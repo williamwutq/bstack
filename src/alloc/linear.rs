@@ -92,6 +92,12 @@ use std::{fmt, io};
 /// ```
 pub struct LinearBStackAllocator {
     stack: BStack,
+    /// The allocator capability, held so no outside caller can mint alloc
+    /// authority over the arena. `LinearBStackAllocator` marks no metadata, so it
+    /// never presents the token — it just holds it, and hands it back on
+    /// [`into_stack`](crate::BStackAllocator::into_stack).
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -105,8 +111,11 @@ impl LinearBStackAllocator {
     #[inline]
     #[must_use]
     pub fn new(stack: BStack) -> Self {
-        stack.acl_claim_alloc();
         Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth: stack
+                .take_alloc_authority()
+                .expect("fresh stack owns its alloc permit"),
             stack,
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
@@ -146,6 +155,10 @@ impl BStackAllocator for LinearBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back to the reclaimed stack, so a caller
+        // that re-wraps it can mint the token again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 

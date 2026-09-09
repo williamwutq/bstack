@@ -5,6 +5,7 @@ use super::{
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+use crate::acl::alloc_meta;
 #[cfg(feature = "atomic")]
 use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
@@ -178,6 +179,10 @@ const ALFF_MAGIC_PREFIX: [u8; 6] = *b"ALFF\x00\x01";
 #[cfg(feature = "set")]
 pub struct FirstFitBStackAllocator {
     stack: BStack,
+    /// The real allocator capability, minted from `stack` at construction and
+    /// presented to the `_as` ops by the `meta_*` forwarders.
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     /// Serialises the operations that span multiple [`BStack`] calls and are
     /// therefore not made atomic by `BStack`'s own locking: free-list mutation
     /// and stack extension/discard.  It is **not** taken for general writes
@@ -241,7 +246,6 @@ impl FirstFitBStackAllocator {
     ///   type).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> Result<Self, io::Error> {
-        stack.acl_claim_alloc();
         // Initialize empty stack with allocator header
         if stack.is_empty()? {
             let mut hdr = [0u8; (Self::OFFSET_SIZE + Self::HEADER_SIZE) as usize];
@@ -253,6 +257,10 @@ impl FirstFitBStackAllocator {
             // allocator's lifetime; own I/O via the `meta_*` helpers.
             stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
             return Ok(Self {
+                #[cfg(feature = "expensive-slice-access-control")]
+                alloc_auth: stack
+                    .take_alloc_authority()
+                    .expect("fresh stack owns its alloc permit"),
                 stack,
                 #[cfg(feature = "atomic")]
                 lock: Mutex::new(()),
@@ -296,6 +304,10 @@ impl FirstFitBStackAllocator {
             }
         }
         let alloc = Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth: stack
+                .take_alloc_authority()
+                .expect("fresh stack owns its alloc permit"),
             stack,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
@@ -318,8 +330,13 @@ impl FirstFitBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     #[inline]
     fn set_recovery_needed(&self) -> io::Result<()> {
-        self.stack
-            .meta_set(Self::OFFSET_SIZE + 8, 1u32.to_le_bytes().as_slice())
+        alloc_meta!(
+            self,
+            set,
+            set_as,
+            Self::OFFSET_SIZE + 8,
+            1u32.to_le_bytes().as_slice()
+        )
     }
 
     #[cfg(feature = "atomic")]
@@ -331,7 +348,10 @@ impl FirstFitBStackAllocator {
         // failure means the flag was left set by a previously crashed or failed
         // operation, so the stack needs recovery (reopen) before it is safe to
         // mutate, and we surface that as an error rather than proceeding.
-        if !self.stack.meta_cas(
+        if !alloc_meta!(
+            self,
+            cas,
+            cas_as,
             Self::OFFSET_SIZE + 8,
             [0u8; 4].as_slice(),
             1u32.to_le_bytes().as_slice(),
@@ -382,8 +402,13 @@ impl FirstFitBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     #[inline]
     fn clear_recovery_needed(&self) -> io::Result<()> {
-        self.stack
-            .meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+        alloc_meta!(
+            self,
+            set,
+            set_as,
+            Self::OFFSET_SIZE + 8,
+            [0u8; 4].as_slice()
+        )
     }
 
     #[cfg(feature = "atomic")]
@@ -394,7 +419,10 @@ impl FirstFitBStackAllocator {
         // this CAS is a no-cost check over the disk write. A failure means the
         // flag was not set when we expected it to be, indicating the paired set
         // was lost or the flag was disturbed out of band.
-        if !self.stack.meta_cas(
+        if !alloc_meta!(
+            self,
+            cas,
+            cas_as,
             Self::OFFSET_SIZE + 8,
             1u32.to_le_bytes().as_slice(),
             [0u8; 4].as_slice(),
@@ -533,8 +561,13 @@ impl FirstFitBStackAllocator {
         if prev != 0 {
             self.stack.set(prev, next.to_le_bytes())?;
         } else {
-            self.stack
-                .meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+            alloc_meta!(
+                self,
+                set,
+                set_as,
+                Self::FREE_HEAD_OFFSET,
+                next.to_le_bytes()
+            )?;
         }
         if next != 0 {
             self.stack.set(next + 8, prev.to_le_bytes())?;
@@ -629,7 +662,7 @@ impl FirstFitBStackAllocator {
         // free_head <- result_block -> next
         // free_head --------------------> next -> ...
         // free_head <------------------- next <- ...
-        let old_head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?;
+        let old_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
         // The old head becomes our next_free and takes a back-link at old_head + 8,
         // so validate it like any other free-list link before writing through it.
         if !Self::is_valid_link_ptr(old_head, stack_len) {
@@ -650,8 +683,13 @@ impl FirstFitBStackAllocator {
         // free_head -> result_block -> next -> ...
         // free_head <------------------ next <- ...
         // If this step fails, the free list is still consistent but the result block is orphaned
-        self.stack
-            .meta_set(Self::FREE_HEAD_OFFSET, result_start.to_le_bytes())?;
+        alloc_meta!(
+            self,
+            set,
+            set_as,
+            Self::FREE_HEAD_OFFSET,
+            result_start.to_le_bytes()
+        )?;
 
         // After adding result block:
         // free_head -> result_block -> next -> ...
@@ -751,7 +789,7 @@ impl FirstFitBStackAllocator {
         let mut head_buf = [0u8; 8];
         let mut back_buf = [0u8; 8];
 
-        self.stack.meta_inplace_gen(|feedback| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |feedback| {
             // A failed read or rejected write must tear the batch down, not commit
             // a partial one
             if let Err(e) = feedback {
@@ -1107,7 +1145,7 @@ impl FirstFitBStackAllocator {
             / (Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE)
             + 1;
         let mut walk_count = 0u64;
-        let mut head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?;
+        let mut head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
         while head != 0 {
             walk_count += 1;
             if walk_count > max_walk {
@@ -1264,8 +1302,13 @@ impl FirstFitBStackAllocator {
             if prev != 0 {
                 self.stack.set(prev, next.to_le_bytes())?;
             } else {
-                self.stack
-                    .meta_set(Self::FREE_HEAD_OFFSET, next.to_le_bytes())?;
+                alloc_meta!(
+                    self,
+                    set,
+                    set_as,
+                    Self::FREE_HEAD_OFFSET,
+                    next.to_le_bytes()
+                )?;
             }
 
             // Then commit forward pointer
@@ -1375,7 +1418,7 @@ impl FirstFitBStackAllocator {
             let mut rd16 = [0u8; 16];
             let zeros = [0u8; 8];
 
-            self.stack.meta_inplace_gen(|feedback| {
+            alloc_meta!(self, inplace_gen, inplace_gen_as, |feedback| {
                 if let Err(e) = feedback {
                     return Some(BStackGenOp::Abort { source: Some(e) });
                 }
@@ -1658,14 +1701,24 @@ impl FirstFitBStackAllocator {
 
         // Update free_head to the first free block found, or 0 if none.
         let new_free_head = free_blocks.first().copied().unwrap_or(0);
-        self.stack
-            .meta_set(Self::FREE_HEAD_OFFSET, new_free_head.to_le_bytes())?;
+        alloc_meta!(
+            self,
+            set,
+            set_as,
+            Self::FREE_HEAD_OFFSET,
+            new_free_head.to_le_bytes()
+        )?;
 
         // Authoritative reset: recovery may have been triggered with the on-disk flag already
         // clear (e.g. an out-of-range free_head in `new`), so write 0 directly rather than via
         // the CAS clear, which under the `atomic` feature would fail when the flag is not 1.
-        self.stack
-            .meta_set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+        alloc_meta!(
+            self,
+            set,
+            set_as,
+            Self::OFFSET_SIZE + 8,
+            [0u8; 4].as_slice()
+        )
     }
 }
 
@@ -1681,6 +1734,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back to the reclaimed stack, so a caller
+        // that re-wraps it can mint the token again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -2035,7 +2092,7 @@ impl FirstFitBStackAllocator {
                     self.stack.get_into(next_block, &mut link_buf)?;
                     let nnext = read_buf_le!(link_buf, 0 => u64); // next.next_free
                     let nprev = read_buf_le!(link_buf, 8 => u64); // next.prev_free
-                    let free_head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?;
+                    let free_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
                     if !Self::is_valid_link_ptr(nnext, stack_len)
                         || !Self::is_valid_link_ptr(nprev, stack_len)
                         || !Self::is_valid_link_ptr(free_head, stack_len)
@@ -2116,7 +2173,7 @@ impl FirstFitBStackAllocator {
                                 (0, NONE)
                             },
                         ];
-                        self.stack.meta_set_batched(writes)?;
+                        alloc_meta!(self, set_batched, set_batched_as, writes)?;
                     } else {
                         // No split: absorb `next` entirely; just remove it from the list.
                         let header_le = merged_size.to_le_bytes();
@@ -2150,7 +2207,7 @@ impl FirstFitBStackAllocator {
                                 (0, NONE)
                             },
                         ];
-                        self.stack.meta_set_batched(writes)?;
+                        alloc_meta!(self, set_batched, set_batched_as, writes)?;
                     }
                     // SAFETY: slice resized by merging with adjacent free block
                     return Ok(true);
@@ -2183,7 +2240,7 @@ impl FirstFitBStackAllocator {
                         let remainder_size =
                             merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
                         let new_free_start = start + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
-                        let old_head = self.stack.meta_read_u64(Self::FREE_HEAD_OFFSET)?;
+                        let old_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
 
                         // All offsets are relative to zero_buff[0] = start + block_size.
                         let alloc_footer_off = (aligned_new_len - block_size) as usize;
@@ -2224,8 +2281,13 @@ impl FirstFitBStackAllocator {
                         )?;
                         // Link forward: free_head → new free block
                         // Failure cause: orphaned block
-                        self.stack
-                            .meta_set(Self::FREE_HEAD_OFFSET, new_free_start.to_le_bytes())?;
+                        alloc_meta!(
+                            self,
+                            set,
+                            set_as,
+                            Self::FREE_HEAD_OFFSET,
+                            new_free_start.to_le_bytes()
+                        )?;
                         // Link backward: old head's prev_free → new free block
                         // Failure cause: orphaned block with stale forward link from old head (detectable in recovery) but no backward link
                         if old_head != 0 {
@@ -2758,7 +2820,7 @@ impl FirstFitBStackAllocator {
                 let off_retftr = start + block_size;
 
                 let mut committed = false;
-                let r = self.stack.meta_inplace_gen(|feedback| {
+                let r = alloc_meta!(self, inplace_gen, inplace_gen_as, |feedback| {
                     // A failed read or rejected write tears the batch down — never
                     // `None`, which would commit the partial state.
                     if let Err(e) = feedback {
@@ -3199,7 +3261,7 @@ impl FirstFitBStackAllocator {
                         let mut back_le = [0u8; 8];
 
                         let mut committed = false;
-                        let r = self.stack.meta_inplace_gen(|feedback| {
+                        let r = alloc_meta!(self, inplace_gen, inplace_gen_as, |feedback| {
                             if let Err(e) = feedback {
                                 return Some(BStackGenOp::Abort { source: Some(e) });
                             }
@@ -3930,13 +3992,14 @@ mod fault_tests {
         // Corrupt `free_head` to an out-of-bounds offset. `b` has no free neighbour to
         // coalesce, so `add_to_free_list` reaches the head read and rejects it.
         // The head is allocator metadata (ACL-protected), so poke it as the allocator.
-        alloc
-            .stack()
-            .meta_set(
-                FirstFitBStackAllocator::FREE_HEAD_OFFSET,
-                u64::MAX.to_le_bytes(),
-            )
-            .unwrap();
+        crate::acl::alloc_meta!(
+            alloc,
+            set,
+            set_as,
+            FirstFitBStackAllocator::FREE_HEAD_OFFSET,
+            u64::MAX.to_le_bytes(),
+        )
+        .unwrap();
 
         let err = alloc
             .dealloc(b)

@@ -6,6 +6,7 @@ use super::{
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+use crate::acl::alloc_meta;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
 use std::fmt;
@@ -189,6 +190,10 @@ struct PathEntry {
 /// ```
 pub struct GhostTreeBstackAllocator {
     stack: BStack,
+    /// The real allocator capability, minted from `stack` at construction and
+    /// presented to the `_as` ops by the `meta_*` forwarders.
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     #[cfg(feature = "atomic")]
     lock: Mutex<()>,
     #[cfg(not(feature = "atomic"))]
@@ -224,7 +229,6 @@ impl GhostTreeBstackAllocator {
     /// Returns [`io::ErrorKind::InvalidData`] if the payload size falls in the
     /// unrecoverable range, or if the magic prefix does not match `ALGT`.
     pub fn new(stack: BStack) -> io::Result<Self> {
-        stack.acl_claim_alloc();
         let size = stack.len()?;
 
         if size == 0 {
@@ -235,6 +239,10 @@ impl GhostTreeBstackAllocator {
             // lifetime; own I/O via the `meta_*` helpers.
             stack.acl_mark_alloc(MAGIC_OFFSET, ARENA_START - MAGIC_OFFSET)?;
             return Ok(Self {
+                #[cfg(feature = "expensive-slice-access-control")]
+                alloc_auth: stack
+                    .take_alloc_authority()
+                    .expect("fresh stack owns its alloc permit"),
                 stack,
                 #[cfg(feature = "atomic")]
                 lock: Mutex::new(()),
@@ -271,6 +279,10 @@ impl GhostTreeBstackAllocator {
         }
 
         let this = Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth: stack
+                .take_alloc_authority()
+                .expect("fresh stack owns its alloc permit"),
             stack,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
@@ -291,7 +303,7 @@ impl GhostTreeBstackAllocator {
     #[inline]
     fn read_root(&self) -> io::Result<u64> {
         // Header stays `Alloc`; the root pointer is read as the allocator.
-        self.stack.meta_read_u64(ROOT_OFFSET)
+        alloc_meta!(self, read_u64, ROOT_OFFSET)
     }
 
     /// Write the AVL root pointer to the header.
@@ -299,7 +311,7 @@ impl GhostTreeBstackAllocator {
     fn write_root(&self, ptr: u64) -> io::Result<()> {
         let mut buf = [0u8; 8];
         write_buf!(ptr => buf, 0);
-        self.stack.meta_set(ROOT_OFFSET, buf)?;
+        alloc_meta!(self, set, set_as, ROOT_OFFSET, buf)?;
         Ok(())
     }
 
@@ -1411,6 +1423,10 @@ impl BStackAllocator for GhostTreeBstackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back to the reclaimed stack, so a caller
+        // that re-wraps it can mint the token again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
