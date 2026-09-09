@@ -431,6 +431,7 @@ fn bench_allocator<A, M, OG, SG>(
     assert!(thread_count >= 1, "thread_count must be at least 1");
     let cfg = config();
     let mut group = c.benchmark_group(group_name);
+    group.sampling_mode(criterion::SamplingMode::Flat);
     group.bench_function(bench_name, |b| {
         b.iter_custom(|iters| {
             // --- setup (not timed) ---

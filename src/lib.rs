@@ -432,7 +432,7 @@
 //!   Combined with `set`, also enables [`BStackSliceWriter`],
 //!   [`FirstFitBStackAllocator`], [`GhostTreeBstackAllocator`],
 //!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`],
-//!   [`SegregatedBStackAllocator`] (experimental), and [`BStackByteVec`].
+//!   [`SegregatedBStackAllocator`], and [`BStackByteVec`].
 //!
 //! * **`atomic`** — Compound read-modify-write operations that hold the write
 //!   lock across what would otherwise be separate calls.  Combined with `set`,
@@ -550,8 +550,9 @@
 //!   Requires both `alloc` and `set` features; with `atomic` additionally
 //!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`).
 //!
-//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
-//!   free-list allocator.  Generalises [`CheckedSlabBStackAllocator`] from one
+//! * [`SegregatedBStackAllocator`] — segregated (binned) free-list allocator,
+//!   the **recommended general-purpose allocator** (the fastest built-in).
+//!   Generalises [`CheckedSlabBStackAllocator`] from one
 //!   block size to 33 size classes sharing a single arena: 16 linear classes
 //!   (16‥256 B, step 16), 16 geometric classes (320‥4096 B, 4 per octave), and
 //!   one shared oversized bucket.  Each class is an independent intrusive free
@@ -566,10 +567,6 @@
 //!   it additionally implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`,
 //!   work bounded by the classes touched, with oversized requests matched
 //!   largest-first against the oversized free list).
-//!   **Experimental:** the on-disk format and API may change, some resize paths
-//!   differ between the `atomic` and non-`atomic` builds, and the deep in-use-leak
-//!   GC is not yet implemented (the free-neighbour coalescer, `coalesce`, now is —
-//!   `atomic` only).
 //!
 //! * [`DebugCheckingAllocator<A>`](DebugCheckingAllocator) — transparent debug
 //!   wrapper.  Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`]
@@ -3100,6 +3097,20 @@ pub enum BStackGenOp<'a> {
         /// Bytes to write.
         data: &'a [u8],
     },
+    /// Fill `offset..offset + count * pattern.len()` with `count` copies of
+    /// `pattern`, ending the sequence.
+    ///
+    /// The in-sequence equivalent of [`repeat`](BStack::repeat) (and, with an
+    /// all-zero `pattern`, of [`zero`](BStack::zero)); the fill counterpart of
+    /// [`Write`](Self::Write). An empty `pattern` or `count == 0` is a no-op.
+    Repeat {
+        /// Logical offset to fill from.
+        offset: u64,
+        /// The pattern repeated to fill the region.
+        pattern: &'a [u8],
+        /// Number of copies of `pattern` to write.
+        count: u64,
+    },
     /// Atomically exchange `len` bytes at `a_offset` with `len` bytes at
     /// `b_offset`, ending the sequence.
     ///
@@ -3806,6 +3817,45 @@ impl BStack {
                     }
                     return Ok(());
                 }
+                Some(BStackGenOp::Repeat {
+                    offset,
+                    pattern,
+                    count,
+                }) => {
+                    // Empty pattern or zero count is a no-op, matching `zero(_, 0)`.
+                    if pattern.is_empty() || count == 0 {
+                        return Ok(());
+                    }
+                    let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+                        io_error!(InvalidInput, "process_gen: repeat length overflows u64")
+                    })?;
+                    let end = checked_end(
+                        offset,
+                        total,
+                        "process_gen: repeat offset + length overflows u64",
+                    )?;
+                    if offset < locked {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "process_gen: repeat range [{offset}, {end}) overlaps locked region [0, {locked})"
+                            )
+                        ));
+                    }
+                    if end > data_size {
+                        return Err(io_error!(
+                            InvalidInput,
+                            format!(
+                                "process_gen: repeat range [{offset}, {end}) exceeds payload size ({data_size})"
+                            )
+                        ));
+                    }
+                    Self::mark_replay(
+                        replay,
+                        repeat_fill(file, data_size, offset, pattern, count),
+                    )?;
+                    return Ok(());
+                }
                 Some(BStackGenOp::Swap {
                     a_offset,
                     b_offset,
@@ -4222,8 +4272,9 @@ impl BStack {
         let locked = self.locked.load(Ordering::Acquire);
         fault_point!(self, "inplace_gen");
         // Sorted, pairwise-non-overlapping set of pending in-place edits, each
-        // borrowing the caller's `Write` data for the lifetime of the call.
-        let mut overlay: Vec<(u64, &'a [u8])> = Vec::new();
+        // borrowing the caller's `Write` data (or `Repeat` pattern) for the
+        // lifetime of the call.
+        let mut overlay: Vec<(u64, OverlayData<'a>)> = Vec::new();
         let mut feedback: io::Result<()> = Ok(());
         loop {
             match f(feedback) {
@@ -4275,7 +4326,27 @@ impl BStack {
                         );
                     }
                     if feedback.is_ok() && !data.is_empty() {
-                        inplace_overlay_insert(&mut overlay, offset, data);
+                        inplace_overlay_insert(&mut overlay, offset, OverlayData::Literal(data));
+                    }
+                }
+                Some(BStackGenOp::Repeat {
+                    offset,
+                    pattern,
+                    count,
+                }) => {
+                    feedback = inplace_validate_repeat(offset, pattern, count, data_size, locked);
+                    if feedback.is_ok() && !pattern.is_empty() && count > 0 {
+                        // Non-overflowing after validation.
+                        let len = pattern.len() as u64 * count;
+                        inplace_overlay_insert(
+                            &mut overlay,
+                            offset,
+                            OverlayData::Repeat {
+                                pattern,
+                                phase: 0,
+                                len,
+                            },
+                        );
                     }
                 }
                 Some(BStackGenOp::Len { out }) => {
@@ -4332,15 +4403,33 @@ impl BStack {
                 None => break,
             }
         }
-        // Commit the accumulated edits. Zero → nothing to do; one → the ordinary
-        // single-write path; many → the multi-write journal.
+        // Commit the accumulated edits. Zero → nothing to do; a lone literal takes
+        // the ordinary single-write path and a lone repeat the compact repeat-fill
+        // journal; several edits go through the multi-write journal (which streams
+        // any repeat block rather than materialising it).
         match overlay.len() {
             0 => Ok(()),
-            1 => {
-                let (offset, data) = overlay[0];
-                Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
-            }
-            _ => Self::mark_replay(replay, journaled_multi_set(file, data_size, &overlay)),
+            1 => match overlay[0] {
+                (offset, OverlayData::Literal(data)) => {
+                    Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
+                }
+                // A lone repeat is never sliced (slicing needs an overlapping edit,
+                // which would leave it non-lone), so `phase == 0` and `len` is a
+                // whole number of periods — exactly what `repeat_fill` expects.
+                (
+                    offset,
+                    OverlayData::Repeat {
+                        pattern,
+                        phase: 0,
+                        len,
+                    },
+                ) if len % pattern.len() as u64 == 0 => Self::mark_replay(
+                    replay,
+                    repeat_fill(file, data_size, offset, pattern, len / pattern.len() as u64),
+                ),
+                _ => Self::mark_replay(replay, journaled_multi_overlay(file, data_size, &overlay)),
+            },
+            _ => Self::mark_replay(replay, journaled_multi_overlay(file, data_size, &overlay)),
         }
     }
 

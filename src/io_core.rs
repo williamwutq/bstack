@@ -1096,6 +1096,43 @@ pub(crate) fn journaled_multi_set(
     file.set_len(HEADER_SIZE + data_size)
 }
 
+/// Multi-write journal over an `inplace_gen` overlay, whose blocks may be literal
+/// slices **or** repeating patterns ([`OverlayData`]). Same protocol and on-disk
+/// format as [`journaled_multi_set`] — a repeat block just streams its expanded
+/// bytes in place (`O(pattern.len())` memory, never a `count·len` buffer) instead
+/// of copying a literal slice — so the staged `[s | e | data]` tail is identical
+/// and recovery ([`recover_multi_write`]) is unchanged.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn journaled_multi_overlay(
+    file: &mut File,
+    data_size: u64,
+    blocks: &[(u64, OverlayData)],
+) -> io::Result<()> {
+    // 1. Stage every block `[s | e | data]` back-to-back beyond the committed end.
+    file.seek(SeekFrom::Start(HEADER_SIZE + data_size))?;
+    for (offset, d) in blocks {
+        let end = offset + d.len();
+        file.write_all(&offset.to_le_bytes())?;
+        file.write_all(&end.to_le_bytes())?;
+        d.write_seq(file)?;
+    }
+    durable_sync(file)?;
+    // 2. Arm the intent-complete sentinel (`wip_ptr` stays 0).
+    write_wip(file, 0, WipAux::MultiWrite)?;
+    durable_sync(file)?;
+    // 3. Replay each block into its target in place.
+    for (offset, d) in blocks {
+        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
+        d.write_seq(file)?;
+    }
+    durable_sync(file)?;
+    // 4. Disarm.
+    write_wip(file, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    // 5. Drop the staged tail.
+    file.set_len(HEADER_SIZE + data_size)
+}
+
 /// Walk the staged multi-write tail `[tail_start, raw_size)` and, for each
 /// well-formed `[s | e | data]` block, invoke `apply(s, data_src_logical, len)`.
 ///
@@ -1193,6 +1230,122 @@ pub(crate) fn recover_multi_write(
     Ok(committed_len)
 }
 
+/// One pending edit in an `inplace_gen` overlay: either a literal borrowed slice
+/// or a repeating pattern that is expanded lazily (never materialised to
+/// `count·len` bytes in memory — it streams at commit time via [`write_pattern`]).
+///
+/// A `Repeat`'s logical byte at local index `i` (`0 <= i < len`) is
+/// `pattern[(phase + i) % pattern.len()]`. Tracking `phase` (rather than a copy
+/// count) lets a repeat be sliced mid-pattern by [`OverlayData::subrange`] without
+/// rotating or copying the borrowed pattern. `pattern` is always non-empty.
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OverlayData<'a> {
+    Literal(&'a [u8]),
+    Repeat {
+        pattern: &'a [u8],
+        phase: usize,
+        len: u64,
+    },
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'a> OverlayData<'a> {
+    /// Logical byte length of the edit.
+    #[inline]
+    pub(crate) fn len(&self) -> u64 {
+        match self {
+            OverlayData::Literal(d) => d.len() as u64,
+            OverlayData::Repeat { len, .. } => *len,
+        }
+    }
+
+    /// The sub-edit covering local indices `[a, b)` (measured from this edit's
+    /// start). A literal sub-slices; a repeat advances `phase` by `a` (mod the
+    /// pattern length) so the sliced bytes stay pattern-aligned. `0 <= a <= b <=
+    /// len()`.
+    #[inline]
+    pub(crate) fn subrange(&self, a: u64, b: u64) -> OverlayData<'a> {
+        match self {
+            OverlayData::Literal(d) => OverlayData::Literal(&d[a as usize..b as usize]),
+            OverlayData::Repeat { pattern, phase, .. } => OverlayData::Repeat {
+                pattern,
+                // Reduce `a` mod the pattern length before adding: both operands are
+                // then `< pattern.len() <= isize::MAX`, so the sum cannot overflow
+                // `usize`, and it stays correct on a 32-bit target where `a as usize`
+                // could otherwise truncate. `(phase + a) % plen == (phase + a % plen) % plen`.
+                phase: (phase + (a % pattern.len() as u64) as usize) % pattern.len(),
+                len: b - a,
+            },
+        }
+    }
+
+    /// Fill `dst` with the edit's bytes for local indices `[rel_lo, rel_lo +
+    /// dst.len())`. `rel_lo + dst.len() <= len()`.
+    #[inline]
+    pub(crate) fn fill_into(&self, dst: &mut [u8], rel_lo: u64) {
+        match self {
+            OverlayData::Literal(d) => {
+                let lo = rel_lo as usize;
+                dst.copy_from_slice(&d[lo..lo + dst.len()]);
+            }
+            OverlayData::Repeat { pattern, phase, .. } => {
+                let plen = pattern.len();
+                // Reduce `rel_lo` mod the pattern length first (see `subrange`): keeps
+                // `base < plen <= isize::MAX`, so `base + i` (with `i < dst.len() <=
+                // isize::MAX`) cannot overflow `usize`, and is correct on 32-bit.
+                let base = (phase + (rel_lo % plen as u64) as usize) % plen;
+                for (i, b) in dst.iter_mut().enumerate() {
+                    *b = pattern[(base + i) % plen];
+                }
+            }
+        }
+    }
+
+    /// Write the edit's `len()` bytes at the file's current position, advancing the
+    /// cursor. A literal is one `write_all`; a repeat streams through a bounded
+    /// buffer (`O(pattern.len())` memory, capped near [`MOVE_CHUNK`]).
+    fn write_seq(&self, file: &mut File) -> io::Result<()> {
+        match self {
+            OverlayData::Literal(d) => file.write_all(d),
+            OverlayData::Repeat {
+                pattern,
+                phase,
+                len,
+            } => write_pattern(file, pattern, *phase, *len),
+        }
+    }
+}
+
+/// Stream `len` bytes of `pattern`, rotated to start at `phase`, at the file's
+/// current position (no seek; the cursor advances). The scratch buffer is a whole
+/// number of pattern periods (so each refill continues the rotation seamlessly)
+/// bounded near [`MOVE_CHUNK`], keeping memory `O(pattern.len())`. `pattern` is
+/// non-empty; `phase < pattern.len()`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn write_pattern(file: &mut File, pattern: &[u8], phase: usize, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let plen = pattern.len();
+    let copies = (MOVE_CHUNK / plen as u64).max(1) as usize;
+    let cap = copies * plen;
+    let mut buf = Vec::with_capacity(cap);
+    for j in 0..cap {
+        buf.push(pattern[(phase + j) % plen]);
+    }
+    // `cap` is a multiple of `plen`, so `buf[cap]` would wrap to `buf[0]` — writing
+    // the buffer repeatedly continues the same rotation, and any short final write
+    // is a valid prefix of it.
+    let mut done = 0u64;
+    while done < len {
+        let take = ((len - done) as usize).min(buf.len());
+        file.write_all(&buf[..take])?;
+        done += take as u64;
+    }
+    Ok(())
+}
+
 /// Insert an in-place write `[off, off + data.len())` into an `inplace_gen`
 /// overlay, keeping it a sorted, pairwise-non-overlapping set of pending edits.
 ///
@@ -1213,34 +1366,34 @@ pub(crate) fn recover_multi_write(
 /// the multi-write journal commits. Callers pass only non-empty `data`.
 #[cfg(all(feature = "set", feature = "atomic"))]
 pub(crate) fn inplace_overlay_insert<'a>(
-    overlay: &mut Vec<(u64, &'a [u8])>,
+    overlay: &mut Vec<(u64, OverlayData<'a>)>,
     off: u64,
-    data: &'a [u8],
+    data: OverlayData<'a>,
 ) {
-    let end = off + data.len() as u64;
+    let end = off + data.len();
     // The overlay is sorted by start and non-overlapping, so its ends are sorted
     // too: the edits the new write touches form one contiguous run `[lo, hi)`.
     // Binary search both ends instead of scanning — `lo` is the first edit
     // reaching past `off` (`edit end > off`), `hi` the first edit starting at or
     // past `end`.
-    let lo = overlay.partition_point(|&(s, d)| s + d.len() as u64 <= off);
-    let hi = overlay.partition_point(|&(s, _)| s < end);
+    let lo = overlay.partition_point(|(s, d)| s + d.len() <= off);
+    let hi = overlay.partition_point(|(s, _)| *s < end);
     // Only the run's first edit can start before `off`, and only its last can end
     // after `end` (interior edits are fully covered and dropped); each contributes
     // at most a surviving prefix / suffix around the new edit.
-    let mut repl: Vec<(u64, &'a [u8])> = Vec::with_capacity(3);
+    let mut repl: Vec<(u64, OverlayData<'a>)> = Vec::with_capacity(3);
     if lo < hi {
         let (s0, d0) = overlay[lo];
         if s0 < off {
-            repl.push((s0, &d0[..(off - s0) as usize]));
+            repl.push((s0, d0.subrange(0, off - s0)));
         }
     }
     repl.push((off, data));
     if lo < hi {
         let (s_last, d_last) = overlay[hi - 1];
-        let e_last = s_last + d_last.len() as u64;
+        let e_last = s_last + d_last.len();
         if e_last > end {
-            repl.push((end, &d_last[(end - s_last) as usize..]));
+            repl.push((end, d_last.subrange(end - s_last, e_last - s_last)));
         }
     }
     // Replace the touched run in place; the surrounding edits keep their order.
@@ -1284,6 +1437,47 @@ pub(crate) fn inplace_validate_write(
     Ok(())
 }
 
+/// Validate an `inplace_gen` `Repeat` op against the fixed payload size and the
+/// locked prefix. An empty `pattern` or `count == 0` is a valid no-op (nothing is
+/// staged), matching `zero(_, 0)`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn inplace_validate_repeat(
+    offset: u64,
+    pattern: &[u8],
+    count: u64,
+    data_size: u64,
+    locked: u64,
+) -> io::Result<()> {
+    if pattern.is_empty() || count == 0 {
+        return Ok(());
+    }
+    let total = (pattern.len() as u64)
+        .checked_mul(count)
+        .ok_or_else(|| io_error!(InvalidInput, "inplace_gen: repeat length overflows u64"))?;
+    let end = crate::checked_end(
+        offset,
+        total,
+        "inplace_gen: repeat offset + length overflows u64",
+    )?;
+    if offset < locked {
+        return Err(io_error!(
+            InvalidInput,
+            format!(
+                "inplace_gen: repeat range [{offset}, {end}) overlaps locked region [0, {locked})"
+            )
+        ));
+    }
+    if end > data_size {
+        return Err(io_error!(
+            InvalidInput,
+            format!(
+                "inplace_gen: repeat range [{offset}, {end}) exceeds payload size ({data_size})"
+            )
+        ));
+    }
+    Ok(())
+}
+
 /// Validate an `inplace_gen` `Read` op against the fixed payload size, mirroring
 /// `get`'s checks.
 ///
@@ -1317,7 +1511,7 @@ pub(crate) fn inplace_overlay_read(
     data_size: u64,
     offset: u64,
     buf: &mut [u8],
-    overlay: &[(u64, &[u8])],
+    overlay: &[(u64, OverlayData)],
 ) -> io::Result<()> {
     inplace_validate_read(offset, buf.len() as u64, data_size)?;
     // Validated above, so this cannot overflow.
@@ -1329,21 +1523,21 @@ pub(crate) fn inplace_overlay_read(
     // too: the edits intersecting `[offset, end)` form one contiguous run. Binary
     // search for the first edit that could reach into the read (`edit end >
     // offset`) — O(log n) instead of scanning every pending edit.
-    let start = overlay.partition_point(|&(s, d)| s + d.len() as u64 <= offset);
+    let start = overlay.partition_point(|(s, d)| s + d.len() <= offset);
     // First pass: find the run's end index and whether the edits leave any gap
     // over `[offset, end)`. A fully-covered read needs no committed bytes at all,
     // so the disk read can be skipped.
     let mut run_end = start;
     let mut covered_to = offset;
     let mut has_gap = false;
-    for &(s, d) in &overlay[start..] {
-        if s >= end {
+    for (s, d) in &overlay[start..] {
+        if *s >= end {
             break;
         }
-        if s > covered_to {
+        if *s > covered_to {
             has_gap = true; // a stretch of committed bytes shows through here
         }
-        covered_to = s + d.len() as u64;
+        covered_to = s + d.len();
         run_end += 1;
     }
     if covered_to < end {
@@ -1355,13 +1549,12 @@ pub(crate) fn inplace_overlay_read(
     }
     // Second pass: overlay each edit in the run. When there was no gap these
     // copies fill `buf` completely, so the skipped read left nothing uninitialised.
-    for &(s, d) in &overlay[start..run_end] {
-        let e = s + d.len() as u64;
-        let lo = s.max(offset);
+    for (s, d) in &overlay[start..run_end] {
+        let e = s + d.len();
+        let lo = (*s).max(offset);
         let hi = e.min(end);
         let (b_lo, b_hi) = ((lo - offset) as usize, (hi - offset) as usize);
-        let (d_lo, d_hi) = ((lo - s) as usize, (hi - s) as usize);
-        buf[b_lo..b_hi].copy_from_slice(&d[d_lo..d_hi]);
+        d.fill_into(&mut buf[b_lo..b_hi], lo - s);
     }
     Ok(())
 }

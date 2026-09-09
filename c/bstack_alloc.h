@@ -3,6 +3,9 @@
 
 #include "bstack.h"
 #include <errno.h>
+#ifdef BSTACK_FEATURE_ATOMIC
+#include <stdatomic.h>
+#endif
 
 /*
  * bstack_alloc — region-management layer on top of bstack.
@@ -1030,6 +1033,12 @@ typedef struct {
      * allocated in first_fit_bstack_allocator_new and released on free.  Kept
      * opaque so this header need not pull in <pthread.h> / <windows.h>. */
     void              *lock;
+    /* In-memory mirror of the on-disk recovery_needed flag (Rust's `AtomicBool`).
+     * A bracketed op that fails mid-sequence leaves it set, so the single
+     * atomic-call paths that no longer arm the disk flag still refuse against an
+     * unrecovered free list — the cheap counterpart of the disk flag's CAS poison
+     * check. */
+    atomic_int         recovery_poisoned;
 #endif
 } first_fit_bstack_allocator_t;
 
@@ -1352,7 +1361,6 @@ uint64_t checked_slab_bstack_allocator_data_size(
 
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
- *   **experimental**
  *
  * Generalises the fixed-block checked slab to 33 size classes sharing one
  * arena: 16 linear (16‥256 B, step 16), 16 geometric (320‥4096 B, 4 per
@@ -1364,7 +1372,7 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x01\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x02\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)
@@ -1392,11 +1400,11 @@ uint64_t checked_slab_bstack_allocator_data_size(
  *                        exposed tail on a visible grow
  *   grow past the block, at the tail
  *                      → extend in place (zero-filled), then record the new size
- *   shrink, excess ≥ SPLIT_MIN
- *                      → atomic: drop the excess (tail truncation, else in-place
- *                        carve) recording the new size in one transaction;
- *                        without atomic, retain the excess in place
- *   shrink, excess < SPLIT_MIN → retain in place — no write
+ *   tail shrink, excess ≥ SPLIT_MIN
+ *                      → atomic: drop the excess via one LEN + SPLICE, recording
+ *                        the new size in the same transaction; without atomic,
+ *                        retain in place
+ *   interior shrink, or excess < SPLIT_MIN → retain the excess in place — no write
  *   non-tail grow past the block → alloc new class, copy, dealloc old
  *
  * With -DBSTACK_FEATURE_ATOMIC the allocator also carries a bulk vtable: work is
@@ -1409,18 +1417,18 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * fits (or a shrink whose excess is retained) touches no metadata at all.  Crash
  * consistency: every path only ever *leaks* on a mid-op failure, never corrupts —
  * the leak-preferring tail grow leaves an orphaned zero tail that recover()
- * reclaims, and an atomic shrink commits the new size together with the
- * truncation (tail) or the carve (non-tail) as one transaction, so a crash
- * leaves the block wholly un-shrunk or fully shrunk — never a recorded size
- * disagreeing with the block's physical extent, which would make the recovery
- * scan mis-stride.  segregated_bstack_allocator_recover rebuilds every free list
- * from a single linear arena scan and reclaims leaked blocks.
+ * reclaims, and an atomic tail shrink commits the new size together with the
+ * truncation as one transaction, so a crash leaves the block wholly un-shrunk or
+ * fully shrunk — never a recorded size disagreeing with the block's physical
+ * extent, which would make the recovery scan mis-stride.
+ * segregated_bstack_allocator_recover rebuilds every free list from a single
+ * linear arena scan and reclaims leaked blocks.
  *
  * Thread safety: without -DBSTACK_FEATURE_ATOMIC an allocator handle must be
  * used from one thread at a time — free-list mutations read then write a head as
  * separate bstack calls.  With -DBSTACK_FEATURE_ATOMIC alloc/dealloc/realloc take
  * no allocator-level lock: free-list pops ride a single bstack_process_gen
- * sequence, pushes and the non-tail carve ride bstack_inplace_gen, the tail
+ * sequence, pushes and the oversized carve ride bstack_inplace_gen, the tail
  * shrink rides a BSTACK_GEN_LEN + BSTACK_GEN_SPLICE bstack_process_gen, and the
  * tail grow / oversized-discard paths use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
@@ -1433,9 +1441,10 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * so that build simply retains the excess inside the still-recorded larger block
  * (zero extra writes, no move); a later grow back into that span fits in place.
  *
- * Experimental: the on-disk format (ALSG magic) and API are not yet stable, and
- * the deep in-use-leak GC is unimplemented (the free-neighbour coalescer,
- * segregated_bstack_allocator_coalesce, is implemented under BSTACK_FEATURE_ATOMIC).
+ * recover() reclaims free leaks and discards orphaned tails, and the allocator
+ * creates no in-use orphans of its own (the realloc move commits its
+ * new-live/old-free flip atomically). The free-neighbour coalescer
+ * segregated_bstack_allocator_coalesce is implemented under BSTACK_FEATURE_ATOMIC.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */

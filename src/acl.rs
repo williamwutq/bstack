@@ -68,8 +68,9 @@ mod inner {
     use crate::fault::fault_probe;
     #[cfg(feature = "atomic")]
     use crate::io_core::{
-        inplace_overlay_insert, inplace_overlay_read, inplace_validate_read,
-        inplace_validate_write, journaled_multi_set,
+        OverlayData, inplace_overlay_insert, inplace_overlay_read, inplace_validate_read,
+        inplace_validate_repeat, inplace_validate_write, journaled_multi_overlay,
+        journaled_multi_set,
     };
 
     /// A one-shot capability token authorizing guard-level access to a stack's
@@ -229,8 +230,18 @@ mod inner {
                                 )
                             ));
                         }
+                        // Per-step read fault: stands in for this `Read`'s I/O, and
+                        // like a genuine read failure here it ends the whole call —
+                        // `process_gen` has no channel to report a step failure on.
+                        // Consulted for every `Read` op, including ones the fast
+                        // paths below serve without touching the disk, so the
+                        // schedule does not shift with cache state.
                         fault_point!(self, "process_gen:read");
-                        self.acl_check(offset, end, AccessOp::Read, held)?;
+                        acl_check!(self, offset, end, Read, held);
+                        // Fast path: locked bytes are immutable, so they can be
+                        // served from the cache or via a lock-free pread instead
+                        // of going through the held file handle — mirroring how
+                        // `get_into` treats reads of the locked region.
                         #[cfg(any(unix, windows))]
                         {
                             if end <= locked {
@@ -279,10 +290,49 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(offset, end, AccessOp::Write, held)?;
+                        acl_check!(self, offset, end, Write, held);
                         if !data.is_empty() {
                             Self::mark_replay(replay, set_in_place(file, data_size, offset, data))?;
                         }
+                        return Ok(());
+                    }
+                    Some(BStackGenOp::Repeat {
+                        offset,
+                        pattern,
+                        count,
+                    }) => {
+                        // Empty pattern or zero count is a no-op, matching `zero(_, 0)`.
+                        if pattern.is_empty() || count == 0 {
+                            return Ok(());
+                        }
+                        let total = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+                            io_error!(InvalidInput, "process_gen: repeat length overflows u64")
+                        })?;
+                        let end = checked_end(
+                            offset,
+                            total,
+                            "process_gen: repeat offset + length overflows u64",
+                        )?;
+                        if offset < locked {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: repeat range [{offset}, {end}) overlaps locked region [0, {locked})"
+                                )
+                            ));
+                        }
+                        if end > data_size {
+                            return Err(io_error!(
+                                InvalidInput,
+                                format!(
+                                    "process_gen: repeat range [{offset}, {end}) exceeds payload size ({data_size})"
+                                )
+                            ));
+                        }
+                        Self::mark_replay(
+                            replay,
+                            repeat_fill(file, data_size, offset, pattern, count),
+                        )?;
                         return Ok(());
                     }
                     Some(BStackGenOp::Swap {
@@ -347,8 +397,8 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(a_offset, a_end, AccessOp::Write, held)?;
-                        self.acl_check(b_offset, b_end, AccessOp::Write, held)?;
+                        acl_check!(self, a_offset, a_end, Write, held);
+                        acl_check!(self, b_offset, b_end, Write, held);
                         if len > 0 {
                             Self::mark_replay(
                                 replay,
@@ -361,13 +411,16 @@ mod inner {
                         if !data.is_empty() {
                             let file_end = file.seek(SeekFrom::End(0))?;
                             let logical_offset = file_end - HEADER_SIZE;
-                            self.acl_check(
+                            acl_check!(
+                                self,
                                 logical_offset,
                                 logical_offset + data.len() as u64,
-                                AccessOp::Write,
-                                held,
-                            )?;
+                                Write,
+                                held
+                            );
                             if let Err(e) = file.write_all(data) {
+                                // A failed rollback leaves a stale tail past the committed length:
+                                // defer it to the next write's replay.
                                 if file.set_len(file_end).is_err() {
                                     *replay = true;
                                 }
@@ -398,7 +451,7 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(new_data_len, data_size, AccessOp::Truncate, held)?;
+                        acl_check!(self, new_data_len, data_size, Truncate, held);
                         if n > 0 {
                             read_at(file, new_data_len, buf)?;
                             Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
@@ -423,7 +476,7 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(new_data_len, data_size, AccessOp::Truncate, held)?;
+                        acl_check!(self, new_data_len, data_size, Truncate, held);
                         if len > 0 {
                             Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
                         }
@@ -447,7 +500,7 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
+                        acl_check!(self, new_tail_start, data_size, Truncate, held);
                         if n != 0 || !data.is_empty() {
                             let file_end = HEADER_SIZE + data_size;
                             Self::mark_replay(
@@ -476,8 +529,9 @@ mod inner {
                                 )
                             ));
                         }
-                        self.acl_check(new_tail_start, data_size, AccessOp::Truncate, held)?;
+                        acl_check!(self, new_tail_start, data_size, Truncate, held);
                         if n != 0 || !new.is_empty() {
+                            // Read the removed bytes before any mutation.
                             read_at(file, new_tail_start, old)?;
                             let file_end = HEADER_SIZE + data_size;
                             Self::mark_replay(
@@ -488,6 +542,8 @@ mod inner {
                         return Ok(());
                     }
                     Some(BStackGenOp::Sparse { writes, length }) => {
+                        // Copy the borrowed blocks into a local list so they can be
+                        // filtered and sorted for validation (the source slice is `&'a`).
                         let mut blocks: Vec<(u64, &[u8])> = writes
                             .iter()
                             .map(|(off, d)| (*off, *d))
@@ -501,7 +557,7 @@ mod inner {
                                 length,
                                 "process_gen: sparse data_size + length overflows u64",
                             )?;
-                            self.acl_check(data_size, new_len, AccessOp::Write, held)?;
+                            acl_check!(self, data_size, new_len, Write, held);
                             Self::mark_replay(
                                 replay,
                                 commit_sparse_extend(
@@ -515,6 +571,8 @@ mod inner {
                         *out = data_size;
                     }
                     Some(BStackGenOp::Abort { source }) => {
+                        // Nothing has been mutated: every mutating op ends the
+                        // sequence, so reaching here means only reads have run.
                         return source.map_or(Ok(()), Err);
                     }
                     None => return Ok(()),
@@ -539,17 +597,37 @@ mod inner {
             let data_size = file.seek(SeekFrom::End(0))?.saturating_sub(HEADER_SIZE);
             let locked = self.locked.load(Ordering::Acquire);
             fault_point!(self, "inplace_gen");
-            let mut overlay: Vec<(u64, &'a [u8])> = Vec::new();
+            // Sorted, pairwise-non-overlapping set of pending in-place edits, each
+            // borrowing the caller's `Write` data (or `Repeat` pattern) for the
+            // lifetime of the call.
+            let mut overlay: Vec<(u64, OverlayData<'a>)> = Vec::new();
             let mut feedback: io::Result<()> = Ok(());
             loop {
                 match f(feedback) {
                     Some(BStackGenOp::Read { offset, buf }) => {
+                        // Validate first so a bad range still beats an injected
+                        // fault, then let the policy stand in for the read itself.
+                        // Unlike `process_gen`, a failed `Read` here does not end
+                        // the call: it is reported to the generator through its
+                        // `feedback` argument, so an injected fault must take the
+                        // same route as a genuine one.
                         feedback = match inplace_validate_read(offset, buf.len() as u64, data_size)
                         {
                             Err(e) => Err(e),
-                            Ok(()) => self
-                                .acl_check(offset, offset + buf.len() as u64, AccessOp::Read, held)
-                                .and_then(|()| {
+                            Ok(()) => {
+                                // A denied read is reported through `feedback`, the same
+                                // route a genuine read failure takes. Validation passed,
+                                // so `offset + len` cannot overflow.
+                                #[cfg(feature = "expensive-slice-access-control")]
+                                let gate = self.acl_check(
+                                    offset,
+                                    offset + buf.len() as u64,
+                                    AccessOp::Read,
+                                    held,
+                                );
+                                #[cfg(not(feature = "expensive-slice-access-control"))]
+                                let gate: io::Result<()> = Ok(());
+                                gate.and_then(|()| {
                                     fault_probe!(self, "inplace_gen:read").map_or_else(
                                         || {
                                             inplace_overlay_read(
@@ -558,17 +636,48 @@ mod inner {
                                         },
                                         Err,
                                     )
-                                }),
+                                })
+                            }
                         };
                     }
                     Some(BStackGenOp::Write { offset, data }) => {
                         feedback = inplace_validate_write(offset, data, data_size, locked);
+                        // A denial is routed to the generator like a validation error,
+                        // not returned from the call. `is_ok` implies the range already
+                        // passed `inplace_validate_write`'s `checked_end`, so `offset +
+                        // len` cannot overflow here.
+                        #[cfg(feature = "expensive-slice-access-control")]
                         if feedback.is_ok() {
                             let end = offset + data.len() as u64;
                             feedback = self.acl_check(offset, end, AccessOp::Write, held);
                         }
                         if feedback.is_ok() && !data.is_empty() {
-                            inplace_overlay_insert(&mut overlay, offset, data);
+                            inplace_overlay_insert(
+                                &mut overlay,
+                                offset,
+                                OverlayData::Literal(data),
+                            );
+                        }
+                    }
+                    Some(BStackGenOp::Repeat {
+                        offset,
+                        pattern,
+                        count,
+                    }) => {
+                        feedback =
+                            inplace_validate_repeat(offset, pattern, count, data_size, locked);
+                        if feedback.is_ok() && !pattern.is_empty() && count > 0 {
+                            // Non-overflowing after validation.
+                            let len = pattern.len() as u64 * count;
+                            inplace_overlay_insert(
+                                &mut overlay,
+                                offset,
+                                OverlayData::Repeat {
+                                    pattern,
+                                    phase: 0,
+                                    len,
+                                },
+                            );
                         }
                     }
                     Some(BStackGenOp::Len { out }) => {
@@ -576,6 +685,8 @@ mod inner {
                         feedback = Ok(());
                     }
                     Some(BStackGenOp::Abort { source }) => {
+                        // Drop the overlay without committing: the pending writes
+                        // only ever existed in memory, so the file is untouched.
                         return source.map_or(Ok(()), Err);
                     }
                     Some(BStackGenOp::Swap { .. }) => {
@@ -623,13 +734,36 @@ mod inner {
                     None => break,
                 }
             }
+            // Commit the accumulated edits. Zero → nothing to do; a lone literal takes
+            // the ordinary single-write path and a lone repeat the compact repeat-fill
+            // journal; several edits go through the multi-write journal (which streams
+            // any repeat block rather than materialising it).
             match overlay.len() {
                 0 => Ok(()),
-                1 => {
-                    let (offset, data) = overlay[0];
-                    Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
-                }
-                _ => Self::mark_replay(replay, journaled_multi_set(file, data_size, &overlay)),
+                1 => match overlay[0] {
+                    (offset, OverlayData::Literal(data)) => {
+                        Self::mark_replay(replay, set_in_place(file, data_size, offset, data))
+                    }
+                    // A lone repeat is never sliced (slicing needs an overlapping edit,
+                    // which would leave it non-lone), so `phase == 0` and `len` is a
+                    // whole number of periods — exactly what `repeat_fill` expects.
+                    (
+                        offset,
+                        OverlayData::Repeat {
+                            pattern,
+                            phase: 0,
+                            len,
+                        },
+                    ) if len % pattern.len() as u64 == 0 => Self::mark_replay(
+                        replay,
+                        repeat_fill(file, data_size, offset, pattern, len / pattern.len() as u64),
+                    ),
+                    _ => Self::mark_replay(
+                        replay,
+                        journaled_multi_overlay(file, data_size, &overlay),
+                    ),
+                },
+                _ => Self::mark_replay(replay, journaled_multi_overlay(file, data_size, &overlay)),
             }
         }
 
@@ -680,6 +814,17 @@ mod inner {
             F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
         {
             self.inplace_gen_as(BStackAccessAuthorities::ALLOC, f)
+        }
+
+        /// [`set_batched`](BStack::set_batched) of allocator metadata, presenting
+        /// allocator authority. See [`meta_set`](Self::meta_set).
+        #[cfg(feature = "atomic")]
+        pub(crate) fn meta_set_batched<I, D>(&self, writes: I) -> io::Result<()>
+        where
+            I: IntoIterator<Item = (u64, D)>,
+            D: AsRef<[u8]>,
+        {
+            self.set_batched_as(BStackAccessAuthorities::ALLOC, writes)
         }
 
         /// [`cas`](BStack::cas) of allocator metadata, presenting allocator
@@ -2727,6 +2872,15 @@ impl crate::BStack {
         F: FnMut(std::io::Result<()>) -> Option<crate::BStackGenOp<'a>>,
     {
         self.inplace_gen(f)
+    }
+
+    #[inline]
+    pub(crate) fn meta_set_batched<I, D>(&self, writes: I) -> std::io::Result<()>
+    where
+        I: IntoIterator<Item = (u64, D)>,
+        D: AsRef<[u8]>,
+    {
+        self.set_batched(writes)
     }
 
     #[inline]

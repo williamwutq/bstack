@@ -102,7 +102,26 @@ Reasons:
 
 ---
 
-## Enabling the `atomic` feature by default
+## Compact `Repeat` staging within a batched commit
+
+**Feature flag:** `set` + `atomic`.
+**Breaking change:** Yes (on-disk journal format / recovery).
+
+### Motivation
+
+A batched commit (the `MultiWrite` mode backing `set_batched` and multi-region `inplace_gen`/`process_gen`) stages every block as literal bytes. So a `Repeat` (above) that shares a batch with other writes loses its `O(1)` staging — it is expanded into the tail as `count·len` bytes. Keeping the compact form in a batch requires the journal to carry a repeat *descriptor* — `(offset, pattern, count)` — for that block, not a literal span, and recovery to replay it.
+
+### Design
+
+The compact form advances the on-disk format wherever it lives — a new encoding under `wip_aux`, in the decrementing-sentinel scheme `algos/WIP.md` already uses for the splice modes — so old binaries must reject a new-format in-progress journal rather than misread it. Only a file with a live in-progress journal at crash time is affected; a cleanly-closed file carries none and stays compatible. `copy` is out of scope here — if wanted it can be added later the same way, as the batched analogue of the single-region `Copy` mode.
+
+### Open questions
+
+- **Where it lives** Three shapes: (a) extend the existing `MultiWrite` mode so a staged block may be a literal span *or* a repeat descriptor; (b) a distinct `wip_aux` mode dedicated to compact fills; or (c) fold it into the proposed 0.5.0 `MultiAtrunc` mode, which already generalises `MultiWrite`. (c) avoids a third multi-region mode when `MultiAtrunc` lands; (a) keeps it usable without waiting on `MultiAtrunc`.
+
+---
+
+## Enabling the `atomic` feature by default (0.5.0)
 
 **Feature flag:** N/A — this changes which features are enabled by default, not a new one.
 **Breaking change:** Yes (0.5.0) — a plain `bstack = "0.5"` dependency (anything without `default-features = false`) now compiles in the `atomic`-gated API surface: `atrunc`, `splice`/`splice_into`, `try_extend`/`try_extend_zeros`/`try_extend_sparse`/`try_extend_sparse_batched`, `try_discard`, and `get_batched_gen`. The larger set gated on `set` *and* `atomic` together — `cross_exchange`, `copy`, `process_gen`, `set_batched`/`inplace_gen`, `swap`/`swap_into`/`cas` — only newly compiles in for consumers who *also* already enable `set`, since `set` itself stays opt-in (see Design below). Consumers who already pin an explicit `features = [...]` list without `atomic` are unaffected; `default-features = false` still builds the bare push/pop/get/peek stack with none of it.

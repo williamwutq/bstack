@@ -84,8 +84,9 @@
 //!   8-byte per-block header tracks state; double-frees caught; bulk
 //!   `alloc_bulk`/`dealloc_bulk` with `atomic`.
 //!
-//! * [`SegregatedBStackAllocator`] — **experimental** segregated (binned)
-//!   free-list allocator (`alloc` + `set`).  Generalises the checked slab to 33
+//! * [`SegregatedBStackAllocator`] — segregated (binned) free-list allocator
+//!   (`alloc` + `set`), the **recommended general-purpose allocator** (fastest
+//!   built-in).  Generalises the checked slab to 33
 //!   size classes sharing one arena; 8-byte per-block header, O(1) classed
 //!   alloc/dealloc, crash-recoverable by linear scan.  `Send` in all
 //!   configurations; `Send + Sync` with `atomic`, where it also implements
@@ -193,7 +194,7 @@
 //! ```
 //!
 //! [`BStackSliceWriter`], [`FirstFitBStackAllocator`], [`SlabBStackAllocator`],
-//! [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`] (experimental),
+//! [`CheckedSlabBStackAllocator`], [`SegregatedBStackAllocator`],
 //! and [`BStackByteVec`] additionally require `set`:
 //!
 //! ```toml

@@ -408,6 +408,45 @@ static int test_realloc_paths(void)
     sg_unlink(tmp); return 0;
 }
 
+/* A non-tail grow forces a move: the block is pinned off the tail, so realloc
+ * must place a larger block, copy the surviving prefix, and free the old one.
+ * Under atomic this is one crash-atomic commit_move — the new block is staged
+ * free, then flipped live as the old is freed, so no in-use orphan can leak.
+ * The result is a clean arena that recover() fully accounts for. */
+static int test_realloc_non_tail_move(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+    bstack_slice_t s, pin, out;
+    uint64_t unsure = 1;
+    uint8_t rd[300];
+    size_t i;
+
+    CHECK(bstack_allocator_alloc(base, 100, &s) == 0);        /* block 112 */
+    CHECK(slice_fill(s, 0x77) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);       /* pins s off the tail */
+    CHECK(bstack_allocator_realloc(base, s, 300, &out) == 0);  /* non-tail grow -> move */
+    CHECK(out.offset != s.offset);                            /* interior grow moves */
+    CHECK(out.len == 300);
+    CHECK(slice_verify(out, 100, 0x77, "move-prefix") == 0);  /* surviving prefix */
+    CHECK(bstack_slice_read_into(out, rd, 300) == 0);
+    for (i = 100; i < 300; i++) CHECK(rd[i] == 0);            /* grown tail is zero */
+
+    /* No leak: recover fully accounts for the arena (old block freed, none
+     * orphaned in use), and the moved block still reads back intact. */
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    CHECK(slice_verify(out, 100, 0x77, "move-after-recover") == 0);
+
+    CHECK(bstack_allocator_dealloc(base, out) == 0);
+    CHECK(bstack_allocator_dealloc(base, pin) == 0);
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 /* Tail shrink whose excess reaches SPLIT_MIN (256).  With atomic it is one
  * LEN + SPLICE transaction: the block is replaced by its shrunk self at the same
  * offset and the excess goes back to the stack.  Without atomic recording the
@@ -425,11 +464,11 @@ static int test_realloc_tail_shrink(void)
 
     bstack_slice_t s, out;
     uint64_t before, after, off;
-    CHECK(bstack_allocator_alloc(base, 500, &s) == 0);  /* block 512, at the tail */
+    CHECK(bstack_allocator_alloc(base, 4500, &s) == 0); /* block 4512, at the tail */
     CHECK(slice_fill(s, 0x3C3C) == 0);
     off = s.offset;
     CHECK(bstack_len(bs, &before) == 0);
-    /* class 112 < 512, excess 400 >= SPLIT_MIN */
+    /* class 112, excess 4400 >= SPLIT_MIN */
     CHECK(bstack_allocator_realloc(base, s, 100, &out) == 0);
     CHECK(out.len == 100);
     CHECK(slice_verify(out, 100, 0x3C3C, "tail-shrink") == 0);
@@ -846,7 +885,7 @@ static int test_bulk_reuses_and_scrubs(void)
 }
 
 /* An oversized request matches a freed oversized block; slack at or above
- * SPLIT_MIN is carved back into class blocks that stay reusable. */
+ * SPLIT_MIN is carved back into a reusable block. */
 static int test_bulk_oversized_match_and_carve(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -858,20 +897,20 @@ static int test_bulk_oversized_match_and_carve(void)
     bstack_slice_t x, pin, out[1], rem;
     uint64_t off_x, lens[1], unsure;
 
-    CHECK(bstack_allocator_alloc(base, 5000, &x) == 0); /* oversized, block 5008 */
+    CHECK(bstack_allocator_alloc(base, 9000, &x) == 0); /* oversized, block 9008 */
     off_x = x.offset;
     CHECK(bstack_allocator_alloc(base, 50, &pin) == 0); /* keeps X off the tail */
     CHECK(bstack_allocator_dealloc(base, x) == 0);      /* X -> oversized list */
 
-    /* 4200 -> block 4208 (oversized); excess 800 >= SPLIT_MIN, so it carves. */
+    /* 4200 -> block 4208 (oversized); excess 4800 >= SPLIT_MIN, so it carves. */
     lens[0] = 4200;
     CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
     CHECK(out[0].offset == off_x);
     CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
     CHECK(unsure == 0); /* every carved piece strides its recorded size */
 
-    /* The 768-byte remainder is on its class list and recycles. */
-    CHECK(bstack_allocator_alloc(base, 700, &rem) == 0);
+    /* The 4800-byte remainder (> MAX_CLASS) is one oversized block and recycles. */
+    CHECK(bstack_allocator_alloc(base, 4790, &rem) == 0); /* need 4800, oversized reuse */
     CHECK(rem.offset == off_x - 8 + 4208 + 8);
 
     CHECK(bstack_allocator_dealloc(base, rem) == 0);
@@ -1119,6 +1158,7 @@ int main(void)
     T(test_dealloc_reuses_block);
     T(test_double_free_and_mismatch_detected);
     T(test_realloc_paths);
+    T(test_realloc_non_tail_move);
     T(test_realloc_tail_shrink);
     T(test_realloc_small_shrink_retained);
     T(test_oversized_reuse_retains_small_excess);
