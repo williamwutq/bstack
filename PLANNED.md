@@ -107,10 +107,6 @@ Reasons:
 **Feature flag:** `alloc` + `set` (existing gates).
 **Breaking change:** No.
 
-### Fuse the `realloc_inplace` front-edge carves
-
-`shrink_front_inplace` and `grow_front_inplace` still run as a `recovery_needed`-bracketed run of separate `set`s plus an `add_to_free_list`/`unlink` — even though the carve is length-preserving (the cascade is a no-op; no `extend`/`discard`). Each is the shape `try_grow_into_next_free` already collapses: derive the final free-list state, then commit every metadata word in one crash-atomic `inplace_gen`, dropping the bracket and its two syncs. `grow_back_inplace` stays as is — its only physical-growth path is a tail `extend`, a length change that cannot ride `inplace_gen` until the 0.5.0 size-changing primitive.
-
 ### Keep the reopen scan header-only
 
 The `recovery_needed` reopen scan reads only block headers, so it stays valid regardless of which paths arm the flag and any 0.4.x file recovers unchanged. This is a fixed design point: the fusions and hardening above, and any later change to the flag-arming set, must not require the scan to read a block's payload.
