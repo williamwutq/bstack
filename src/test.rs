@@ -6410,11 +6410,24 @@ mod first_fit_tests {
         alloc.dealloc(b).unwrap();
         let stack = alloc.into_stack();
 
-        // Corrupt: set recovery_needed=1 and scramble free_head to garbage
-        stack.set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
-        stack
-            .set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
-            .unwrap();
+        // Corrupt: set recovery_needed=1 and scramble free_head to garbage. These
+        // are allocator-metadata writes (the header is protected under the ACL
+        // feature), so present ALLOC authority.
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            stack.set(24, 1u32.to_le_bytes()).unwrap(); // flags byte → recovery_needed=1
+            stack
+                .set(FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
+                .unwrap();
+        }
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            let auth = crate::BStackAccessAuthorities::ALLOC;
+            stack.set_as(auth, 24, 1u32.to_le_bytes()).unwrap();
+            stack
+                .set_as(auth, FREE_HEAD_OFFSET, 0xDEADBEEFu64.to_le_bytes())
+                .unwrap();
+        }
         drop(stack);
 
         // Re-open: recovery should run and rebuild the free list from is_free flags
@@ -6757,9 +6770,19 @@ mod first_fit_tests {
         // and the in-memory poison set. The disk flag drives reopen recovery; the
         // poison is what the single atomic-call paths (which no longer arm the flag
         // themselves) check to refuse.
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         alloc
             .stack()
             .set(24u64, 1u32.to_le_bytes().as_slice())
+            .unwrap();
+        #[cfg(feature = "expensive-slice-access-control")]
+        alloc
+            .stack()
+            .set_as(
+                crate::BStackAccessAuthorities::ALLOC,
+                24u64,
+                1u32.to_le_bytes().as_slice(),
+            )
             .unwrap();
         alloc.poison_for_test();
 

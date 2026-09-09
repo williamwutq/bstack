@@ -92,6 +92,12 @@ use std::{fmt, io};
 /// ```
 pub struct LinearBStackAllocator {
     stack: BStack,
+    /// The allocator capability, held so no outside caller can mint alloc
+    /// authority over the arena. `LinearBStackAllocator` marks no metadata, so it
+    /// never presents the token — it just holds it, and hands it back on
+    /// [`into_stack`](crate::BStackAllocator::into_stack).
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -106,6 +112,10 @@ impl LinearBStackAllocator {
     #[must_use]
     pub fn new(stack: BStack) -> Self {
         Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth: stack
+                .take_alloc_authority()
+                .expect("fresh stack owns its alloc permit"),
             stack,
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
@@ -145,6 +155,10 @@ impl BStackAllocator for LinearBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -259,6 +273,9 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, handle));
+        }
         (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
             if end == current_tail {
@@ -283,6 +300,9 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, handle));
+        }
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
         self.stack
             .try_discard(end, len)
@@ -422,6 +442,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             return Ok(());
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
+        for h in &sorted {
+            if let Err(source) = self.stack.acl_reclaimable(h.start(), h.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, sorted));
+            }
+        }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
@@ -459,6 +484,11 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             return Ok(());
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
+        for h in &sorted {
+            if let Err(source) = self.stack.acl_reclaimable(h.start(), h.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, sorted));
+            }
+        }
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
