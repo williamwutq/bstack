@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Runtime range access control: the `expensive-slice-access-control` feature (implies `alloc` + `set`; Rust only; off by default).** A per-stack point table assigns an access mode to every payload offset, and each mutating/reading entry point (`set`/`get`/`push`/`pop`/`extend`/`resize`/`ensure`/`swap`/`splice`/`atrunc`/`cas`/`copy`/`process`/`process_gen`/`inplace_gen` and the batched/sparse/`try_*` variants) checks the touched range's required authority before committing, failing with `io::ErrorKind::PermissionDenied` on denial. Protection is armed through `BStackOwnedSlice::protect`/`protect_as` and carried by two one-shot, `!Clone`, pointer-identity-checked capability tokens — `BStackProtection` (guard authority, minted once via `take_protection`) and `BStackAllocAuthority` (allocator authority, `take_alloc_authority`) — which are mutually incomparable, so a token from a different stack or the wrong axis grants nothing. A holder reaches a protected range through the `_as` sibling of any checked method (`set_as`, `get_as`, `swap_as`, `resize_as`, `push_as`, …); a `BStackOwnedSlice`/`BStackSlice` granted an authority via `authorize` routes its region I/O through them automatically, and `merge`/`merge_adjacent` refuse when two views carry different authorities. New public types: `BStackAccess`, `AccessOp`, `BStackAccessRequirement`, `BStackAccessAuthorities`, `BStackProtection`, `BStackAllocAuthority`, `BStackAuthority`. The whole feature compiles away when off — the check macro folds to nothing and a build without the feature is byte-for-byte unchanged.
+- **Allocators reserve their own metadata and refuse to free protected regions (`expensive-slice-access-control`; Rust only).** Every built-in allocator burns the alloc-authority mint on construction and marks its fixed header `Alloc`, routing its own metadata I/O through that authority so a protected header cannot be corrupted. `dealloc`/`dealloc_bulk` refuse to free any range still carrying a caller mode outside `{All, Alloc}`, returning `PermissionDenied` and handing the handle(s) back intact rather than silently dropping the caller's protection into the region's next owner; the caller must lift its own `protect` first.
+
 ## [0.4.4] - 2026-09-04
 
 ### Added
