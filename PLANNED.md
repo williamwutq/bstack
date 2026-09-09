@@ -102,17 +102,6 @@ Reasons:
 
 ---
 
-## Incremental atomicity refactors for `FirstFitBStackAllocator`
-
-**Feature flag:** `alloc` + `set` (existing gates).
-**Breaking change:** No.
-
-### Keep the reopen scan header-only
-
-The `recovery_needed` reopen scan reads only block headers, so it stays valid regardless of which paths arm the flag and any 0.4.x file recovers unchanged. This is a fixed design point: the fusions and hardening above, and any later change to the flag-arming set, must not require the scan to read a block's payload.
-
----
-
 ## Compact `Repeat` staging within a batched commit
 
 **Feature flag:** `set` + `atomic`.
