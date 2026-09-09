@@ -31,6 +31,35 @@ macro_rules! acl_check {
 }
 pub(crate) use acl_check;
 
+/// Define a non-generic allocator-metadata I/O helper on `BStack`. With the
+/// `expensive-slice-access-control` feature it presents synthetic
+/// [`ALLOC`](crate::BStackAccessAuthorities::ALLOC) authority to the
+/// token-carrying `_as` op (the header stays permanently `Alloc`-marked, so the
+/// allocator's own write is admitted); without the feature it is the plain op.
+/// One definition serves both builds, so there is no separate shim. The
+/// generator/`set_batched` helpers are generic and written out by hand.
+#[cfg(all(feature = "alloc", feature = "set"))]
+macro_rules! meta_dispatch {
+    (
+        $(#[$attr:meta])*
+        [$op:ident / $op_as:ident]
+        fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty
+    ) => {
+        $(#[$attr])*
+        #[inline]
+        pub(crate) fn $name(&self, $($arg: $ty),*) -> $ret {
+            #[cfg(feature = "expensive-slice-access-control")]
+            {
+                self.$op_as(crate::BStackAccessAuthorities::ALLOC, $($arg),*)
+            }
+            #[cfg(not(feature = "expensive-slice-access-control"))]
+            {
+                self.$op($($arg),*)
+            }
+        }
+    };
+}
+
 #[cfg(feature = "expensive-slice-access-control")]
 mod inner {
     use crate::fault::fault_point;
@@ -767,79 +796,6 @@ mod inner {
                 },
                 _ => Self::mark_replay(replay, journaled_multi_overlay(file, data_size, &overlay)),
             }
-        }
-
-        /// Overwrite allocator metadata at `offset`, presenting allocator
-        /// authority so a permanently [`Alloc`](BStackAccess)-marked region (the
-        /// header) accepts the allocator's own write. The `meta_*` family is how
-        /// an allocator does metadata I/O uniformly across feature configurations;
-        /// without the feature they are the plain ops (see the shim).
-        // Used by the non-atomic allocator paths; the atomic paths route free-list
-        // writes through the generators instead, so this is dead in `atomic`-only
-        // builds until more allocators adopt it.
-        #[allow(dead_code)]
-        pub(crate) fn meta_set(&self, offset: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
-            self.set_as(BStackAccessAuthorities::ALLOC, offset, data)
-        }
-
-        /// Read a little-endian `u64` of allocator metadata at `offset`, presenting
-        /// allocator authority. See [`meta_set`](Self::meta_set).
-        #[allow(dead_code)]
-        pub(crate) fn meta_read_u64(&self, offset: u64) -> io::Result<u64> {
-            let mut buf = [0u8; 8];
-            self.get_into_as(BStackAccessAuthorities::ALLOC, offset, &mut buf)?;
-            Ok(u64::from_le_bytes(buf))
-        }
-
-        /// [`cross_exchange`](BStack::cross_exchange) of allocator metadata,
-        /// presenting allocator authority. See [`meta_set`](Self::meta_set).
-        #[cfg(feature = "atomic")]
-        pub(crate) fn meta_cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
-            self.cross_exchange_as(BStackAccessAuthorities::ALLOC, a, b, n)
-        }
-
-        /// [`process_gen`](BStack::process_gen) run as the allocator (see
-        /// [`process_gen_as`](Self::process_gen_as)). See [`meta_set`](Self::meta_set).
-        #[cfg(feature = "atomic")]
-        pub(crate) fn meta_process_gen<'a, F>(&self, f: F) -> io::Result<()>
-        where
-            F: FnMut() -> Option<BStackGenOp<'a>>,
-        {
-            self.process_gen_as(BStackAccessAuthorities::ALLOC, f)
-        }
-
-        /// [`inplace_gen`](BStack::inplace_gen) run as the allocator (see
-        /// [`inplace_gen_as`](Self::inplace_gen_as)). See [`meta_set`](Self::meta_set).
-        #[cfg(feature = "atomic")]
-        pub(crate) fn meta_inplace_gen<'a, F>(&self, f: F) -> io::Result<()>
-        where
-            F: FnMut(io::Result<()>) -> Option<BStackGenOp<'a>>,
-        {
-            self.inplace_gen_as(BStackAccessAuthorities::ALLOC, f)
-        }
-
-        /// [`set_batched`](BStack::set_batched) of allocator metadata, presenting
-        /// allocator authority. See [`meta_set`](Self::meta_set).
-        #[cfg(feature = "atomic")]
-        pub(crate) fn meta_set_batched<I, D>(&self, writes: I) -> io::Result<()>
-        where
-            I: IntoIterator<Item = (u64, D)>,
-            D: AsRef<[u8]>,
-        {
-            self.set_batched_as(BStackAccessAuthorities::ALLOC, writes)
-        }
-
-        /// [`cas`](BStack::cas) of allocator metadata, presenting allocator
-        /// authority. See [`meta_set`](Self::meta_set).
-        #[cfg(feature = "atomic")]
-        #[allow(dead_code)]
-        pub(crate) fn meta_cas(
-            &self,
-            offset: u64,
-            old: impl AsRef<[u8]>,
-            new: impl AsRef<[u8]>,
-        ) -> io::Result<bool> {
-            self.cas_as(BStackAccessAuthorities::ALLOC, offset, old, new)
         }
 
         /// Arm `[offset, offset + len)` with `mode`, presenting `auth`. Crate-internal.
@@ -2813,71 +2769,91 @@ impl crate::BStack {
     }
 }
 
-// Metadata I/O shims: without the feature these are the plain ops (no marking to
-// respect), so an allocator calls the same `meta_*` methods in every config.
-#[cfg(all(feature = "set", not(feature = "expensive-slice-access-control")))]
+// Allocator-metadata I/O, generated by `meta_dispatch!` (defined at the module
+// root). One definition per method serves every feature configuration.
+#[cfg(all(feature = "alloc", feature = "set"))]
 impl crate::BStack {
-    #[inline]
-    #[allow(dead_code)] // see the gated sibling
-    pub(crate) fn meta_set(&self, offset: u64, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-        self.set(offset, data)
-    }
+    meta_dispatch!(
+        #[allow(dead_code)]
+        [set / set_as]
+        fn meta_set(offset: u64, data: impl AsRef<[u8]>) -> std::io::Result<()>
+    );
 
+    /// Read a little-endian `u64` of allocator metadata at `offset`. See the
+    /// `meta_dispatch!`-generated siblings; the read is followed by a decode, so
+    /// this one is written out rather than generated.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn meta_read_u64(&self, offset: u64) -> std::io::Result<u64> {
         let mut buf = [0u8; 8];
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.get_into_as(crate::BStackAccessAuthorities::ALLOC, offset, &mut buf)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         self.get_into(offset, &mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }
 }
 
-#[cfg(all(
-    feature = "alloc",
-    feature = "set",
-    feature = "atomic",
-    not(feature = "expensive-slice-access-control")
-))]
+#[cfg(all(feature = "alloc", feature = "set", feature = "atomic"))]
 impl crate::BStack {
-    #[inline]
-    pub(crate) fn meta_cross_exchange(&self, a: u64, b: u64, n: u64) -> std::io::Result<()> {
-        self.cross_exchange(a, b, n)
-    }
+    meta_dispatch!(
+        [cross_exchange / cross_exchange_as]
+        fn meta_cross_exchange(a: u64, b: u64, n: u64) -> std::io::Result<()>
+    );
+    meta_dispatch!(
+        #[allow(dead_code)]
+        [cas / cas_as]
+        fn meta_cas(offset: u64, old: impl AsRef<[u8]>, new: impl AsRef<[u8]>) -> std::io::Result<bool>
+    );
 
+    /// `process_gen` run as the allocator. Generic, so written out rather than
+    /// generated; see the `meta_dispatch!` siblings.
     #[inline]
     pub(crate) fn meta_process_gen<'a, F>(&self, f: F) -> std::io::Result<()>
     where
         F: FnMut() -> Option<crate::BStackGenOp<'a>>,
     {
-        self.process_gen(f)
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.process_gen_as(crate::BStackAccessAuthorities::ALLOC, f)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.process_gen(f)
+        }
     }
 
+    /// `inplace_gen` run as the allocator. See [`meta_process_gen`](Self::meta_process_gen).
     #[inline]
     pub(crate) fn meta_inplace_gen<'a, F>(&self, f: F) -> std::io::Result<()>
     where
         F: FnMut(std::io::Result<()>) -> Option<crate::BStackGenOp<'a>>,
     {
-        self.inplace_gen(f)
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.inplace_gen_as(crate::BStackAccessAuthorities::ALLOC, f)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.inplace_gen(f)
+        }
     }
 
+    /// `set_batched` of allocator metadata. See [`meta_process_gen`](Self::meta_process_gen).
     #[inline]
     pub(crate) fn meta_set_batched<I, D>(&self, writes: I) -> std::io::Result<()>
     where
         I: IntoIterator<Item = (u64, D)>,
         D: AsRef<[u8]>,
     {
-        self.set_batched(writes)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn meta_cas(
-        &self,
-        offset: u64,
-        old: impl AsRef<[u8]>,
-        new: impl AsRef<[u8]>,
-    ) -> std::io::Result<bool> {
-        self.cas(offset, old, new)
+        #[cfg(feature = "expensive-slice-access-control")]
+        {
+            self.set_batched_as(crate::BStackAccessAuthorities::ALLOC, writes)
+        }
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        {
+            self.set_batched(writes)
+        }
     }
 }
 

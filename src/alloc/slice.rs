@@ -10,6 +10,30 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::{Deref, Range};
 
+/// Define a `BStackSlice` I/O dispatch helper: with the
+/// `expensive-slice-access-control` feature it presents this slice's stored
+/// `auth` to the token-carrying `_as` entry point; without it, the plain
+/// tokenless op. All offsets are absolute.
+macro_rules! s_dispatch {
+    (
+        $(#[$attr:meta])*
+        fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty => $op:ident / $op_as:ident
+    ) => {
+        $(#[$attr])*
+        #[inline]
+        fn $name(&self, $($arg: $ty),*) -> $ret {
+            #[cfg(feature = "expensive-slice-access-control")]
+            {
+                self.stack.$op_as(self.auth, $($arg),*)
+            }
+            #[cfg(not(feature = "expensive-slice-access-control"))]
+            {
+                self.stack.$op($($arg),*)
+            }
+        }
+    };
+}
+
 /// A raw `(offset, len)` coordinate pair with no backing reference.
 ///
 /// `BStackRange` is the serialization and persistence representation: store it on
@@ -805,172 +829,20 @@ impl<'a> BStackSlice<'a> {
         self.auth = auth.authorities_for(self.stack);
     }
 
-    // Dispatch helpers: route slice I/O through the stack's token-carrying
-    // entry points with this slice's stored authority, or the plain tokenless
-    // ones without the access-control feature. Offsets are absolute.
-    #[cfg(feature = "set")]
-    #[inline]
-    fn s_set(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.set_as(self.auth, offset, data)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.set(offset, data)
-        }
-    }
-
-    #[cfg(feature = "set")]
-    #[inline]
-    fn s_zero(&self, offset: u64, n: u64) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.zero_as(self.auth, offset, n)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.zero(offset, n)
-        }
-    }
-
-    #[cfg(feature = "set")]
-    #[inline]
-    fn s_repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.repeat_as(self.auth, offset, pattern, count)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.repeat(offset, pattern, count)
-        }
-    }
-
-    #[inline]
-    fn s_get(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.get_as(self.auth, start, end)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.get(start, end)
-        }
-    }
-
-    #[inline]
-    fn s_get_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.get_into_as(self.auth, start, buf)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.get_into(start, buf)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_copy(&self, from: u64, to: u64, n: u64) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.copy_as(self.auth, from, to, n)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.copy(from, to, n)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_process<F: FnOnce(&mut [u8])>(&self, start: u64, end: u64, f: F) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.process_as(self.auth, start, end, f)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.process(start, end, f)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack.cross_exchange_as(self.auth, a, b, n)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.cross_exchange(a, b, n)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_eq_crds(
-        &self,
-        a_offset: u64,
-        a_expected: impl AsRef<[u8]>,
-        b_offset: u64,
-        b_buf: impl AsRef<[u8]>,
-    ) -> io::Result<Option<Vec<u8>>> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack
-                .eq_crds_as(self.auth, a_offset, a_expected, b_offset, b_buf)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.eq_crds(a_offset, a_expected, b_offset, b_buf)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_ne_crds(
-        &self,
-        a_offset: u64,
-        a_expected: impl AsRef<[u8]>,
-        b_offset: u64,
-        b_buf: impl AsRef<[u8]>,
-    ) -> io::Result<Option<Vec<u8>>> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack
-                .ne_crds_as(self.auth, a_offset, a_expected, b_offset, b_buf)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack.ne_crds(a_offset, a_expected, b_offset, b_buf)
-        }
-    }
-
-    #[cfg(all(feature = "set", feature = "atomic"))]
-    #[inline]
-    fn s_masked_eq_crds(
-        &self,
-        a_offset: u64,
-        mask: impl AsRef<[u8]>,
-        a_expected: impl AsRef<[u8]>,
-        b_offset: u64,
-        b_buf: impl AsRef<[u8]>,
-    ) -> io::Result<Option<Vec<u8>>> {
-        #[cfg(feature = "expensive-slice-access-control")]
-        {
-            self.stack
-                .masked_eq_crds_as(self.auth, a_offset, mask, a_expected, b_offset, b_buf)
-        }
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        {
-            self.stack
-                .masked_eq_crds(a_offset, mask, a_expected, b_offset, b_buf)
-        }
-    }
+    // Dispatch helpers, generated by `s_dispatch!`: route slice I/O through the
+    // stack's token-carrying `_as` entry point with this slice's stored authority,
+    // or the plain tokenless op without the access-control feature.
+    s_dispatch!(#[cfg(feature = "set")] fn s_set(offset: u64, data: &[u8]) -> io::Result<()> => set / set_as);
+    s_dispatch!(#[cfg(feature = "set")] fn s_zero(offset: u64, n: u64) -> io::Result<()> => zero / zero_as);
+    s_dispatch!(#[cfg(feature = "set")] fn s_repeat(offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> => repeat / repeat_as);
+    s_dispatch!(fn s_get(start: u64, end: u64) -> io::Result<Vec<u8>> => get / get_as);
+    s_dispatch!(fn s_get_into(start: u64, buf: &mut [u8]) -> io::Result<()> => get_into / get_into_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_copy(from: u64, to: u64, n: u64) -> io::Result<()> => copy / copy_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_process(start: u64, end: u64, f: impl FnOnce(&mut [u8])) -> io::Result<()> => process / process_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_cross_exchange(a: u64, b: u64, n: u64) -> io::Result<()> => cross_exchange / cross_exchange_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_eq_crds(a_offset: u64, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => eq_crds / eq_crds_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_ne_crds(a_offset: u64, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => ne_crds / ne_crds_as);
+    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_masked_eq_crds(a_offset: u64, mask: impl AsRef<[u8]>, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => masked_eq_crds / masked_eq_crds_as);
 
     /// Zero out the entire slice.
     ///
