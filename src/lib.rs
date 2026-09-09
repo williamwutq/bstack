@@ -742,8 +742,6 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "expensive-slice-access-control")]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
@@ -961,13 +959,16 @@ pub struct BStack {
     /// persisted — reopening clears it.
     #[cfg(feature = "expensive-slice-access-control")]
     acl: RwLock<acl_core::PointTable>,
-    /// One-shot guard-token flag: set the first time [`take_protection`] mints
-    /// the token, `None` thereafter.
+    /// One-shot guard-token permit: `Some(())` until [`take_protection`] moves it
+    /// out to mint the token, `None` after (until [`return_protection`] hands it
+    /// back). The move-out is what makes the token mean anything — there is only
+    /// ever one guard authority per stack.
     #[cfg(feature = "expensive-slice-access-control")]
-    protection_taken: AtomicBool,
-    /// One-shot allocator-token flag, minted by [`take_alloc_authority`].
+    protection: Mutex<Option<()>>,
+    /// One-shot allocator-token permit, the [`take_alloc_authority`] /
+    /// [`return_alloc_authority`] counterpart of [`protection`](Self::protection).
     #[cfg(feature = "expensive-slice-access-control")]
-    alloc_authority_taken: AtomicBool,
+    alloc_authority: Mutex<Option<()>>,
 }
 
 // `BStack` is auto-`Send + Sync` on every platform: all fields
@@ -1183,10 +1184,9 @@ impl BStack {
             #[cfg(feature = "expensive-slice-access-control")]
             acl: RwLock::new(acl_core::PointTable::new()),
             #[cfg(feature = "expensive-slice-access-control")]
+            protection: Mutex::new(Some(())),
             #[cfg(feature = "expensive-slice-access-control")]
-            protection_taken: AtomicBool::new(false),
-            #[cfg(feature = "expensive-slice-access-control")]
-            alloc_authority_taken: AtomicBool::new(false),
+            alloc_authority: Mutex::new(Some(())),
         })
     }
 

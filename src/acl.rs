@@ -105,23 +105,28 @@ mod inner {
     /// A one-shot capability token authorizing guard-level access to a stack's
     /// protected ranges.
     ///
-    /// Minted at most once per handle via [`BStack::take_protection`]; neither
-    /// `Clone` nor `Copy`, so the authority cannot be duplicated. Present it to a
-    /// `*_as` entry point to act on a [`Prot`](BStackAccess::Prot)/
-    /// [`RwProt`](BStackAccess::RwProt) range or to re-arm a range this token
-    /// governs. Incomparable with [`BStackAllocAuthority`]: neither reaches the
-    /// other's private ranges.
-    pub struct BStackProtection<'a> {
-        stack: &'a BStack,
+    /// Minted at most once per stack via [`BStack::take_protection`] (there is only
+    /// ever one guard authority per stack); neither `Clone` nor `Copy`, so it
+    /// cannot be duplicated. It is owned (it records its origin stack's identity
+    /// rather than borrowing it), so a holder may store it — e.g. a wrapper that
+    /// owns the stack by value — and hand it back with
+    /// [`BStack::return_protection`]. Present it to a `*_as` entry point to act on a
+    /// [`Prot`](BStackAccess::Prot)/[`RwProt`](BStackAccess::RwProt) range or to
+    /// re-arm a range it governs. Incomparable with [`BStackAllocAuthority`]:
+    /// neither reaches the other's private ranges.
+    pub struct BStackProtection {
+        origin: u64,
     }
 
     /// A one-shot capability token authorizing allocator-level access to a stack's
     /// [`Alloc`](BStackAccess::Alloc) ranges.
     ///
-    /// Minted at most once per handle via [`BStack::take_alloc_authority`]; neither
-    /// `Clone` nor `Copy`. Incomparable with [`BStackProtection`].
-    pub struct BStackAllocAuthority<'a> {
-        stack: &'a BStack,
+    /// The allocator-axis counterpart of [`BStackProtection`], with the same
+    /// one-per-stack owned move-out shape (mint via [`BStack::take_alloc_authority`],
+    /// hand back via [`BStack::return_alloc_authority`]); neither `Clone` nor
+    /// `Copy`. Incomparable with [`BStackProtection`].
+    pub struct BStackAllocAuthority {
+        origin: u64,
     }
 
     /// A presented access token, resolved to the authorities it carries for the
@@ -149,12 +154,12 @@ mod inner {
         }
     }
 
-    impl BStackAuthority for &BStackProtection<'_> {
+    impl BStackAuthority for &BStackProtection {
         #[inline]
         fn authorities_for(&self, stack: &BStack) -> BStackAccessAuthorities {
-            // `BStack: Eq` is pointer identity, so this rejects a token minted
-            // from any other stack.
-            if self.stack == stack {
+            // The token records its origin stack's identity, so this rejects a
+            // token minted from any other stack.
+            if self.origin == stack.acl_identity() {
                 BStackAccessAuthorities::GUARD
             } else {
                 BStackAccessAuthorities::NONE
@@ -162,10 +167,10 @@ mod inner {
         }
     }
 
-    impl BStackAuthority for &BStackAllocAuthority<'_> {
+    impl BStackAuthority for &BStackAllocAuthority {
         #[inline]
         fn authorities_for(&self, stack: &BStack) -> BStackAccessAuthorities {
-            if self.stack == stack {
+            if self.origin == stack.acl_identity() {
                 BStackAccessAuthorities::ALLOC
             } else {
                 BStackAccessAuthorities::NONE
@@ -174,26 +179,71 @@ mod inner {
     }
 
     impl BStack {
-        /// Mint the guard capability [token](BStackProtection) for this handle, or
-        /// `None` if it has already been taken. One-shot minting is what makes the
-        /// token mean anything.
+        /// This stack's identity, recorded in a minted token and re-checked when it
+        /// is presented, so a token only ever authorizes the stack it came from.
+        /// The fd (Unix) / handle (Windows) — unique among live stacks, matching
+        /// the [`Hash`]/[`PartialEq`] identity — or the instance address elsewhere.
         #[inline]
-        pub fn take_protection(&self) -> Option<BStackProtection<'_>> {
-            if self.protection_taken.swap(true, Ordering::AcqRel) {
-                None
-            } else {
-                Some(BStackProtection { stack: self })
+        pub(crate) fn acl_identity(&self) -> u64 {
+            #[cfg(unix)]
+            {
+                self.fd as u64
+            }
+            #[cfg(windows)]
+            {
+                self.handle as u64
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                self as *const BStack as u64
             }
         }
 
-        /// Mint the allocator capability [token](BStackAllocAuthority) for this
-        /// handle, or `None` if it has already been taken.
+        /// Move out the guard capability [token](BStackProtection), or `None` if it
+        /// has already been taken (until [`return_protection`](Self::return_protection)
+        /// hands it back). The one-shot move-out is what makes the token mean
+        /// anything.
         #[inline]
-        pub fn take_alloc_authority(&self) -> Option<BStackAllocAuthority<'_>> {
-            if self.alloc_authority_taken.swap(true, Ordering::AcqRel) {
-                None
-            } else {
-                Some(BStackAllocAuthority { stack: self })
+        pub fn take_protection(&self) -> Option<BStackProtection> {
+            self.protection
+                .lock()
+                .unwrap()
+                .take()
+                .map(|()| BStackProtection {
+                    origin: self.acl_identity(),
+                })
+        }
+
+        /// Hand a guard token back to the stack it came from, so a later
+        /// [`take_protection`](Self::take_protection) can mint again. A token from a
+        /// different stack is dropped without re-arming this one.
+        #[inline]
+        pub fn return_protection(&self, token: BStackProtection) {
+            if token.origin == self.acl_identity() {
+                *self.protection.lock().unwrap() = Some(());
+            }
+        }
+
+        /// Move out the allocator capability [token](BStackAllocAuthority), or
+        /// `None` if it has already been taken. See
+        /// [`take_protection`](Self::take_protection).
+        #[inline]
+        pub fn take_alloc_authority(&self) -> Option<BStackAllocAuthority> {
+            self.alloc_authority
+                .lock()
+                .unwrap()
+                .take()
+                .map(|()| BStackAllocAuthority {
+                    origin: self.acl_identity(),
+                })
+        }
+
+        /// Hand an allocator token back to the stack it came from. See
+        /// [`return_protection`](Self::return_protection).
+        #[inline]
+        pub fn return_alloc_authority(&self, token: BStackAllocAuthority) {
+            if token.origin == self.acl_identity() {
+                *self.alloc_authority.lock().unwrap() = Some(());
             }
         }
 
@@ -3252,6 +3302,40 @@ mod acl_tests {
         assert!(s.take_protection().is_none());
         assert!(s.take_alloc_authority().is_some());
         assert!(s.take_alloc_authority().is_none());
+    }
+
+    #[test]
+    fn returned_token_can_be_reminted() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let prot = s.take_protection().expect("first mint");
+        assert!(s.take_protection().is_none(), "one-shot while held");
+        s.return_protection(prot);
+        assert!(s.take_protection().is_some(), "re-mintable after return");
+
+        let auth = s.take_alloc_authority().expect("first alloc mint");
+        assert!(s.take_alloc_authority().is_none());
+        s.return_alloc_authority(auth);
+        assert!(s.take_alloc_authority().is_some());
+    }
+
+    #[test]
+    fn returning_a_foreign_token_does_not_rearm() {
+        let (s1, p1) = mk();
+        let _g1 = Guard(p1);
+        let (s2, p2) = mk();
+        let _g2 = Guard(p2);
+        let from_s1 = s1.take_protection().unwrap();
+        let from_s2 = s2.take_protection().unwrap();
+        // s1's token carries s1's identity, so handing it to s2 is a no-op.
+        s2.return_protection(from_s1);
+        assert!(
+            s2.take_protection().is_none(),
+            "a foreign token must not re-arm the mint"
+        );
+        // s2's own token hands back and re-mints normally.
+        s2.return_protection(from_s2);
+        assert!(s2.take_protection().is_some());
     }
 
     #[test]
