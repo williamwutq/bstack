@@ -776,7 +776,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "expensive-slice-access-control")]
     #[inline]
     pub(crate) fn protect(&self, mode: BStackAccess) -> io::Result<()> {
-        self.stack.protect(self.start(), self.len(), mode)
+        self.stack.protect_as((), self.start(), self.len(), mode)
     }
 
     /// [`protect`](Self::protect) presenting an access token. Crate-internal; the

@@ -148,6 +148,7 @@ mod inner {
         /// Mint the guard capability [token](BStackProtection) for this handle, or
         /// `None` if it has already been taken. One-shot minting is what makes the
         /// token mean anything.
+        #[inline]
         pub fn take_protection(&self) -> Option<BStackProtection<'_>> {
             if self.protection_taken.swap(true, Ordering::AcqRel) {
                 None
@@ -158,6 +159,7 @@ mod inner {
 
         /// Mint the allocator capability [token](BStackAllocAuthority) for this
         /// handle, or `None` if it has already been taken.
+        #[inline]
         pub fn take_alloc_authority(&self) -> Option<BStackAllocAuthority<'_>> {
             if self.alloc_authority_taken.swap(true, Ordering::AcqRel) {
                 None
@@ -840,31 +842,14 @@ mod inner {
             self.cas_as(BStackAccessAuthorities::ALLOC, offset, old, new)
         }
 
-        /// Arm `[offset, offset + len)` with `mode`, tokenless.
+        /// Arm `[offset, offset + len)` with `mode`, presenting `auth`. Crate-internal.
         ///
-        /// Crate-internal: all public protection goes through
+        /// All public protection goes through
         /// [`BStackOwnedSlice::protect`](crate::BStackOwnedSlice::protect), which
         /// bounds the range to a genuine allocation rather than an arbitrary span.
+        /// Nothing is persisted, so reopening clears the policy.
         ///
-        /// A tokenless caller may only tighten a range that is currently
-        /// [`All`](BStackAccess::All) everywhere; arming a range already governed by
-        /// a token is [`PermissionDenied`](io::ErrorKind::PermissionDenied). Present a
-        /// token via `protect_as` to re-mode a range you own. Nothing is persisted,
-        /// so reopening clears the policy.
-        ///
-        /// # Errors
-        ///
-        /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `offset + len` overflows;
-        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range is not
-        /// entirely unprotected.
-        pub(crate) fn protect(&self, offset: u64, len: u64, mode: BStackAccess) -> io::Result<()> {
-            self.protect_as((), offset, len, mode)
-        }
-
-        /// Arm `[offset, offset + len)` with `mode`, presenting `auth`. Crate-internal;
-        /// see [`protect`](Self::protect).
-        ///
-        /// The token sibling of `protect`: a caller may re-mode any range whose
+        /// A caller may re-mode any range whose
         /// current mode its token can already write (which, by the incomparability
         /// of the two tokens, keeps a guard out of [`Alloc`](BStackAccess::Alloc)
         /// ranges and an allocator out of [`Prot`](BStackAccess::Prot) ranges). A
@@ -999,6 +984,7 @@ mod inner {
         }
 
         /// The mode currently governing logical `offset` (for inspection/testing).
+        #[inline]
         #[must_use]
         pub fn access_at(&self, offset: u64) -> BStackAccess {
             if !self.acl_active.load(Ordering::Acquire) {
@@ -2892,5 +2878,668 @@ impl crate::BStack {
         new: impl AsRef<[u8]>,
     ) -> std::io::Result<bool> {
         self.cas(offset, old, new)
+    }
+}
+
+#[cfg(all(test, feature = "expensive-slice-access-control"))]
+mod acl_tests {
+    use crate::*;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn mk() -> (BStack, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("bstack_acl_{pid}_{id}.bin"));
+        let _ = std::fs::remove_file(&path);
+        (BStack::open(&path).unwrap(), path)
+    }
+
+    struct Guard(PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn seed(s: &BStack, n: usize) {
+        s.push(vec![0xAAu8; n]).unwrap();
+    }
+
+    #[test]
+    fn unprotected_stack_is_transparent() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        assert_eq!(s.access_at(10), BStackAccess::All);
+        s.set(0, [1, 2, 3]).unwrap();
+        assert_eq!(s.get(0, 3).unwrap(), [1, 2, 3]);
+        s.discard(8).unwrap();
+        assert_eq!(s.len().unwrap(), 56);
+    }
+
+    #[test]
+    fn prot_range_needs_guard_on_every_axis() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        assert_eq!(s.access_at(20), BStackAccess::Prot);
+
+        // Tokenless is denied on read, write, and (via the tail) truncate.
+        assert_eq!(
+            s.set(16, [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.get(16, 20).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.discard(56).unwrap_err().kind(), // would cut into [16,32)
+            io::ErrorKind::PermissionDenied
+        );
+
+        // The guard token satisfies all three.
+        s.set_as(&prot, 16, [7u8; 4]).unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [7, 7, 7, 7]);
+        s.discard_as(&prot, 56).unwrap();
+        assert_eq!(s.len().unwrap(), 8);
+    }
+
+    #[test]
+    fn alloc_and_guard_are_incomparable() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let alloc = s.take_alloc_authority().unwrap();
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&alloc, 0, 16, BStackAccess::Alloc).unwrap();
+
+        // The guard cannot touch an Alloc range, nor re-mode it.
+        assert_eq!(
+            s.get_as(&prot, 0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.protect_as(&prot, 0, 16, BStackAccess::Prot)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The allocator can.
+        s.set_as(&alloc, 0, [1u8; 4]).unwrap();
+        assert_eq!(s.get_as(&alloc, 0, 4).unwrap(), [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn readonly_denies_writes_only() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect_as((), 0, 16, BStackAccess::ReadOnly).unwrap();
+        assert_eq!(s.get(0, 4).unwrap().len(), 4); // reads pass
+        assert_eq!(
+            s.set(0, [0u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.zero(0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn locked_denies_reads() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect_as((), 0, 16, BStackAccess::Locked).unwrap();
+        assert_eq!(
+            s.get(0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.peek(0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn tokenless_protect_only_tightens_all() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 32);
+        s.protect_as((), 0, 16, BStackAccess::ReadOnly).unwrap();
+        // Re-arming a now-non-All range without a token is denied.
+        assert_eq!(
+            s.protect_as((), 0, 16, BStackAccess::All)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn tokens_are_one_shot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        assert!(s.take_protection().is_some());
+        assert!(s.take_protection().is_none());
+        assert!(s.take_alloc_authority().is_some());
+        assert!(s.take_alloc_authority().is_none());
+    }
+
+    #[test]
+    fn foreign_token_grants_nothing() {
+        let (s1, p1) = mk();
+        let _g1 = Guard(p1);
+        let (s2, p2) = mk();
+        let _g2 = Guard(p2);
+        seed(&s1, 32);
+        let foreign = s2.take_protection().unwrap();
+        s1.protect_as((), 0, 16, BStackAccess::Prot).unwrap();
+        // A token minted from s2 is treated as tokenless on s1.
+        assert_eq!(
+            s1.get_as(&foreign, 0, 4).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn append_checks_its_target_region() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 16);
+        // Arm the region a push would land in, before its bytes exist.
+        s.protect_as((), 16, 16, BStackAccess::Locked).unwrap();
+        assert_eq!(
+            s.push(vec![0u8; 8]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            s.extend(8).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(s.len().unwrap(), 16); // nothing appended
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn atomic_ops_respect_protection() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // In-place mutators over the protected range are denied tokenless.
+        denied(s.swap(16, [0u8; 4]).unwrap_err().kind());
+        denied(s.cas(16, [0xAAu8; 4], [0u8; 4]).unwrap_err().kind());
+        denied(s.process(16, 20, |b| b.fill(0)).unwrap_err().kind());
+        // copy: source read denied.
+        denied(s.copy(16, 40, 4).unwrap_err().kind());
+        // copy: destination write denied.
+        denied(s.copy(40, 16, 4).unwrap_err().kind());
+        // cross_exchange touching the range denied.
+        denied(s.cross_exchange(16, 40, 4).unwrap_err().kind());
+        // A tail replace that reaches into the range is denied.
+        denied(s.atrunc(56, []).unwrap_err().kind()); // truncates [8, 64) ⊇ [16,32)
+        // Batched read of the range denied.
+        denied(s.get_batched(std::iter::once(16..20)).unwrap_err().kind());
+
+        // Outside the protected range, the same ops succeed.
+        s.swap(40, [1u8; 4]).unwrap();
+        assert_eq!(s.get(40, 44).unwrap(), [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn authorized_slice_reaches_prot_region() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        // Without authority, the slice's own I/O is denied.
+        assert_eq!(
+            slice.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Grant the slice the guard authority; its I/O now reaches the region.
+        slice.authorize(&prot);
+        slice.write([7u8; 4]).unwrap();
+        let bytes = slice.read().unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..4], &[7, 7, 7, 7]);
+    }
+
+    #[test]
+    fn owned_slice_protect_forwards_to_stack() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        // Arm the allocation as ReadOnly through the owned handle.
+        slice.protect(BStackAccess::ReadOnly).unwrap();
+        assert_eq!(
+            alloc.stack().access_at(slice.start()),
+            BStackAccess::ReadOnly
+        );
+        // Reads through the slice pass; writes are denied by the forwarded policy.
+        assert!(slice.read().is_ok());
+        assert_eq!(
+            slice.write([0u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn owned_slice_protect_as_with_guard() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        // Arm as Prot; only the guard token may then read or write it.
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        assert_eq!(
+            slice.read().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The stack's token-carrying entry points still reach it.
+        let stack = alloc.stack();
+        stack.set_as(&prot, slice.start(), [9u8; 4]).unwrap();
+        assert_eq!(
+            stack
+                .get_as(&prot, slice.start(), slice.start() + 4)
+                .unwrap(),
+            [9, 9, 9, 9]
+        );
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn set_batched_checks_every_block() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        s.protect_as((), 32, 8, BStackAccess::ReadOnly).unwrap();
+        // One block lands in the ReadOnly region → the whole batch is refused.
+        assert_eq!(
+            s.set_batched([(0u64, vec![1u8; 4]), (32u64, vec![2u8; 4])])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // The permitted block was not applied (checks run before the journal).
+        assert_eq!(s.get(0, 4).unwrap(), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_slice_atomic_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let mut slice = alloc.alloc(32).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+        // Tokenless slice process (a write) is denied.
+        assert_eq!(
+            slice
+                .as_slice_mut()
+                .process(|b| b.fill(9))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // With authority the atomic slice ops reach the Prot region.
+        slice.authorize(&prot);
+        slice.as_slice_mut().process(|b| b.fill(1)).unwrap();
+        assert_eq!(&slice.read().unwrap()[..4], &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn authorized_stack_compound_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        // Interior range for the in-place writes; tail range for the replacements.
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // swap over [16,20): tokenless denied, `swap_as` reaches it.
+        denied(s.swap(16, [0u8; 4]).unwrap_err().kind());
+        s.swap_as(&prot, 16, [1u8; 4]).unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [1, 1, 1, 1]);
+
+        // swap_into over [16,20): reads back the bytes just written.
+        let mut buf = [2u8; 4];
+        denied(s.swap_into(16, &mut [0u8; 4]).unwrap_err().kind());
+        s.swap_into_as(&prot, 16, &mut buf).unwrap();
+        assert_eq!(buf, [1, 1, 1, 1]);
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [2, 2, 2, 2]);
+
+        // set_batched touching [16,20): tokenless denied, `set_batched_as` succeeds.
+        denied(
+            s.set_batched(std::iter::once((16u64, [3u8; 4])))
+                .unwrap_err()
+                .kind(),
+        );
+        s.set_batched_as(&prot, std::iter::once((16u64, [3u8; 4])))
+            .unwrap();
+        assert_eq!(s.get_as(&prot, 16, 20).unwrap(), [3, 3, 3, 3]);
+
+        // Tail replacements reaching [48,64) via a 20-byte tail (touches [44,64)).
+        denied(s.splice(20, []).unwrap_err().kind());
+        let removed = s.splice_as(&prot, 20, [7u8; 20]).unwrap();
+        assert_eq!(removed.len(), 20);
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [7u8; 20]);
+
+        let mut old = [0u8; 20];
+        denied(s.splice_into(&mut [0u8; 20], []).unwrap_err().kind());
+        s.splice_into_as(&prot, &mut old, [8u8; 20]).unwrap();
+        assert_eq!(old, [7u8; 20]);
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [8u8; 20]);
+
+        denied(s.replace(20, |b| b.to_vec()).unwrap_err().kind());
+        s.replace_as(&prot, 20, |b| b.iter().map(|x| x + 1).collect())
+            .unwrap();
+        assert_eq!(s.get_as(&prot, 44, 64).unwrap(), [9u8; 20]);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_append_ops_reach_prot() {
+        // Appends land in a Prot window armed just past the tail: tokenless denied,
+        // `_as` reaches it. Chained so each op fills the next slice of the window.
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 48);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 48, 32, BStackAccess::Prot).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        denied(s.push([1u8; 4]).unwrap_err().kind());
+        assert_eq!(s.push_as(&prot, [1u8; 4]).unwrap(), 48);
+
+        denied(s.extend(4).unwrap_err().kind());
+        assert_eq!(s.extend_as(&prot, 4).unwrap(), 52);
+
+        denied(s.extend_sparse([2u8; 2], 4).unwrap_err().kind());
+        assert_eq!(s.extend_sparse_as(&prot, [2u8; 2], 4).unwrap(), 56);
+
+        denied(
+            s.extend_sparse_batched(std::iter::once((0u64, [3u8; 2])), 4)
+                .unwrap_err()
+                .kind(),
+        );
+        assert_eq!(
+            s.extend_sparse_batched_as(&prot, std::iter::once((0u64, [3u8; 2])), 4)
+                .unwrap(),
+            60
+        );
+
+        denied(s.try_extend(64, [4u8; 4]).unwrap_err().kind());
+        assert!(s.try_extend_as(&prot, 64, [4u8; 4]).unwrap());
+
+        denied(s.try_extend_zeros(68, 4).unwrap_err().kind());
+        assert!(s.try_extend_zeros_as(&prot, 68, 4).unwrap());
+
+        denied(s.try_extend_sparse(72, [5u8; 2], 4).unwrap_err().kind());
+        assert!(s.try_extend_sparse_as(&prot, 72, [5u8; 2], 4).unwrap());
+
+        denied(
+            s.try_extend_sparse_batched(76, std::iter::once((0u64, [6u8; 2])), 4)
+                .unwrap_err()
+                .kind(),
+        );
+        assert!(
+            s.try_extend_sparse_batched_as(&prot, 76, std::iter::once((0u64, [6u8; 2])), 4)
+                .unwrap()
+        );
+        assert_eq!(s.len().unwrap(), 80);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_removal_ops_reach_prot() {
+        // Tail removals reaching a Prot tail are denied tokenless and succeed with
+        // the token. Fresh stack per op keeps the protected region well-defined.
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.pop(20).unwrap_err().kind());
+            assert_eq!(s.pop_as(&prot, 20).unwrap().len(), 20);
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            let mut buf = [0u8; 20];
+            denied(s.pop_into(&mut [0u8; 20]).unwrap_err().kind());
+            s.pop_into_as(&prot, &mut buf).unwrap();
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        {
+            // atrunc actually rewrites the tail, so its check matters most here.
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.atrunc(20, [1u8; 4]).unwrap_err().kind());
+            s.atrunc_as(&prot, 20, [1u8; 4]).unwrap();
+            assert_eq!(s.len().unwrap(), 48);
+        }
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.try_discard(64, 20).unwrap_err().kind());
+            assert!(s.try_discard_as(&prot, 64, 20).unwrap());
+            assert_eq!(s.len().unwrap(), 44);
+        }
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn authorized_stack_read_ops_reach_prot() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        seed(&s, 64);
+        let prot = s.take_protection().unwrap();
+        s.protect_as(&prot, 16, 16, BStackAccess::Prot).unwrap();
+        s.set_as(&prot, 16, [5u8; 16]).unwrap();
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+
+        // peek reads from offset to end; starting inside the Prot region is denied.
+        denied(s.peek(16).unwrap_err().kind());
+        assert_eq!(&s.peek_as(&prot, 16).unwrap()[..4], &[5, 5, 5, 5]);
+
+        let mut b = [0u8; 4];
+        denied(s.peek_into(16, &mut [0u8; 4]).unwrap_err().kind());
+        s.peek_into_as(&prot, 16, &mut b).unwrap();
+        assert_eq!(b, [5, 5, 5, 5]);
+
+        denied(s.get_batched(std::iter::once(16..20)).unwrap_err().kind());
+        assert_eq!(
+            s.get_batched_as(&prot, std::iter::once(16..20)).unwrap()[0],
+            vec![5, 5, 5, 5]
+        );
+
+        let mut b2 = [0u8; 4];
+        {
+            let mut dbuf = [0u8; 4];
+            denied(
+                s.get_batched_into(std::iter::once((16u64, &mut dbuf[..])))
+                    .unwrap_err()
+                    .kind(),
+            );
+        }
+        s.get_batched_into_as(&prot, std::iter::once((16u64, &mut b2[..])))
+            .unwrap();
+        assert_eq!(b2, [5, 5, 5, 5]);
+
+        // Lending closure: yield a raw-pointer slice, as the other gen tests do.
+        let mut gbuf = [0u8; 4];
+        let ptr = gbuf.as_mut_ptr();
+        let mut called = false;
+        denied(
+            s.get_batched_gen(|| {
+                if called {
+                    None
+                } else {
+                    called = true;
+                    Some((16u64, unsafe { std::slice::from_raw_parts_mut(ptr, 4) }))
+                }
+            })
+            .unwrap_err()
+            .kind(),
+        );
+        let mut called2 = false;
+        s.get_batched_gen_as(&prot, || {
+            if called2 {
+                None
+            } else {
+                called2 = true;
+                Some((16u64, unsafe { std::slice::from_raw_parts_mut(ptr, 4) }))
+            }
+        })
+        .unwrap();
+        assert_eq!(gbuf, [5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn authorized_stack_resize_ops_reach_prot() {
+        let denied = |k: io::ErrorKind| assert_eq!(k, io::ErrorKind::PermissionDenied);
+        // resize shrink reaching a Prot tail.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 64);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.resize(44).unwrap_err().kind());
+            assert_eq!(s.resize_as(&prot, 44).unwrap(), 64);
+            assert_eq!(s.len().unwrap(), 44);
+        }
+        // resize grow into a Prot region armed past the tail.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 48);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.resize(60).unwrap_err().kind());
+            assert_eq!(s.resize_as(&prot, 60).unwrap(), 48);
+            assert_eq!(s.len().unwrap(), 60);
+        }
+        // ensure grow into a Prot region.
+        {
+            let (s, p) = mk();
+            let _g = Guard(p);
+            seed(&s, 48);
+            let prot = s.take_protection().unwrap();
+            s.protect_as(&prot, 48, 16, BStackAccess::Prot).unwrap();
+            denied(s.ensure(60).unwrap_err().kind());
+            assert_eq!(s.ensure_as(&prot, 60).unwrap(), 48);
+            assert_eq!(s.len().unwrap(), 60);
+        }
+    }
+
+    #[test]
+    fn merge_requires_matching_authority() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let owned = alloc.alloc(32).unwrap();
+        let full = owned.as_slice();
+        let mut left = full.subslice(0, 16);
+        let right = full.subslice(16, 32);
+        // Same (NONE) authority: the adjacent subslices merge.
+        assert!(left.merge_adjacent(&right).is_some());
+        // Grant `left` an authority; now the authorities differ and merge refuses.
+        let prot = alloc.stack().take_protection().unwrap();
+        left.authorize(&prot);
+        assert!(left.merge(&right).is_none());
+        assert!(left.merge_adjacent(&right).is_none());
+    }
+
+    #[test]
+    fn allocator_constructor_burns_alloc_authority() {
+        // Every allocator claims the alloc-authority mint on construction, so no
+        // external caller can obtain `Alloc` authority over its arena.
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        assert!(alloc.stack().take_alloc_authority().is_none());
+        // The guard mint is independent and still available.
+        assert!(alloc.stack().take_protection().is_some());
+
+        let (s2, p2) = mk();
+        let _g2 = Guard(p2);
+        let ff = crate::FirstFitBStackAllocator::new(s2).unwrap();
+        assert!(ff.stack().take_alloc_authority().is_none());
+    }
+
+    #[test]
+    fn dealloc_refuses_protected_region_then_frees_once_cleared() {
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let slice = alloc.alloc(32).unwrap();
+        let start = slice.start();
+        let len = slice.len();
+        let prot = alloc.stack().take_protection().unwrap();
+        slice.protect_as(&prot, BStackAccess::Prot).unwrap();
+
+        // Freeing a region that carries caller policy is refused, and the handle
+        // comes back intact rather than being consumed.
+        let err = alloc.dealloc(slice).unwrap_err();
+        assert_eq!(err.source.kind(), io::ErrorKind::PermissionDenied);
+        let slice = err.into_handle().expect("region survives a refused free");
+
+        // The guard holder clears the policy, and the free now succeeds.
+        alloc
+            .stack()
+            .protect_as(&prot, start, len, BStackAccess::All)
+            .unwrap();
+        alloc.dealloc(slice).unwrap();
+        assert_eq!(alloc.stack().len().unwrap(), 0);
+    }
+
+    #[test]
+    fn dealloc_bulk_refuses_batch_with_any_protected_handle() {
+        use crate::BStackBulkAllocator;
+        let (s, p) = mk();
+        let _g = Guard(p);
+        let alloc = crate::LinearBStackAllocator::new(s);
+        let a = alloc.alloc(16).unwrap();
+        let b = alloc.alloc(16).unwrap();
+        let prot = alloc.stack().take_protection().unwrap();
+        // Arm just one of the two allocations.
+        b.protect_as(&prot, BStackAccess::ReadOnly).unwrap();
+
+        let err = alloc.dealloc_bulk([a, b]).unwrap_err();
+        assert_eq!(err.source.kind(), io::ErrorKind::PermissionDenied);
+        // The whole batch is refused up front, so both handles are returned.
+        assert_eq!(err.into_handles().len(), 2);
     }
 }
