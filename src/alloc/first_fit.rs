@@ -246,6 +246,16 @@ impl FirstFitBStackAllocator {
     ///   type).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> Result<Self, io::Error> {
+        // Acquire the allocator authority up front and use it for the header I/O
+        // below, so a same-object reopen reads its own `Alloc`-marked header.
+        // Refused (not panic) if the stack's permit has already been taken.
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "FirstFitBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         // Initialize empty stack with allocator header
         if stack.is_empty()? {
             let mut hdr = [0u8; (Self::OFFSET_SIZE + Self::HEADER_SIZE) as usize];
@@ -258,9 +268,7 @@ impl FirstFitBStackAllocator {
             stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
             return Ok(Self {
                 #[cfg(feature = "expensive-slice-access-control")]
-                alloc_auth: stack
-                    .take_alloc_authority()
-                    .expect("fresh stack owns its alloc permit"),
+                alloc_auth,
                 stack,
                 #[cfg(feature = "atomic")]
                 lock: Mutex::new(()),
@@ -279,6 +287,9 @@ impl FirstFitBStackAllocator {
             ));
         }
         let mut header = [0u8; Self::HEADER_SIZE as usize];
+        #[cfg(feature = "expensive-slice-access-control")]
+        stack.get_into_as(&alloc_auth, Self::OFFSET_SIZE, &mut header)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         stack.get_into(Self::OFFSET_SIZE, &mut header)?;
         // Check magic prefix for compatibility with 0.1.x files.
         if header[..ALFF_MAGIC_PREFIX.len()] != ALFF_MAGIC_PREFIX {
@@ -305,9 +316,7 @@ impl FirstFitBStackAllocator {
         }
         let alloc = Self {
             #[cfg(feature = "expensive-slice-access-control")]
-            alloc_auth: stack
-                .take_alloc_authority()
-                .expect("fresh stack owns its alloc permit"),
+            alloc_auth,
             stack,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
@@ -662,7 +671,17 @@ impl FirstFitBStackAllocator {
         // free_head <- result_block -> next
         // free_head --------------------> next -> ...
         // free_head <------------------- next <- ...
-        let old_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+        let old_head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         // The old head becomes our next_free and takes a back-link at old_head + 8,
         // so validate it like any other free-list link before writing through it.
         if !Self::is_valid_link_ptr(old_head, stack_len) {
@@ -1145,7 +1164,17 @@ impl FirstFitBStackAllocator {
             / (Self::MIN_BLOCK_PAYLOAD_SIZE + Self::BLOCK_OVERHEAD_SIZE)
             + 1;
         let mut walk_count = 0u64;
-        let mut head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+        let mut head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         while head != 0 {
             walk_count += 1;
             if walk_count > max_walk {
@@ -1734,13 +1763,10 @@ impl BStackAllocator for FirstFitBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
         #[cfg(feature = "expensive-slice-access-control")]
-        {
-            // Marks are in-memory only; clear them so the reclaimed stack matches
-            // a fresh reopen, then hand the capability back for re-minting.
-            self.stack.acl_reset();
-            self.stack.return_alloc_authority(self.alloc_auth);
-        }
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -2095,7 +2121,17 @@ impl FirstFitBStackAllocator {
                     self.stack.get_into(next_block, &mut link_buf)?;
                     let nnext = read_buf_le!(link_buf, 0 => u64); // next.next_free
                     let nprev = read_buf_le!(link_buf, 8 => u64); // next.prev_free
-                    let free_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+                    let free_head = {
+                        let mut buf = [0u8; 8];
+                        alloc_meta!(
+                            self,
+                            get_into,
+                            get_into_as,
+                            Self::FREE_HEAD_OFFSET,
+                            &mut buf
+                        )?;
+                        u64::from_le_bytes(buf)
+                    };
                     if !Self::is_valid_link_ptr(nnext, stack_len)
                         || !Self::is_valid_link_ptr(nprev, stack_len)
                         || !Self::is_valid_link_ptr(free_head, stack_len)
@@ -2243,7 +2279,17 @@ impl FirstFitBStackAllocator {
                         let remainder_size =
                             merged_size - aligned_new_len - Self::BLOCK_OVERHEAD_SIZE;
                         let new_free_start = start + aligned_new_len + Self::BLOCK_OVERHEAD_SIZE;
-                        let old_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+                        let old_head = {
+                            let mut buf = [0u8; 8];
+                            alloc_meta!(
+                                self,
+                                get_into,
+                                get_into_as,
+                                Self::FREE_HEAD_OFFSET,
+                                &mut buf
+                            )?;
+                            u64::from_le_bytes(buf)
+                        };
 
                         // All offsets are relative to zero_buff[0] = start + block_size.
                         let alloc_footer_off = (aligned_new_len - block_size) as usize;

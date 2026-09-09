@@ -44,18 +44,10 @@ pub(crate) use acl_check;
 /// The allocator (`self`) is passed explicitly — `self` does not cross
 /// `macro_rules` hygiene, the same reason [`acl_check!`] takes its stack. The
 /// allocator must have a `stack` field and, under the feature, an `alloc_auth`
-/// field holding its token. `read_u64` is special-cased (read then little-endian
-/// decode) as it is not a direct forward.
+/// field holding its token. It is pure dispatch: a caller that needs to decode
+/// (e.g. a little-endian `u64`) reads into a buffer and decodes at the call site.
 #[cfg(all(feature = "alloc", feature = "set"))]
 macro_rules! alloc_meta {
-    ($self:expr, read_u64, $offset:expr $(,)?) => {{
-        let mut __buf = [0u8; 8];
-        #[cfg(feature = "expensive-slice-access-control")]
-        let __r = $self.stack.get_into_as(&$self.alloc_auth, $offset, &mut __buf);
-        #[cfg(not(feature = "expensive-slice-access-control"))]
-        let __r = $self.stack.get_into($offset, &mut __buf);
-        __r.map(|()| u64::from_le_bytes(__buf))
-    }};
     ($self:expr, $op:ident, $op_as:ident $(, $arg:expr)* $(,)?) => {{
         #[cfg(feature = "expensive-slice-access-control")]
         let __r = $self.stack.$op_as(&$self.alloc_auth $(, $arg)*);
@@ -974,15 +966,6 @@ mod inner {
             }
             table.set(offset, end, BStackAccess::All);
             Ok(())
-        }
-
-        /// Drop all access-control policy, returning the stack to the unmarked
-        /// state of a fresh open. Called when an allocator relinquishes its stack
-        /// ([`into_stack`](crate::BStackAllocator::into_stack)): the allocator's
-        /// permanent header marks live only in memory (never persisted), so a
-        /// reclaimed stack must present the same empty policy a real reopen would.
-        pub(crate) fn acl_reset(&self) {
-            self.acl.write().unwrap().clear();
         }
 
         /// The mode currently governing logical `offset` (for inspection/testing).

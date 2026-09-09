@@ -10,28 +10,20 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::{Deref, Range};
 
-/// Define a `BStackSlice` I/O dispatch helper: with the
-/// `expensive-slice-access-control` feature it presents this slice's stored
-/// `auth` to the token-carrying `_as` entry point; without it, the plain
-/// tokenless op. All offsets are absolute.
-macro_rules! s_dispatch {
-    (
-        $(#[$attr:meta])*
-        fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty => $op:ident / $op_as:ident
-    ) => {
-        $(#[$attr])*
-        #[inline]
-        fn $name(&self, $($arg: $ty),*) -> $ret {
-            #[cfg(feature = "expensive-slice-access-control")]
-            {
-                self.stack.$op_as(self.auth, $($arg),*)
-            }
-            #[cfg(not(feature = "expensive-slice-access-control"))]
-            {
-                self.stack.$op($($arg),*)
-            }
-        }
-    };
+/// Dispatch one `BStackSlice` I/O op through the slice's stored authority:
+/// `slice_meta!(self, op, op_as, args...)` presents `self.auth` to the
+/// token-carrying `_as` entry point with the `expensive-slice-access-control`
+/// feature, or calls the plain tokenless op without it. Expands inline at the
+/// call site — no per-op wrapper methods; `self` is passed explicitly (`self`
+/// does not cross `macro_rules` hygiene). All offsets are absolute.
+macro_rules! slice_meta {
+    ($self:expr, $op:ident, $op_as:ident $(, $arg:expr)* $(,)?) => {{
+        #[cfg(feature = "expensive-slice-access-control")]
+        let __r = $self.stack.$op_as($self.auth $(, $arg)*);
+        #[cfg(not(feature = "expensive-slice-access-control"))]
+        let __r = $self.stack.$op($($arg),*);
+        __r
+    }};
 }
 
 /// A raw `(offset, len)` coordinate pair with no backing reference.
@@ -654,7 +646,7 @@ impl<'a> BStackSlice<'a> {
             return Ok(None);
         }
         let mut buf = [0u8; 1];
-        self.s_get_into(self.start() + index, &mut buf)?;
+        slice_meta!(self, get_into, get_into_as, self.start() + index, &mut buf)?;
         Ok(Some(buf[0]))
     }
 
@@ -727,14 +719,14 @@ impl<'a> BStackSlice<'a> {
     /// Read the entire slice into a new `Vec<u8>`.
     #[inline]
     pub fn read(&self) -> io::Result<Vec<u8>> {
-        self.s_get(self.start(), self.end())
+        slice_meta!(self, get, get_as, self.start(), self.end())
     }
 
     /// Read bytes into `buf`, up to `min(buf.len(), self.len())` bytes.
     #[inline]
     pub fn read_into(&self, buf: &mut [u8]) -> io::Result<()> {
         let n = (buf.len() as u64).min(self.len()) as usize;
-        self.s_get_into(self.start(), &mut buf[..n])
+        slice_meta!(self, get_into, get_into_as, self.start(), &mut buf[..n])
     }
 
     /// Read `[start, end)` relative to this slice into a new `Vec<u8>`.
@@ -746,7 +738,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_get(self.start() + start, self.start() + end)
+        slice_meta!(self, get, get_as, self.start() + start, self.start() + end)
     }
 
     /// Read `[start, start + buf.len())` relative to this slice into `buf`.
@@ -759,7 +751,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_get_into(self.start() + start, buf)
+        slice_meta!(self, get_into, get_into_as, self.start() + start, buf)
     }
 
     /// Overwrite the beginning of this slice with `data` (up to `self.len()` bytes).
@@ -769,7 +761,7 @@ impl<'a> BStackSlice<'a> {
     pub fn write(&mut self, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
         let n = (data.len() as u64).min(self.len()) as usize;
-        self.s_set(self.start(), &data[..n])
+        slice_meta!(self, set, set_as, self.start(), &data[..n])
     }
 
     /// Overwrite `[start, start + data.len())` relative to this slice.
@@ -786,35 +778,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_set(self.start() + start, data)
-    }
-
-    /// Arm this slice's range with `mode` in the stack's access-control table.
-    ///
-    /// Crate-internal: the public protection entry is
-    /// [`BStackOwnedSlice::protect`], which forwards here. The range is this
-    /// slice's own `[start, end)` — a tokenless caller may only tighten a range
-    /// currently at [`All`](BStackAccess::All).
-    ///
-    /// Requires the `expensive-slice-access-control` feature.
-    #[cfg(feature = "expensive-slice-access-control")]
-    #[inline]
-    pub(crate) fn protect(&self, mode: BStackAccess) -> io::Result<()> {
-        self.stack.protect_as((), self.start(), self.len(), mode)
-    }
-
-    /// [`protect`](Self::protect) presenting an access token. Crate-internal; the
-    /// public entry is [`BStackOwnedSlice::protect_as`].
-    ///
-    /// Requires the `expensive-slice-access-control` feature.
-    #[cfg(feature = "expensive-slice-access-control")]
-    #[inline]
-    pub(crate) fn protect_as(
-        &self,
-        auth: impl BStackAuthority,
-        mode: BStackAccess,
-    ) -> io::Result<()> {
-        self.stack.protect_as(auth, self.start(), self.len(), mode)
+        slice_meta!(self, set, set_as, self.start() + start, data)
     }
 
     /// Grant this slice the authority carried by `auth`, so its subsequent I/O
@@ -829,28 +793,13 @@ impl<'a> BStackSlice<'a> {
         self.auth = auth.authorities_for(self.stack);
     }
 
-    // Dispatch helpers, generated by `s_dispatch!`: route slice I/O through the
-    // stack's token-carrying `_as` entry point with this slice's stored authority,
-    // or the plain tokenless op without the access-control feature.
-    s_dispatch!(#[cfg(feature = "set")] fn s_set(offset: u64, data: &[u8]) -> io::Result<()> => set / set_as);
-    s_dispatch!(#[cfg(feature = "set")] fn s_zero(offset: u64, n: u64) -> io::Result<()> => zero / zero_as);
-    s_dispatch!(#[cfg(feature = "set")] fn s_repeat(offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> => repeat / repeat_as);
-    s_dispatch!(fn s_get(start: u64, end: u64) -> io::Result<Vec<u8>> => get / get_as);
-    s_dispatch!(fn s_get_into(start: u64, buf: &mut [u8]) -> io::Result<()> => get_into / get_into_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_copy(from: u64, to: u64, n: u64) -> io::Result<()> => copy / copy_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_process(start: u64, end: u64, f: impl FnOnce(&mut [u8])) -> io::Result<()> => process / process_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_cross_exchange(a: u64, b: u64, n: u64) -> io::Result<()> => cross_exchange / cross_exchange_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_eq_crds(a_offset: u64, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => eq_crds / eq_crds_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_ne_crds(a_offset: u64, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => ne_crds / ne_crds_as);
-    s_dispatch!(#[cfg(all(feature = "set", feature = "atomic"))] fn s_masked_eq_crds(a_offset: u64, mask: impl AsRef<[u8]>, a_expected: impl AsRef<[u8]>, b_offset: u64, b_buf: impl AsRef<[u8]>) -> io::Result<Option<Vec<u8>>> => masked_eq_crds / masked_eq_crds_as);
-
     /// Zero out the entire slice.
     ///
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     #[inline]
     pub fn zero(&mut self) -> io::Result<()> {
-        self.s_zero(self.start(), self.len())
+        slice_meta!(self, zero, zero_as, self.start(), self.len())
     }
 
     /// Zero `[start, start + n)` within this slice.
@@ -866,7 +815,7 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_zero(self.start() + start, n)
+        slice_meta!(self, zero, zero_as, self.start() + start, n)
     }
 
     /// Fill the entire slice with `value`.
@@ -877,7 +826,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "set")]
     #[inline]
     pub fn fill(&mut self, value: u8) -> io::Result<()> {
-        self.s_repeat(self.start(), [value], self.len())
+        slice_meta!(self, repeat, repeat_as, self.start(), [value], self.len())
     }
 
     /// Fill the slice by calling `f` once per byte.
@@ -911,7 +860,7 @@ impl<'a> BStackSlice<'a> {
             self.len(),
             "copy_from_slice: length mismatch"
         );
-        self.s_set(self.start(), src)
+        slice_meta!(self, set, set_as, self.start(), src)
     }
 
     /// Copy the contents of `src` into this slice.
@@ -946,7 +895,7 @@ impl<'a> BStackSlice<'a> {
         if self.is_empty() {
             return Ok(());
         }
-        self.s_copy(src.start(), self.start(), self.len())
+        slice_meta!(self, copy, copy_as, src.start(), self.start(), self.len())
     }
 
     /// Copy this view's contents into a fresh allocation from `allocator`.
@@ -1046,7 +995,14 @@ impl<'a> BStackSlice<'a> {
         if n == 0 {
             return Ok(());
         }
-        self.s_copy(self.start() + src_range.start, self.start() + dest, n)
+        slice_meta!(
+            self,
+            copy,
+            copy_as,
+            self.start() + src_range.start,
+            self.start() + dest,
+            n
+        )
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents
@@ -1100,7 +1056,15 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_eq_crds(guard.start(), expected, self.start(), new_bytes)
+        slice_meta!(
+            self,
+            eq_crds,
+            eq_crds_as,
+            guard.start(),
+            expected,
+            self.start(),
+            new_bytes
+        )
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents do
@@ -1145,7 +1109,15 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_ne_crds(guard.start(), expected, self.start(), new_bytes)
+        slice_meta!(
+            self,
+            ne_crds,
+            ne_crds_as,
+            guard.start(),
+            expected,
+            self.start(),
+            new_bytes
+        )
     }
 
     /// Overwrite this slice with `new_bytes` if `guard`'s current contents
@@ -1196,7 +1168,16 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
-        self.s_masked_eq_crds(guard.start(), mask, expected, self.start(), new_bytes)
+        slice_meta!(
+            self,
+            masked_eq_crds,
+            masked_eq_crds_as,
+            guard.start(),
+            mask,
+            expected,
+            self.start(),
+            new_bytes
+        )
     }
 
     /// Swap the contents of this slice with `other`.
@@ -1226,7 +1207,14 @@ impl<'a> BStackSlice<'a> {
         if self.is_empty() || self.start() == other.start() {
             return Ok(());
         }
-        self.s_cross_exchange(self.start(), other.start(), self.len())
+        slice_meta!(
+            self,
+            cross_exchange,
+            cross_exchange_as,
+            self.start(),
+            other.start(),
+            self.len()
+        )
     }
 
     /// Run a length-preserving transform over this slice's bytes in place.
@@ -1243,7 +1231,7 @@ impl<'a> BStackSlice<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn process<F: FnOnce(&mut [u8])>(&mut self, f: F) -> io::Result<()> {
-        self.s_process(self.start(), self.end(), f)
+        slice_meta!(self, process, process_as, self.start(), self.end(), f)
     }
 
     /// Reverse the byte order of this slice in place.
@@ -1255,7 +1243,9 @@ impl<'a> BStackSlice<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
-        self.s_process(self.start(), self.end(), |buf| buf.reverse())
+        slice_meta!(self, process, process_as, self.start(), self.end(), |buf| {
+            buf.reverse()
+        })
     }
 
     /// Rotate the slice in place such that the bytes at `[mid, len)` move to
@@ -1275,7 +1265,7 @@ impl<'a> BStackSlice<'a> {
             mid <= self.len(),
             "rotate_left: mid must be <= slice length"
         );
-        self.s_process(self.start(), self.end(), |buf| {
+        slice_meta!(self, process, process_as, self.start(), self.end(), |buf| {
             buf.rotate_left(mid as usize)
         })
     }
@@ -1294,7 +1284,9 @@ impl<'a> BStackSlice<'a> {
     #[track_caller]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         assert!(k <= self.len(), "rotate_right: k must be <= slice length");
-        self.s_process(self.start(), self.end(), |buf| buf.rotate_right(k as usize))
+        slice_meta!(self, process, process_as, self.start(), self.end(), |buf| {
+            buf.rotate_right(k as usize)
+        })
     }
 
     /// Create a cursor-based reader positioned at the start of this slice.
@@ -1705,7 +1697,9 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[cfg(feature = "expensive-slice-access-control")]
     #[inline]
     pub fn protect(&self, mode: BStackAccess) -> io::Result<()> {
-        self.as_slice().protect(mode)
+        self.allocator
+            .stack()
+            .protect_as((), self.range.start(), self.range.len(), mode)
     }
 
     /// [`protect`](Self::protect) presenting an access token — the token sibling
@@ -1716,7 +1710,9 @@ impl<'a, A: BStackAllocator> BStackOwnedSlice<'a, A> {
     #[cfg(feature = "expensive-slice-access-control")]
     #[inline]
     pub fn protect_as(&self, auth: impl BStackAuthority, mode: BStackAccess) -> io::Result<()> {
-        self.as_slice().protect_as(auth, mode)
+        self.allocator
+            .stack()
+            .protect_as(auth, self.range.start(), self.range.len(), mode)
     }
 
     /// Grant this handle the authority carried by `auth`, so every view borrowed
@@ -2728,7 +2724,7 @@ impl<'a> io::Read for BStackSliceReader<'a> {
         let available = (self.slice.len() - self.cursor) as usize;
         let n = buf.len().min(available);
         let abs_start = self.slice.start() + self.cursor;
-        self.slice.s_get_into(abs_start, &mut buf[..n])?;
+        slice_meta!(self.slice, get_into, get_into_as, abs_start, &mut buf[..n])?;
         self.cursor += n as u64;
         Ok(n)
     }
@@ -2915,7 +2911,7 @@ impl<'a> io::Write for BStackSliceWriter<'a> {
         let available = (self.slice.len() - self.cursor) as usize;
         let n = buf.len().min(available);
         let abs_start = self.slice.start() + self.cursor;
-        self.slice.s_set(abs_start, &buf[..n])?;
+        slice_meta!(self.slice, set, set_as, abs_start, &buf[..n])?;
         self.cursor += n as u64;
         Ok(n)
     }

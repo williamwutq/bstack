@@ -283,6 +283,16 @@ impl SegregatedBStackAllocator {
     ///   allocator of the expected version).
     /// * Any [`io::Error`] from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> io::Result<Self> {
+        // Acquire the allocator authority up front and use it for the header I/O
+        // below, so a same-object reopen reads its own `Alloc`-marked header.
+        // Refused (not panic) if the stack's permit has already been taken.
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "SegregatedBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if stack.is_empty()? {
             // Initialize a new stack: write the header and return a fresh allocator.
             const OFFSET_OFFSET: usize = SegregatedBStackAllocator::OFFSET_SIZE as usize;
@@ -295,9 +305,7 @@ impl SegregatedBStackAllocator {
             stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::ARENA_START - Self::OFFSET_SIZE)?;
             return Ok(Self {
                 #[cfg(feature = "expensive-slice-access-control")]
-                alloc_auth: stack
-                    .take_alloc_authority()
-                    .expect("fresh stack owns its alloc permit"),
+                alloc_auth,
                 stack,
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
@@ -314,6 +322,9 @@ impl SegregatedBStackAllocator {
         }
 
         let mut magic = [0u8; 8];
+        #[cfg(feature = "expensive-slice-access-control")]
+        stack.get_into_as(&alloc_auth, Self::OFFSET_SIZE, &mut magic)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         stack.get_into(Self::OFFSET_SIZE, &mut magic)?;
         if magic[..ALSG_MAGIC_PREFIX.len()] != ALSG_MAGIC_PREFIX {
             return Err(io_error!(
@@ -334,9 +345,7 @@ impl SegregatedBStackAllocator {
         }
         let allocator = Self {
             #[cfg(feature = "expensive-slice-access-control")]
-            alloc_auth: stack
-                .take_alloc_authority()
-                .expect("fresh stack owns its alloc permit"),
+            alloc_auth,
             stack,
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
@@ -685,7 +694,11 @@ impl SegregatedBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     fn pop_class(&self, class: u64) -> io::Result<Option<u64>> {
         let head_off = Self::head_off(class);
-        let head = alloc_meta!(self, read_u64, head_off)?;
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
@@ -751,7 +764,11 @@ impl SegregatedBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     fn pop_oversized(&self, need: u64) -> io::Result<Option<(u64, u64)>> {
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
-        let head = alloc_meta!(self, read_u64, head_off)?;
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
@@ -947,7 +964,11 @@ impl SegregatedBStackAllocator {
         #[cfg(not(feature = "atomic"))]
         {
             // Non-atomic path: read head, write overhead+next_free, write head.
-            let head = alloc_meta!(self, read_u64, head_off)?;
+            let head = {
+                let mut buf = [0u8; 8];
+                alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+                u64::from_le_bytes(buf)
+            };
             write_buf!(head => overhead_buf, 8);
             self.stack.set(block_start, overhead_buf)?;
             // A crash between these two writes leaves the block free-tagged so it is
@@ -1062,7 +1083,11 @@ impl SegregatedBStackAllocator {
                 // old head directly into the latter half before writing both.
                 let mut shared = overhead_next[i];
                 // next_free ← current head of this class (read as the allocator).
-                let head = alloc_meta!(self, read_u64, head_offs[i])?;
+                let head = {
+                    let mut buf = [0u8; 8];
+                    alloc_meta!(self, get_into, get_into_as, head_offs[i], &mut buf)?;
+                    u64::from_le_bytes(buf)
+                };
                 shared[8..16].copy_from_slice(&head.to_le_bytes());
                 // overhead || next_free, then head ← this block.
                 self.stack.set(block_offs[i], shared)?;
@@ -1232,13 +1257,10 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
         #[cfg(feature = "expensive-slice-access-control")]
-        {
-            // Marks are in-memory only; clear them so the reclaimed stack matches
-            // a fresh reopen, then hand the capability back for re-minting.
-            self.stack.acl_reset();
-            self.stack.return_alloc_authority(self.alloc_auth);
-        }
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -3632,7 +3654,11 @@ mod bulk_tests {
         a.stack.set(xb + 272, (48u64 >> 4).to_le_bytes()).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
         // largest_class_le(272) == 256, so it lands on class 15.
-        let head = crate::acl::alloc_meta!(a, read_u64, Seg::head_off(15)).unwrap();
+        let head = {
+            let mut buf = [0u8; 8];
+            crate::acl::alloc_meta!(a, get_into, get_into_as, Seg::head_off(15), &mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
         assert_eq!(head, xb);
         // A class-15 request (block 256) reuses it instead of failing the batch.
         let r = a.alloc_bulk([248u64]).unwrap();

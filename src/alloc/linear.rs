@@ -155,13 +155,10 @@ impl BStackAllocator for LinearBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
         #[cfg(feature = "expensive-slice-access-control")]
-        {
-            // Marks are in-memory only; clear them so the reclaimed stack matches
-            // a fresh reopen, then hand the capability back for re-minting.
-            self.stack.acl_reset();
-            self.stack.return_alloc_authority(self.alloc_auth);
-        }
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 

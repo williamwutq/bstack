@@ -268,6 +268,16 @@ impl CheckedSlabBStackAllocator {
     ///   file).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack, data_size: u64) -> io::Result<Self> {
+        // Acquire the allocator authority up front, so every metadata write below
+        // is made as the allocator. Refused (rather than panicking) if the stack's
+        // permit has already been taken.
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "CheckedSlabBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if !stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -303,9 +313,7 @@ impl CheckedSlabBStackAllocator {
         stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
         Ok(Self {
             #[cfg(feature = "expensive-slice-access-control")]
-            alloc_auth: stack
-                .take_alloc_authority()
-                .expect("fresh stack owns its alloc permit"),
+            alloc_auth,
             stack,
             block_size,
             #[cfg(feature = "atomic")]
@@ -335,6 +343,16 @@ impl CheckedSlabBStackAllocator {
     ///   `block_size`, misaligned arena, or an invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn open(stack: BStack) -> io::Result<Self> {
+        // Acquire the allocator authority up front and read the header through it,
+        // so a reopen sees its own `Alloc`-marked header (marks are not persisted,
+        // but a same-object reopen still carries them).
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "CheckedSlabBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -351,6 +369,9 @@ impl CheckedSlabBStackAllocator {
         }
 
         let mut header = [0u8; Self::HEADER_SIZE as usize];
+        #[cfg(feature = "expensive-slice-access-control")]
+        stack.get_into_as(&alloc_auth, Self::OFFSET_SIZE, &mut header)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         stack.get_into(Self::OFFSET_SIZE, &mut header)?;
 
         if header[..ALCK_MAGIC_PREFIX.len()] != ALCK_MAGIC_PREFIX {
@@ -405,9 +426,7 @@ impl CheckedSlabBStackAllocator {
 
         let allocator = Self {
             #[cfg(feature = "expensive-slice-access-control")]
-            alloc_auth: stack
-                .take_alloc_authority()
-                .expect("fresh stack owns its alloc permit"),
+            alloc_auth,
             stack,
             block_size: stored_block_size,
             #[cfg(feature = "atomic")]
@@ -847,7 +866,17 @@ impl CheckedSlabBStackAllocator {
     fn scan_free_list(&self, stack_len: u64) -> io::Result<(Vec<u64>, bool)> {
         let mut free = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        let mut head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+        let mut head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         let mut corrupt = false;
         while head != Self::SENTINEL {
             if head < Self::ARENA_START
@@ -1093,7 +1122,17 @@ impl CheckedSlabBStackAllocator {
     /// two writes merely leaks the detached block.
     #[cfg(not(feature = "atomic"))]
     fn pop_and_claim_block(&self, num_blocks: u64, init: bool) -> io::Result<Option<u64>> {
-        let head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?;
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
@@ -1149,7 +1188,18 @@ impl CheckedSlabBStackAllocator {
     fn write_free_run(&self, first_block: u64, count: u64) -> io::Result<()> {
         debug_assert!(count > 0);
         #[cfg(not(feature = "atomic"))]
-        let old_head = alloc_meta!(self, read_u64, Self::FREE_HEAD_OFFSET)?.to_le_bytes();
+        let old_head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        }
+        .to_le_bytes();
         let total = count
             .checked_mul(self.block_size)
             .ok_or_else(|| io_error!(InvalidInput, "freed region size overflows u64"))?;
@@ -1585,13 +1635,10 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
         #[cfg(feature = "expensive-slice-access-control")]
-        {
-            // Marks are in-memory only; clear them so the reclaimed stack matches
-            // a fresh reopen, then hand the capability back for re-minting.
-            self.stack.acl_reset();
-            self.stack.return_alloc_authority(self.alloc_auth);
-        }
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
