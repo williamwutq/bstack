@@ -1232,10 +1232,13 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
-        // Hand the allocator capability back to the reclaimed stack, so a caller
-        // that re-wraps it can mint the token again.
         #[cfg(feature = "expensive-slice-access-control")]
-        self.stack.return_alloc_authority(self.alloc_auth);
+        {
+            // Marks are in-memory only; clear them so the reclaimed stack matches
+            // a fresh reopen, then hand the capability back for re-minting.
+            self.stack.acl_reset();
+            self.stack.return_alloc_authority(self.alloc_auth);
+        }
         self.stack
     }
 

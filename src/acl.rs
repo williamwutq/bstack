@@ -976,6 +976,15 @@ mod inner {
             Ok(())
         }
 
+        /// Drop all access-control policy, returning the stack to the unmarked
+        /// state of a fresh open. Called when an allocator relinquishes its stack
+        /// ([`into_stack`](crate::BStackAllocator::into_stack)): the allocator's
+        /// permanent header marks live only in memory (never persisted), so a
+        /// reclaimed stack must present the same empty policy a real reopen would.
+        pub(crate) fn acl_reset(&self) {
+            self.acl.write().unwrap().clear();
+        }
+
         /// The mode currently governing logical `offset` (for inspection/testing).
         #[inline]
         #[must_use]

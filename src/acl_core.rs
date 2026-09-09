@@ -207,6 +207,15 @@ impl PointTable {
         &self.points
     }
 
+    /// Drop all policy, returning the table to [`All`](BStackAccess::All)
+    /// everywhere (the state of a freshly opened stack). Used when an allocator
+    /// relinquishes its stack: marks are never persisted, so the reclaimed
+    /// in-memory table must match what a fresh reopen would see.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.points.clear();
+    }
+
     /// The mode in effect at `off`.
     ///
     /// `partition_point(|p| p.0 <= off) - 1`, with `All` when no point starts at
