@@ -1176,7 +1176,16 @@ mod inner {
             }
         }
 
-        /// [`zero`](BStack::zero) presenting an access token.
+        /// [`zero`](BStack::zero) presenting an access token: zeroing a
+        /// [`Prot`](BStackAccess::Prot)/[`Alloc`](BStackAccess::Alloc) range requires the
+        /// matching capability, checked before any I/O.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `offset + n` overflows `u64` or the range exceeds the payload size; plus any I/O
+        /// error from the write.
         pub fn zero_as(&self, auth: impl BStackAuthority, offset: u64, n: u64) -> io::Result<()> {
             if n == 0 {
                 return Ok(());
@@ -1200,6 +1209,13 @@ mod inner {
         }
 
         /// [`repeat`](BStack::repeat) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if the
+        /// pattern is empty with a non-zero count, or the filled range overflows `u64` or
+        /// exceeds the payload size; plus any I/O error from the write.
         pub fn repeat_as(
             &self,
             auth: impl BStackAuthority,
@@ -1237,6 +1253,13 @@ mod inner {
         }
 
         /// [`cas`](BStack::cas) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `offset + old.len()` overflows `u64` or exceeds the payload size; plus any I/O
+        /// error. A length mismatch or a failed compare returns `Ok(false)`, not an error.
         #[cfg(feature = "atomic")]
         pub fn cas_as(
             &self,
@@ -1277,7 +1300,15 @@ mod inner {
             Ok(true)
         }
 
-        /// [`cross_exchange`](BStack::cross_exchange) presenting an access token.
+        /// [`cross_exchange`](BStack::cross_exchange) presenting an access token: both
+        /// regions are checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if either region's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// region overflows `u64`, exceeds the payload size, overlaps the other, or overlaps
+        /// the locked prefix; plus any I/O error.
         #[cfg(feature = "atomic")]
         pub fn cross_exchange_as(
             &self,
@@ -1345,7 +1376,16 @@ mod inner {
             Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
         }
 
-        /// [`copy`](BStack::copy) presenting an access token.
+        /// [`copy`](BStack::copy) presenting an access token: the source range is checked
+        /// for read and the destination for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the source denies the
+        /// read or the destination denies the write under `auth`;
+        /// [`InvalidInput`](io::ErrorKind::InvalidInput) if either range overflows `u64`,
+        /// exceeds the payload size, or the destination overlaps the locked prefix; plus
+        /// any I/O error.
         #[cfg(feature = "atomic")]
         pub fn copy_as(
             &self,
@@ -1405,6 +1445,13 @@ mod inner {
         }
 
         /// [`swap`](BStack::swap) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `offset + buf.len()` overflows `u64` or exceeds the payload size; plus any I/O
+        /// error from the read-back or write.
         #[cfg(feature = "atomic")]
         pub fn swap_as(
             &self,
@@ -1438,6 +1485,13 @@ mod inner {
         }
 
         /// [`swap_into`](BStack::swap_into) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// As [`swap_as`](Self::swap_as): [`PermissionDenied`](io::ErrorKind::PermissionDenied)
+        /// if the range's mode denies the write under `auth`;
+        /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `offset + buf.len()` overflows
+        /// `u64` or exceeds the payload size; plus any I/O error.
         #[cfg(feature = "atomic")]
         pub fn swap_into_as(
             &self,
@@ -1476,7 +1530,15 @@ mod inner {
             Ok(())
         }
 
-        /// [`splice`](BStack::splice) presenting an access token.
+        /// [`splice`](BStack::splice) presenting an access token: the truncated tail range
+        /// is checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the tail range's mode
+        /// denies the truncate under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `n` exceeds the payload size or the cut reaches into the locked prefix; plus any
+        /// I/O error.
         #[cfg(feature = "atomic")]
         pub fn splice_as(
             &self,
@@ -1520,6 +1582,13 @@ mod inner {
         }
 
         /// [`splice_into`](BStack::splice_into) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// As [`splice_as`](Self::splice_as): [`PermissionDenied`](io::ErrorKind::PermissionDenied)
+        /// if the tail range's mode denies the truncate under `auth`;
+        /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `old.len()` exceeds the payload
+        /// size or the cut reaches the locked prefix; plus any I/O error.
         #[cfg(feature = "atomic")]
         pub fn splice_into_as(
             &self,
@@ -1562,6 +1631,13 @@ mod inner {
         }
 
         /// [`replace`](BStack::replace) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the tail range's mode
+        /// denies the truncate under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `n` exceeds the payload size or the cut reaches the locked prefix; plus any I/O
+        /// error.
         #[cfg(feature = "atomic")]
         pub fn replace_as<F>(&self, auth: impl BStackAuthority, n: u64, f: F) -> io::Result<()>
         where
@@ -1597,7 +1673,15 @@ mod inner {
             )
         }
 
-        /// [`set_batched`](BStack::set_batched) presenting an access token.
+        /// [`set_batched`](BStack::set_batched) presenting an access token: every write
+        /// block is checked under `auth` before the batch is journaled.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if any block's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a block
+        /// overflows `u64`, exceeds the payload size, overlaps the locked prefix, or two
+        /// blocks overlap; plus any I/O error.
         #[cfg(feature = "atomic")]
         pub fn set_batched_as<I, D>(&self, auth: impl BStackAuthority, writes: I) -> io::Result<()>
         where
@@ -1665,6 +1749,13 @@ mod inner {
         }
 
         /// [`process`](BStack::process) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if the range
+        /// overflows `u64` or exceeds the payload size; plus any I/O error. The callback must
+        /// not change the buffer length.
         #[cfg(feature = "atomic")]
         pub fn process_as<F>(
             &self,
@@ -1713,7 +1804,15 @@ mod inner {
             Ok(())
         }
 
-        /// [`eq_crds`](BStack::eq_crds) presenting an access token.
+        /// [`eq_crds`](BStack::eq_crds) presenting an access token: the compared range and the
+        /// write range are checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if a touched range's mode
+        /// denies the access under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// range overflows `u64` or exceeds the payload size, or the lengths mismatch; plus
+        /// any I/O error. A failed compare returns `Ok(None)`, not an error.
         #[cfg(feature = "atomic")]
         pub fn eq_crds_as(
             &self,
@@ -1783,7 +1882,15 @@ mod inner {
             Ok(Some(old_b))
         }
 
-        /// [`ne_crds`](BStack::ne_crds) presenting an access token.
+        /// [`ne_crds`](BStack::ne_crds) presenting an access token: the compared range and the
+        /// write range are checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if a touched range's mode
+        /// denies the access under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// range overflows `u64` or exceeds the payload size, or the lengths mismatch; plus
+        /// any I/O error. A failed compare returns `Ok(None)`, not an error.
         #[cfg(feature = "atomic")]
         pub fn ne_crds_as(
             &self,
@@ -1853,7 +1960,15 @@ mod inner {
             Ok(Some(old_b))
         }
 
-        /// [`masked_eq_crds`](BStack::masked_eq_crds) presenting an access token.
+        /// [`masked_eq_crds`](BStack::masked_eq_crds) presenting an access token: the compared range and the
+        /// write range are checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if a touched range's mode
+        /// denies the access under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// range overflows `u64` or exceeds the payload size, or the lengths mismatch; plus
+        /// any I/O error. A failed compare returns `Ok(None)`, not an error.
         #[cfg(feature = "atomic")]
         pub fn masked_eq_crds_as(
             &self,
@@ -1938,7 +2053,14 @@ mod inner {
             Ok(Some(old_b))
         }
 
-        /// [`push`](BStack::push) presenting an access token.
+        /// [`push`](BStack::push) presenting an access token: the appended range
+        /// `[len, len + data.len())` is checked for write under `auth` (it need not be
+        /// `All` — a range may be armed before its bytes arrive).
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the appended range's mode
+        /// denies the write under `auth`; plus any I/O error from the append.
         pub fn push_as(
             &self,
             auth: impl BStackAuthority,
@@ -1975,7 +2097,13 @@ mod inner {
             Ok(logical_offset)
         }
 
-        /// [`extend`](BStack::extend) presenting an access token.
+        /// [`extend`](BStack::extend) presenting an access token: the grown range
+        /// `[len, len + n)` is checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; plus any I/O error.
         pub fn extend_as(&self, auth: impl BStackAuthority, n: u64) -> io::Result<u64> {
             let held = auth.authorities_for(self);
             let mut guard = self.write_lock()?;
@@ -1997,7 +2125,14 @@ mod inner {
             Ok(logical_offset)
         }
 
-        /// [`resize`](BStack::resize) presenting an access token.
+        /// [`resize`](BStack::resize) presenting an access token: a grow checks the new tail
+        /// for write, a shrink checks the discarded tail for truncate, under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the affected range's mode
+        /// denies the operation under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// a shrink would cut into the locked prefix; plus any I/O error.
         pub fn resize_as(&self, auth: impl BStackAuthority, target: u64) -> io::Result<u64> {
             let held = auth.authorities_for(self);
             let mut guard = self.write_lock()?;
@@ -2029,7 +2164,13 @@ mod inner {
             Ok(data_size)
         }
 
-        /// [`ensure`](BStack::ensure) presenting an access token.
+        /// [`ensure`](BStack::ensure) presenting an access token: when it grows, the new
+        /// range is checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; plus any I/O error.
         pub fn ensure_as(&self, auth: impl BStackAuthority, target: u64) -> io::Result<u64> {
             let held = auth.authorities_for(self);
             let mut guard = self.write_lock()?;
@@ -2046,7 +2187,15 @@ mod inner {
             Ok(data_size)
         }
 
-        /// [`extend_sparse`](BStack::extend_sparse) presenting an access token.
+        /// [`extend_sparse`](BStack::extend_sparse) presenting an access token: the grown
+        /// range `[len, len + length)` is checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `buf.len()` exceeds `length` or the payload size plus `length` overflows `u64`;
+        /// plus any I/O error.
         pub fn extend_sparse_as(
             &self,
             auth: impl BStackAuthority,
@@ -2086,7 +2235,15 @@ mod inner {
             Ok(logical_offset)
         }
 
-        /// [`extend_sparse_batched`](BStack::extend_sparse_batched) presenting an access token.
+        /// [`extend_sparse_batched`](BStack::extend_sparse_batched) presenting an access
+        /// token: the grown range is checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// write overflows `u64` or exceeds `length`, two writes overlap, or the payload size
+        /// plus `length` overflows `u64`; plus any I/O error.
         pub fn extend_sparse_batched_as<I, D>(
             &self,
             auth: impl BStackAuthority,
@@ -2127,7 +2284,15 @@ mod inner {
             Ok(logical_offset)
         }
 
-        /// [`pop`](BStack::pop) presenting an access token.
+        /// [`pop`](BStack::pop) presenting an access token: the removed tail range
+        /// `[len - n, len)` is checked for truncate under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the tail range's mode
+        /// denies the truncate under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `n` exceeds the payload size or shrinks below the locked length; plus any I/O
+        /// error.
         pub fn pop_as(&self, auth: impl BStackAuthority, n: u64) -> io::Result<Vec<u8>> {
             let held = auth.authorities_for(self);
             let mut guard = self.write_lock()?;
@@ -2157,6 +2322,13 @@ mod inner {
         }
 
         /// [`pop_into`](BStack::pop_into) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// As [`pop_as`](Self::pop_as): [`PermissionDenied`](io::ErrorKind::PermissionDenied)
+        /// if the tail range's mode denies the truncate under `auth`;
+        /// [`InvalidInput`](io::ErrorKind::InvalidInput) if `buf.len()` exceeds the payload
+        /// size or shrinks below the locked length; plus any I/O error.
         pub fn pop_into_as(&self, auth: impl BStackAuthority, buf: &mut [u8]) -> io::Result<()> {
             if buf.is_empty() {
                 return Ok(());
@@ -2188,7 +2360,14 @@ mod inner {
             Ok(())
         }
 
-        /// [`peek`](BStack::peek) presenting an access token.
+        /// [`peek`](BStack::peek) presenting an access token: the read range `[offset, len)`
+        /// is checked for read under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the read under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if `offset`
+        /// exceeds the payload size; plus any I/O error.
         pub fn peek_as(&self, auth: impl BStackAuthority, offset: u64) -> io::Result<Vec<u8>> {
             let held = auth.authorities_for(self);
             #[cfg(any(unix, windows))]
@@ -2228,6 +2407,13 @@ mod inner {
         }
 
         /// [`peek_into`](BStack::peek_into) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the range's mode denies
+        /// the read under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `offset + buf.len()` overflows `u64` or exceeds the payload size; plus any I/O
+        /// error.
         pub fn peek_into_as(
             &self,
             auth: impl BStackAuthority,
@@ -2278,7 +2464,15 @@ mod inner {
             }
         }
 
-        /// [`atrunc`](BStack::atrunc) presenting an access token.
+        /// [`atrunc`](BStack::atrunc) presenting an access token: the rewritten tail range
+        /// `[data_size - n, data_size)` is checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the tail range's mode
+        /// denies the truncate under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `n` exceeds the payload size or the cut reaches the locked prefix; plus any I/O
+        /// error.
         #[cfg(feature = "atomic")]
         pub fn atrunc_as(
             &self,
@@ -2318,7 +2512,14 @@ mod inner {
             )
         }
 
-        /// [`try_extend`](BStack::try_extend) presenting an access token.
+        /// [`try_extend`](BStack::try_extend) presenting an access token: when the size
+        /// matches, the appended range is checked for write under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the appended range's mode
+        /// denies the write under `auth`; plus any I/O error. A size mismatch returns
+        /// `Ok(false)`, not an error.
         #[cfg(feature = "atomic")]
         pub fn try_extend_as(
             &self,
@@ -2355,6 +2556,13 @@ mod inner {
         }
 
         /// [`try_extend_zeros`](BStack::try_extend_zeros) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if the
+        /// payload size plus `n` overflows `u64`; plus any I/O error. A size mismatch returns
+        /// `Ok(false)`.
         #[cfg(feature = "atomic")]
         pub fn try_extend_zeros_as(
             &self,
@@ -2389,6 +2597,13 @@ mod inner {
         }
 
         /// [`try_extend_sparse`](BStack::try_extend_sparse) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `buf.len()` exceeds `length` or the payload size plus `length` overflows `u64`;
+        /// plus any I/O error. A size mismatch returns `Ok(false)`.
         #[cfg(feature = "atomic")]
         pub fn try_extend_sparse_as(
             &self,
@@ -2432,7 +2647,16 @@ mod inner {
             Ok(true)
         }
 
-        /// [`try_extend_sparse_batched`](BStack::try_extend_sparse_batched) presenting a token.
+        /// [`try_extend_sparse_batched`](BStack::try_extend_sparse_batched) presenting an
+        /// access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the grown range's mode
+        /// denies the write under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a
+        /// write overflows `u64` or exceeds `length`, two writes overlap, or the payload size
+        /// plus `length` overflows `u64`; plus any I/O error. A size mismatch returns
+        /// `Ok(false)`.
         #[cfg(feature = "atomic")]
         pub fn try_extend_sparse_batched_as<I, D>(
             &self,
@@ -2477,7 +2701,15 @@ mod inner {
             Ok(true)
         }
 
-        /// [`try_discard`](BStack::try_discard) presenting an access token.
+        /// [`try_discard`](BStack::try_discard) presenting an access token: when the size
+        /// matches, the removed tail range is checked for truncate under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if the tail range's mode
+        /// denies the truncate under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if
+        /// `n` exceeds the payload size or shrinks below the locked length; plus any I/O
+        /// error. A size mismatch returns `Ok(false)`.
         #[cfg(feature = "atomic")]
         pub fn try_discard_as(
             &self,
@@ -2519,7 +2751,14 @@ mod inner {
             Ok(true)
         }
 
-        /// [`get_batched`](BStack::get_batched) presenting an access token.
+        /// [`get_batched`](BStack::get_batched) presenting an access token: every range is
+        /// checked for read under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if any range's mode denies
+        /// the read under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if a range has
+        /// `end < start` or exceeds the payload size; plus any I/O error.
         #[cfg(feature = "atomic")]
         pub fn get_batched_as<I>(
             &self,
@@ -2593,6 +2832,13 @@ mod inner {
         }
 
         /// [`get_batched_into`](BStack::get_batched_into) presenting an access token.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if any range's mode denies
+        /// the read under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if an
+        /// `offset + buf.len()` overflows `u64` or exceeds the payload size; plus any I/O
+        /// error.
         #[cfg(feature = "atomic")]
         pub fn get_batched_into_as<'a, I>(
             &self,
@@ -2662,7 +2908,15 @@ mod inner {
             }
         }
 
-        /// [`get_batched_gen`](BStack::get_batched_gen) presenting an access token.
+        /// [`get_batched_gen`](BStack::get_batched_gen) presenting an access token: each
+        /// requested read range is checked under `auth`.
+        ///
+        /// # Errors
+        ///
+        /// [`PermissionDenied`](io::ErrorKind::PermissionDenied) if a requested range's mode
+        /// denies the read under `auth`; [`InvalidInput`](io::ErrorKind::InvalidInput) if an
+        /// `offset + buf.len()` overflows `u64` or exceeds the payload size; plus any I/O
+        /// error.
         #[cfg(feature = "atomic")]
         pub fn get_batched_gen_as<'a, F>(
             &self,
