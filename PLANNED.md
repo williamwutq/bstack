@@ -102,7 +102,7 @@ Reasons:
 
 ---
 
-## Compact `Repeat` staging within a batched commit
+## Compact `Repeat` staging within a batched commit (0.5.0)
 
 **Feature flag:** `set` + `atomic`.
 **Breaking change:** Yes (on-disk journal format / recovery).
