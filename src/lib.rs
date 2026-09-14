@@ -486,6 +486,7 @@
 
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod alloc_fuzz_tests;
+#[cfg(test)]
 mod test;
 
 #[cfg(feature = "alloc")]
