@@ -14,7 +14,7 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example move_and_cow --features "set,atomic"
+//! cargo run --example move_and_cow --features set
 //! ```
 
 #[cfg(all(feature = "set", feature = "atomic"))]

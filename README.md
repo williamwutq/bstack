@@ -2,7 +2,7 @@
 
 A persistent, fsync-durable binary stack backed by a single file.
 
-Every write — `push`, `pop`, and the optional `set`/`atomic` operations —
+Every write — `push`, `pop`, and the optional `set` and the `atomic` operations —
 performs a *durable sync* before returning, so data survives a process crash
 or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used instead of
 `fdatasync` to flush the drive's hardware write cache, which plain
@@ -21,7 +21,8 @@ On **Unix**, `open` acquires an **exclusive advisory `flock`**; on
 **Windows**, `LockFileEx` is used instead.  Both prevent two processes from
 concurrently corrupting the same stack file.
 
-The optional `atomic` feature adds compound read-modify-write and
+The `atomic` feature — **enabled by default** (opt out with `default-features =
+false`) — adds compound read-modify-write and
 compare-and-swap operations, including a generator-driven `get_batched_gen` for
 multi-step reads, `process_gen` for multi-step read and writes, and `set_batched`
 / `inplace_gen` for committing several in-place writes as one crash-atomic unit.
@@ -1330,7 +1331,7 @@ A general typed vector over arbitrary `Copy` types requires a sound POD/byte-cas
 
 ```toml
 [dependencies]
-bstack = { version = "0.4", features = ["alloc", "set"] }
+bstack = { version = "0.5", features = ["alloc", "set"] }
 ```
 
 ### Memory layout

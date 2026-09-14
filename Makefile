@@ -159,13 +159,11 @@ help:
 	@echo '  make clean-zip                         remove archives only'
 	@echo '  make clean-data                        remove *.bstack data files'
 	@echo ''
-	@echo 'C feature variants built per target:'
-	@echo '  libbstack.a            base'
-	@echo '  libbstack-set.a        -DBSTACK_FEATURE_SET'
-	@echo '  libbstack-atomic.a     -DBSTACK_FEATURE_ATOMIC'
-	@echo '  libbstack-set-atomic.a -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC'
-	@echo '  libbstack-alloc.a      base + alloc layer'
-	@echo '  libbstack-alloc-set.a  -DBSTACK_FEATURE_SET + alloc layer'
+	@echo 'C feature variants built per target (all include atomic):'
+	@echo '  libbstack.a            -DBSTACK_FEATURE_ATOMIC'
+	@echo '  libbstack-set.a        -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC'
+	@echo '  libbstack-alloc.a      -DBSTACK_FEATURE_ATOMIC + alloc layer'
+	@echo '  libbstack-alloc-set.a  -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC + alloc layer'
 
 all: release zip
 
@@ -176,12 +174,12 @@ rust: $(RUST_PHONY)
 c: $(C_PHONY)
 
 # ── Rust — cargo zigbuild ─────────────────────────────────────────────────────
-# Output: $(BUILD)/<target>/rust/libbstack.rlib
-#         $(BUILD)/<target>/rust/libbstack-set.rlib
-#         $(BUILD)/<target>/rust/libbstack-alloc.rlib
-#         $(BUILD)/<target>/rust/libbstack-alloc-set.rlib
-#         $(BUILD)/<target>/rust/libbstack-atomic.rlib
-#         $(BUILD)/<target>/rust/libbstack-set-atomic.rlib
+# `atomic` is a default feature, so every release rlib includes it; no-atomic
+# builds are exercised by the `test`/CI targets, not shipped.
+# Output: $(BUILD)/<target>/rust/libbstack.rlib           (atomic — the default)
+#         $(BUILD)/<target>/rust/libbstack-set.rlib       (set + atomic)
+#         $(BUILD)/<target>/rust/libbstack-alloc.rlib     (alloc + atomic)
+#         $(BUILD)/<target>/rust/libbstack-alloc-set.rlib (alloc + set + atomic)
 define rust_rule
 rust-$(1):
 	@echo "==> rust $(1)"
@@ -194,21 +192,18 @@ rust-$(1):
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-alloc.rlib
 	cargo zigbuild --target $(1) --release --features "alloc,set"
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-alloc-set.rlib
-	cargo zigbuild --target $(1) --release --features atomic
-	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-atomic.rlib
-	cargo zigbuild --target $(1) --release --features "set,atomic"
-	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-set-atomic.rlib
 endef
 
 $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
 
 # ── C — cross-compilation ─────────────────────────────────────────────────────
-# Output: $(BUILD)/<target>/c/libbstack.a
-#         $(BUILD)/<target>/c/libbstack-set.a
-#         $(BUILD)/<target>/c/libbstack-atomic.a
-#         $(BUILD)/<target>/c/libbstack-set-atomic.a
-#         $(BUILD)/<target>/c/libbstack-alloc.a
-#         $(BUILD)/<target>/c/libbstack-alloc-set.a
+# Every release archive is built with -DBSTACK_FEATURE_ATOMIC (C has no default
+# feature, so it is added explicitly to match the Rust default); no-atomic builds
+# are exercised by the `test`/CI targets, not shipped.
+# Output: $(BUILD)/<target>/c/libbstack.a           (-DATOMIC)
+#         $(BUILD)/<target>/c/libbstack-set.a       (-DSET -DATOMIC)
+#         $(BUILD)/<target>/c/libbstack-alloc.a     (-DATOMIC + alloc)
+#         $(BUILD)/<target>/c/libbstack-alloc-set.a (-DSET -DATOMIC + alloc)
 #         $(BUILD)/<target>/c/bstack.h
 #         $(BUILD)/<target>/c/bstack_alloc.h
 define c_rule
@@ -217,27 +212,19 @@ c-$(1):
 	@mkdir -p $(BUILD)/$(1)/c
 	cp $(C_INC)/bstack.h       $(BUILD)/$(1)/c/bstack.h
 	cp $(C_INC)/bstack_alloc.h $(BUILD)/$(1)/c/bstack_alloc.h
-	$(call cc_for,$(1)) $(C_FLAGS) \
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_ATOMIC \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack.o $(C_SRC)
 	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack.a \
 	    $(BUILD)/$(1)/c/bstack.o
-	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET \
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-set.o $(C_SRC)
 	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-set.a \
 	    $(BUILD)/$(1)/c/bstack-set.o
 	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_ATOMIC \
-	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-atomic.o $(C_SRC)
-	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-atomic.a \
-	    $(BUILD)/$(1)/c/bstack-atomic.o
-	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC \
-	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack-set-atomic.o $(C_SRC)
-	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-set-atomic.a \
-	    $(BUILD)/$(1)/c/bstack-set-atomic.o
-	$(call cc_for,$(1)) $(C_FLAGS) \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc.o $(C_ALLOC_SRC)
 	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc.a \
 	    $(BUILD)/$(1)/c/bstack.o $(BUILD)/$(1)/c/bstack_alloc.o
-	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET \
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC \
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc-set.o $(C_ALLOC_SRC)
 	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc-set.a \
 	    $(BUILD)/$(1)/c/bstack-set.o $(BUILD)/$(1)/c/bstack_alloc-set.o
