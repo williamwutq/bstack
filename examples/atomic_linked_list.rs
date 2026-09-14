@@ -46,7 +46,7 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example atomic_linked_list --features "set,atomic"
+//! cargo run --example atomic_linked_list --features set
 //! ```
 
 #[cfg(all(feature = "set", feature = "atomic"))]
