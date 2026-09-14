@@ -705,6 +705,7 @@ use fault::fault_probe;
 pub use fault::{FaultPolicy, FaultState};
 #[cfg(all(test, feature = "alloc", feature = "set"))]
 mod alloc_fuzz;
+#[cfg(test)]
 mod test;
 
 #[cfg(feature = "alloc")]
