@@ -1324,7 +1324,10 @@ pub(crate) fn journaled_multi_atrunc(
     file.set_len(HEADER_SIZE + s_base + staged_len)?;
     file.seek(SeekFrom::Start(HEADER_SIZE + s_base))?;
     for (offset, d) in blocks {
-        debug_assert!(offset.saturating_add(d.len()) <= clen_new, "block past clen'");
+        debug_assert!(
+            offset.saturating_add(d.len()) <= clen_new,
+            "block past clen'"
+        );
         let e = offset + d.len();
         file.write_all(&offset.to_le_bytes())?;
         file.write_all(&e.to_le_bytes())?;
@@ -1376,7 +1379,11 @@ pub(crate) fn journaled_multi_atrunc(
 /// disjoint from every target.
 enum MaBlock {
     /// Copy `len` staged literal bytes (at logical `src_logical`) into the target.
-    Literal { dst: u64, src_logical: u64, len: u64 },
+    Literal {
+        dst: u64,
+        src_logical: u64,
+        len: u64,
+    },
     /// Fill the target with `pattern` (at physical `pattern_phys`, `plen` bytes)
     /// rotated to start at `phase`.
     Repeat {
@@ -1504,26 +1511,32 @@ pub(crate) fn recover_multi_atrunc(
     if valid {
         // Pass 2: replay each block into place, only now that the whole tail is
         // known clean, so the effect is all-or-nothing.
-        walk_multi_atrunc_blocks(file, clen_new, tail_start, raw_size, |f, block| match block {
-            MaBlock::Literal {
-                dst,
-                src_logical,
-                len,
-            } => move_chunked(f, src_logical, dst, len),
-            MaBlock::Repeat {
-                dst,
-                pattern_phys,
-                plen,
-                phase,
-                len,
-            } => {
-                let mut pat = vec![0u8; plen as usize];
-                f.seek(SeekFrom::Start(pattern_phys))?;
-                f.read_exact(&mut pat)?;
-                f.seek(SeekFrom::Start(HEADER_SIZE + dst))?;
-                write_pattern(f, &pat, phase, len)
-            }
-        })?;
+        walk_multi_atrunc_blocks(
+            file,
+            clen_new,
+            tail_start,
+            raw_size,
+            |f, block| match block {
+                MaBlock::Literal {
+                    dst,
+                    src_logical,
+                    len,
+                } => move_chunked(f, src_logical, dst, len),
+                MaBlock::Repeat {
+                    dst,
+                    pattern_phys,
+                    plen,
+                    phase,
+                    len,
+                } => {
+                    let mut pat = vec![0u8; plen as usize];
+                    f.seek(SeekFrom::Start(pattern_phys))?;
+                    f.read_exact(&mut pat)?;
+                    f.seek(SeekFrom::Start(HEADER_SIZE + dst))?;
+                    write_pattern(f, &pat, phase, len)
+                }
+            },
+        )?;
         durable_sync(file)?;
     }
     Ok(valid)

@@ -3108,8 +3108,15 @@ mod alloc_tests {
         assert!(dbg.contains("BStack"), "{dbg}");
         assert!(dbg.contains("version"), "{dbg}");
         assert!(dbg.contains("len"), "{dbg}");
-        // Version must be a recognisable semver string.
-        assert!(dbg.contains("0.4"), "{dbg}");
+        // Version must be the current format version, derived from the magic so
+        // this stays correct across format bumps.
+        let ver = format!(
+            "{}.{}.{}",
+            crate::MAGIC[4],
+            crate::MAGIC[5],
+            crate::MAGIC[6]
+        );
+        assert!(dbg.contains(&ver), "{dbg}");
     }
 
     #[test]
@@ -6447,7 +6454,10 @@ mod first_fit_tests {
         // Append partial block bytes (less than BLOCK_OVERHEAD=24) directly to the file
         {
             use std::fs::OpenOptions;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(&[0u8; 12]).unwrap(); // 12 < 24 = partial block
         }
 
@@ -9096,7 +9106,11 @@ mod atomic_tests {
         // Grow 300 -> 400: a literal at [0,50) and a repeat filling the grown
         // region [300,400); the gap [50,300) keeps its old committed bytes.
         {
-            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
             let aaa = vec![b'A'; 50];
             let mut clen = 300u64;
             let blocks = [
@@ -9143,7 +9157,11 @@ mod atomic_tests {
 
         // Shrink 300 -> 200 while overwriting [0,50).
         {
-            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
             let aaa = vec![b'A'; 50];
             let mut clen = 300u64;
             let blocks = [(0u64, OverlayData::Literal(&aaa))];
@@ -9165,8 +9183,7 @@ mod atomic_tests {
     #[test]
     fn recovery_rolls_forward_multi_atrunc_grow() {
         let h = crate::io_core::HEADER_SIZE;
-        let path =
-            std::env::temp_dir().join(format!("bstack_ma_grow_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("bstack_ma_grow_{}.bin", std::process::id()));
         let _g = Guard(path.clone());
 
         // Armed grow 300 -> 400 (S = clen' = 400): committed payload, the grown
@@ -9261,7 +9278,11 @@ mod atomic_tests {
         let mut file = mw_wip_header(fill, h + fill, u64::MAX - 6);
         file.extend_from_slice(&vec![b'.'; fill as usize]);
         let block = ma_rep(0, fill, b"Z", 0);
-        assert_eq!(block.len(), 41, "repeat descriptor is O(pattern), not O(fill)");
+        assert_eq!(
+            block.len(),
+            41,
+            "repeat descriptor is O(pattern), not O(fill)"
+        );
         file.extend_from_slice(&block);
         assert_eq!(
             file.len() as u64,
@@ -9272,7 +9293,11 @@ mod atomic_tests {
 
         let s = BStack::open(&path).unwrap();
         assert_eq!(s.len().unwrap(), fill);
-        assert_eq!(s.peek(0).unwrap(), vec![b'Z'; fill as usize], "repeat expanded on replay");
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'Z'; fill as usize],
+            "repeat expanded on replay"
+        );
         drop(s);
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(raw.len() as u64, h + fill, "staging dropped after recovery");

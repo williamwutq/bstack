@@ -408,7 +408,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.5"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.5.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
