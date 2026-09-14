@@ -15,6 +15,7 @@ use super::{BStackBulkAllocError, BStackBulkAllocator, ensure_own_handles};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+use crate::acl::alloc_meta;
 #[cfg(feature = "atomic")]
 use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
@@ -175,6 +176,10 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 #[cfg(feature = "set")]
 pub struct CheckedSlabBStackAllocator {
     stack: BStack,
+    /// The real allocator capability, minted from `stack` at construction and
+    /// presented to the `_as` ops by the `alloc_meta!` forwarders.
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     /// Cached from the on-disk header; fixed for the lifetime of the allocator.
     /// Covers the full block including the 8-byte overhead; must be `≥ 16`.
     block_size: u64,
@@ -263,6 +268,16 @@ impl CheckedSlabBStackAllocator {
     ///   file).
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn new(stack: BStack, data_size: u64) -> io::Result<Self> {
+        // Acquire the allocator authority up front, so every metadata write below
+        // is made as the allocator. Refused (rather than panicking) if the stack's
+        // permit has already been taken.
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "CheckedSlabBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if !stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -291,7 +306,14 @@ impl CheckedSlabBStackAllocator {
         write_buf!(block_size => hdr, off + 8);
         // free_head at off+16 remains 0 (SENTINEL)
         stack.push(hdr)?;
+        // The whole header stays `Alloc` for the allocator's lifetime; its own
+        // metadata I/O goes through the `meta_*` helpers, which present allocator
+        // authority. No external `stack().set(..)` can corrupt magic, geometry, or
+        // the free-list head.
+        stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
         Ok(Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth,
             stack,
             block_size,
             #[cfg(feature = "atomic")]
@@ -321,6 +343,16 @@ impl CheckedSlabBStackAllocator {
     ///   `block_size`, misaligned arena, or an invalid `free_head`.
     /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
     pub fn open(stack: BStack) -> io::Result<Self> {
+        // Acquire the allocator authority up front and read the header through it,
+        // so a reopen sees its own `Alloc`-marked header (marks are not persisted,
+        // but a same-object reopen still carries them).
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "CheckedSlabBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if stack.is_empty()? {
             return Err(io_error!(
                 InvalidInput,
@@ -337,6 +369,9 @@ impl CheckedSlabBStackAllocator {
         }
 
         let mut header = [0u8; Self::HEADER_SIZE as usize];
+        #[cfg(feature = "expensive-slice-access-control")]
+        stack.get_into_as(&alloc_auth, Self::OFFSET_SIZE, &mut header)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         stack.get_into(Self::OFFSET_SIZE, &mut header)?;
 
         if header[..ALCK_MAGIC_PREFIX.len()] != ALCK_MAGIC_PREFIX {
@@ -390,6 +425,8 @@ impl CheckedSlabBStackAllocator {
         }
 
         let allocator = Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth,
             stack,
             block_size: stored_block_size,
             #[cfg(feature = "atomic")]
@@ -397,6 +434,11 @@ impl CheckedSlabBStackAllocator {
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
+        // Re-arm the header mark on every open (policy is not persisted); the
+        // free-list I/O in `recover` below goes through the `meta_*` helpers.
+        allocator
+            .stack
+            .acl_mark_alloc(Self::OFFSET_SIZE, Self::HEADER_SIZE)?;
         // Reclaim leaks and repair a failed tail truncation left by an unclean
         // shutdown. Best-effort: the residual unsure-block count is discarded
         // here; call [`recover`](Self::recover) explicitly to inspect it.
@@ -533,7 +575,7 @@ impl CheckedSlabBStackAllocator {
         let mut node_buf = [0u8; 16];
         let mut oh_buf = [0u8; 8];
 
-        self.stack.process_gen(|| {
+        alloc_meta!(self, process_gen, process_gen_as, || {
             loop {
                 match st {
                     // Read the authoritative payload size first.
@@ -824,7 +866,17 @@ impl CheckedSlabBStackAllocator {
     fn scan_free_list(&self, stack_len: u64) -> io::Result<(Vec<u64>, bool)> {
         let mut free = Vec::new();
         let mut seen: HashSet<u64> = HashSet::new();
-        let mut head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
+        let mut head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         let mut corrupt = false;
         while head != Self::SENTINEL {
             if head < Self::ARENA_START
@@ -987,7 +1039,7 @@ impl CheckedSlabBStackAllocator {
         let mut head_opt: Option<u64> = None;
         let mut corrupt: Option<u64> = None;
 
-        self.stack.process_gen(|| {
+        alloc_meta!(self, process_gen, process_gen_as, || {
             let op = match step {
                 // Step 0: read the current free-list head.
                 0 => Some(BStackGenOp::Read {
@@ -1070,7 +1122,17 @@ impl CheckedSlabBStackAllocator {
     /// two writes merely leaks the detached block.
     #[cfg(not(feature = "atomic"))]
     fn pop_and_claim_block(&self, num_blocks: u64, init: bool) -> io::Result<Option<u64>> {
-        let head = u64::from_le_bytes(read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64));
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
@@ -1086,7 +1148,7 @@ impl CheckedSlabBStackAllocator {
             ));
         }
         // Advance free_head to the next block (stored in data[0..8]).
-        self.stack.set(Self::FREE_HEAD_OFFSET, &prefix[8..16])?;
+        alloc_meta!(self, set, set_as, Self::FREE_HEAD_OFFSET, &prefix[8..16])?;
         // Mark in-use and, when the caller is owed zeroes, scrub the data in the
         // same write. `false` writes just the overhead word — still one
         // `set`, but `block_size - OVERHEAD` fewer bytes — and leaves the data
@@ -1126,7 +1188,18 @@ impl CheckedSlabBStackAllocator {
     fn write_free_run(&self, first_block: u64, count: u64) -> io::Result<()> {
         debug_assert!(count > 0);
         #[cfg(not(feature = "atomic"))]
-        let old_head = read_bstack!(self.stack, Self::FREE_HEAD_OFFSET => u64);
+        let old_head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(
+                self,
+                get_into,
+                get_into_as,
+                Self::FREE_HEAD_OFFSET,
+                &mut buf
+            )?;
+            u64::from_le_bytes(buf)
+        }
+        .to_le_bytes();
         let total = count
             .checked_mul(self.block_size)
             .ok_or_else(|| io_error!(InvalidInput, "freed region size overflows u64"))?;
@@ -1194,13 +1267,24 @@ impl CheckedSlabBStackAllocator {
                     io_error!(InvalidInput, "last free-list offset overflows u64")
                 })?)
                 .ok_or_else(|| io_error!(InvalidInput, "last block offset overflows u64"))?;
-            self.stack
-                .cross_exchange(last_block + Self::OVERHEAD, Self::FREE_HEAD_OFFSET, 8)
+            alloc_meta!(
+                self,
+                cross_exchange,
+                cross_exchange_as,
+                last_block + Self::OVERHEAD,
+                Self::FREE_HEAD_OFFSET,
+                8
+            )
         }
         #[cfg(not(feature = "atomic"))]
         {
-            self.stack
-                .set(Self::FREE_HEAD_OFFSET, first_block.to_le_bytes())
+            alloc_meta!(
+                self,
+                set,
+                set_as,
+                Self::FREE_HEAD_OFFSET,
+                first_block.to_le_bytes()
+            )
         }
     }
 }
@@ -1491,7 +1575,10 @@ impl CheckedSlabBStackAllocator {
                 // the pre-built run onto free_head with one cross_exchange.
                 if !self.stack.try_discard(sentinel, excess_backing)? {
                     let last_block = excess_start + (excess_count - 1) * self.block_size;
-                    self.stack.cross_exchange(
+                    alloc_meta!(
+                        self,
+                        cross_exchange,
+                        cross_exchange_as,
                         last_block + Self::OVERHEAD,
                         Self::FREE_HEAD_OFFSET,
                         8,
@@ -1502,8 +1589,13 @@ impl CheckedSlabBStackAllocator {
             {
                 // Non-tail (tail handled above): the run already points at the old
                 // head, so publishing its first block as the new head splices it.
-                self.stack
-                    .set(Self::FREE_HEAD_OFFSET, excess_start.to_le_bytes())?;
+                alloc_meta!(
+                    self,
+                    set,
+                    set_as,
+                    Self::FREE_HEAD_OFFSET,
+                    excess_start.to_le_bytes()
+                )?;
             }
             // SAFETY:
             // 1. No overflow: slice.start() + new_len ≤ block_start + OVERHEAD + new_n * block_size − OVERHEAD ≤ u64::MAX
@@ -1543,6 +1635,10 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -1600,6 +1696,9 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         let slice = ensure_own_handle(self, slice, "CheckedSlabBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         // Set once the caller's blocks may have been partially freed, after
         // which returning the handle for retry would risk a double-free.
         let mut lost = false;
@@ -1750,7 +1849,7 @@ impl CheckedSlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.process_gen(|| {
+        alloc_meta!(self, process_gen, process_gen_as, || {
             loop {
                 match st {
                     St::ReadHead => {
@@ -1885,7 +1984,7 @@ impl CheckedSlabBStackAllocator {
         }
         let mut st = St::ReadHead;
 
-        self.stack.inplace_gen(|prev| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |prev| {
             // A failed read reports its error here, not as a return value, and
             // leaves the buffer unfilled: bail before consuming stale bytes.
             if let Err(e) = prev {
@@ -2042,7 +2141,7 @@ impl CheckedSlabBStackAllocator {
             b
         };
         let mut i = 0usize;
-        self.stack.inplace_gen(|_prev| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |_prev| {
             // `i` walks `jobs` (collected before this call), so `get` is in bounds
             // until it runs off the end, where `?` ends the sequence.
             let (off, overhead) = jobs.get(i)?;
@@ -2083,8 +2182,14 @@ impl CheckedSlabBStackAllocator {
             batch.push((blocks[i], buf));
         }
         self.stack.set_batched(batch)?;
-        self.stack
-            .cross_exchange(blocks[k - 1] + Self::OVERHEAD, Self::FREE_HEAD_OFFSET, 8)
+        alloc_meta!(
+            self,
+            cross_exchange,
+            cross_exchange_as,
+            blocks[k - 1] + Self::OVERHEAD,
+            Self::FREE_HEAD_OFFSET,
+            8
+        )
     }
 
     /// Best-effort cleanup after an `alloc_bulk` extend path fails partway.
@@ -2310,6 +2415,11 @@ impl BStackBulkAllocator for CheckedSlabBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "CheckedSlabBStackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
         let bs = self.block_size;
 
         let mut freeing = false;
@@ -2920,7 +3030,7 @@ mod tests {
         let _c = alloc.alloc(8).unwrap(); // block 80
         alloc.dealloc(b).unwrap(); // free_head = 64
         // Simulate a pop crash: advance free_head past b without claiming it.
-        alloc.stack().set(40, 0u64.to_le_bytes()).unwrap();
+        crate::acl::alloc_meta!(alloc, set, set_as, 40, 0u64.to_le_bytes()).unwrap();
         // Block 64 is now leaked (overhead 0, not in the free list).
         assert_eq!(alloc.recover().unwrap(), 0);
         // The reclaimed block is handed back out on the next allocation.
@@ -2983,7 +3093,7 @@ mod tests {
         let b = alloc.alloc(8).unwrap();
         let _c = alloc.alloc(8).unwrap();
         alloc.dealloc(b).unwrap();
-        alloc.stack().set(40, 0u64.to_le_bytes()).unwrap(); // leak block 64
+        crate::acl::alloc_meta!(alloc, set, set_as, 40, 0u64.to_le_bytes()).unwrap(); // leak block 64
         assert_eq!(alloc.recover().unwrap(), 0);
         let len_after = alloc.stack().len().unwrap();
         // A second run finds nothing further and changes nothing.

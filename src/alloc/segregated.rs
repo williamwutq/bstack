@@ -49,6 +49,7 @@ use super::{BStackBulkAllocError, BStackBulkAllocator, ensure_own_handles};
 use crate::BStack;
 #[cfg(feature = "atomic")]
 use crate::BStackGenOp;
+use crate::acl::alloc_meta;
 #[cfg(feature = "atomic")]
 use crate::{bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 #[cfg(not(feature = "atomic"))]
@@ -119,6 +120,10 @@ const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 #[cfg(feature = "set")]
 pub struct SegregatedBStackAllocator {
     stack: BStack,
+    /// The real allocator capability, minted from `stack` at construction and
+    /// presented to the `_as` ops by the `alloc_meta!` forwarders.
+    #[cfg(feature = "expensive-slice-access-control")]
+    alloc_auth: crate::BStackAllocAuthority,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -278,6 +283,16 @@ impl SegregatedBStackAllocator {
     ///   allocator of the expected version).
     /// * Any [`io::Error`] from the underlying [`BStack`] operations.
     pub fn new(stack: BStack) -> io::Result<Self> {
+        // Acquire the allocator authority up front and use it for the header I/O
+        // below, so a same-object reopen reads its own `Alloc`-marked header.
+        // Refused (not panic) if the stack's permit has already been taken.
+        #[cfg(feature = "expensive-slice-access-control")]
+        let alloc_auth = stack.take_alloc_authority().ok_or_else(|| {
+            io_error!(
+                PermissionDenied,
+                "SegregatedBStackAllocator: alloc authority already taken from this stack"
+            )
+        })?;
         if stack.is_empty()? {
             // Initialize a new stack: write the header and return a fresh allocator.
             const OFFSET_OFFSET: usize = SegregatedBStackAllocator::OFFSET_SIZE as usize;
@@ -285,7 +300,12 @@ impl SegregatedBStackAllocator {
             hdr[OFFSET_OFFSET..].copy_from_slice(&ALSG_MAGIC);
             // the reserved words and every free_head remain 0.
             let _ = stack.extend_sparse(hdr, Self::ARENA_START)?;
+            // Header (magic + the 33 free-list heads) stays `Alloc` for the
+            // allocator's lifetime; own I/O via the `meta_*` helpers.
+            stack.acl_mark_alloc(Self::OFFSET_SIZE, Self::ARENA_START - Self::OFFSET_SIZE)?;
             return Ok(Self {
+                #[cfg(feature = "expensive-slice-access-control")]
+                alloc_auth,
                 stack,
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
@@ -302,6 +322,9 @@ impl SegregatedBStackAllocator {
         }
 
         let mut magic = [0u8; 8];
+        #[cfg(feature = "expensive-slice-access-control")]
+        stack.get_into_as(&alloc_auth, Self::OFFSET_SIZE, &mut magic)?;
+        #[cfg(not(feature = "expensive-slice-access-control"))]
         stack.get_into(Self::OFFSET_SIZE, &mut magic)?;
         if magic[..ALSG_MAGIC_PREFIX.len()] != ALSG_MAGIC_PREFIX {
             return Err(io_error!(
@@ -321,10 +344,17 @@ impl SegregatedBStackAllocator {
             ));
         }
         let allocator = Self {
+            #[cfg(feature = "expensive-slice-access-control")]
+            alloc_auth,
             stack,
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
+        // Re-arm the header mark on reopen (policy is not persisted); the head I/O
+        // in `recover` below goes through the `meta_*` helpers.
+        allocator
+            .stack
+            .acl_mark_alloc(Self::OFFSET_SIZE, Self::ARENA_START - Self::OFFSET_SIZE)?;
         // SAFETY: `allocator` was just constructed and has not yet escaped this
         // function, so no other thread can hold it — it is trivially quiescent.
         unsafe { allocator.recover()? };
@@ -419,7 +449,7 @@ impl SegregatedBStackAllocator {
         for (c, &h) in heads.iter().enumerate() {
             write_buf!(h => head_bytes, c * 8);
         }
-        self.stack.set(Self::FREE_HEAD_BASE, head_bytes)?;
+        alloc_meta!(self, set, set_as, Self::FREE_HEAD_BASE, head_bytes)?;
         Ok(unsure)
     }
 
@@ -519,7 +549,7 @@ impl SegregatedBStackAllocator {
         let mut wi = 0usize;
         let mut state = Scan::NeedLen;
 
-        self.stack.inplace_gen(|feedback| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |feedback| {
             if let Err(e) = feedback {
                 return Some(BStackGenOp::Abort { source: Some(e) });
             }
@@ -664,12 +694,16 @@ impl SegregatedBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     fn pop_class(&self, class: u64) -> io::Result<Option<u64>> {
         let head_off = Self::head_off(class);
-        let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
         let next = u64::from_le_bytes(read_bstack!(self.stack, head + Self::OVERHEAD => u64));
-        self.stack.set(head_off, next.to_le_bytes())?;
+        alloc_meta!(self, set, set_as, head_off, next.to_le_bytes())?;
         Ok(Some(head))
     }
 
@@ -686,7 +720,7 @@ impl SegregatedBStackAllocator {
         let mut next_buf = [0u8; 8];
         let mut step = 0u32;
         let mut popped: Option<u64> = None;
-        self.stack.process_gen(|| {
+        alloc_meta!(self, process_gen, process_gen_as, || {
             let op = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
@@ -730,7 +764,11 @@ impl SegregatedBStackAllocator {
     #[cfg(not(feature = "atomic"))]
     fn pop_oversized(&self, need: u64) -> io::Result<Option<(u64, u64)>> {
         let head_off = Self::head_off(Self::OVERSIZED_CLASS);
-        let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+        let head = {
+            let mut buf = [0u8; 8];
+            alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+            u64::from_le_bytes(buf)
+        };
         if head == Self::SENTINEL {
             return Ok(None);
         }
@@ -743,7 +781,7 @@ impl SegregatedBStackAllocator {
             return Ok(None);
         }
         let next = read_buf_le!(buf, 8 => u64);
-        self.stack.set(head_off, next.to_le_bytes())?;
+        alloc_meta!(self, set, set_as, head_off, next.to_le_bytes())?;
         Ok(Some((head, size)))
     }
 
@@ -766,7 +804,7 @@ impl SegregatedBStackAllocator {
         let mut head = 0u64;
         let mut size = 0u64;
         let mut popped: Option<(u64, u64)> = None;
-        self.stack.process_gen(|| {
+        alloc_meta!(self, process_gen, process_gen_as, || {
             let op = match step {
                 0 => Some(BStackGenOp::Read {
                     offset: head_off,
@@ -926,18 +964,22 @@ impl SegregatedBStackAllocator {
         #[cfg(not(feature = "atomic"))]
         {
             // Non-atomic path: read head, write overhead+next_free, write head.
-            let head = u64::from_le_bytes(read_bstack!(self.stack, head_off => u64));
+            let head = {
+                let mut buf = [0u8; 8];
+                alloc_meta!(self, get_into, get_into_as, head_off, &mut buf)?;
+                u64::from_le_bytes(buf)
+            };
             write_buf!(head => overhead_buf, 8);
             self.stack.set(block_start, overhead_buf)?;
             // A crash between these two writes leaves the block free-tagged so it is
             // recoverable by `recover`.
-            self.stack.set(head_off, start_bytes)
+            alloc_meta!(self, set, set_as, head_off, start_bytes)
         }
         #[cfg(feature = "atomic")]
         {
             let mut step = 0u32;
             let mut read_err: Option<io::Error> = None;
-            self.stack.inplace_gen(|res| {
+            alloc_meta!(self, inplace_gen, inplace_gen_as, |res| {
                 if let Err(e) = res {
                     read_err = Some(e);
                     return None;
@@ -1040,11 +1082,16 @@ impl SegregatedBStackAllocator {
                 // Copy the prefilled overhead into a local buffer, then read the
                 // old head directly into the latter half before writing both.
                 let mut shared = overhead_next[i];
-                // next_free ← current head of this class (read straight in).
-                self.stack.get_into(head_offs[i], &mut shared[8..])?;
+                // next_free ← current head of this class (read as the allocator).
+                let head = {
+                    let mut buf = [0u8; 8];
+                    alloc_meta!(self, get_into, get_into_as, head_offs[i], &mut buf)?;
+                    u64::from_le_bytes(buf)
+                };
+                shared[8..16].copy_from_slice(&head.to_le_bytes());
                 // overhead || next_free, then head ← this block.
                 self.stack.set(block_offs[i], shared)?;
-                self.stack.set(head_offs[i], blockoff_bytes[i])?;
+                alloc_meta!(self, set, set_as, head_offs[i], blockoff_bytes[i])?;
             }
             // Commit: expose the pieces (and, for a claim, mark the block in use).
             self.stack.set(prefix_off, prefix)?;
@@ -1062,7 +1109,7 @@ impl SegregatedBStackAllocator {
             // `overhead_next` already holds the per-piece overhead in its first
             // 8 bytes; we will read each head directly into its second half.
             let mut read_err: Option<io::Error> = None;
-            self.stack.inplace_gen(|res| {
+            alloc_meta!(self, inplace_gen, inplace_gen_as, |res| {
                 if let Err(e) = res {
                     read_err = Some(e);
                     return None;
@@ -1146,7 +1193,7 @@ impl SegregatedBStackAllocator {
         write_buf!(old_size >> 4 => old_buf, 0); // free tag: high bit clear
         let mut step = 0u32;
         let mut read_err: Option<io::Error> = None;
-        self.stack.inplace_gen(|res| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |res| {
             if let Err(e) = res {
                 read_err = Some(e);
                 return None;
@@ -1210,6 +1257,10 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
     #[inline]
     fn into_stack(self) -> BStack {
+        // Hand the allocator capability back so a caller that re-wraps the
+        // reclaimed stack can mint it again.
+        #[cfg(feature = "expensive-slice-access-control")]
+        self.stack.return_alloc_authority(self.alloc_auth);
         self.stack
     }
 
@@ -1263,6 +1314,9 @@ impl BStackAllocator for SegregatedBStackAllocator {
         let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::dealloc")?;
         let start = slice.start();
         let len = slice.len();
+        if let Err(source) = self.stack.acl_reclaim(start, len) {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         if slice.is_empty() {
             return Ok(());
         }
@@ -1367,7 +1421,7 @@ impl SegregatedBStackAllocator {
         let mut st = St::Chase(0);
         let mut in_class = 0usize; // blocks popped so far from the current class
 
-        self.stack.inplace_gen(|res| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |res| {
             // A prior read failed. All writes live in the write phase, entered
             // only once every read has completed, so nothing is staged yet:
             // ending with `None` commits the empty batch (pops nothing).
@@ -1516,7 +1570,10 @@ impl SegregatedBStackAllocator {
         // not merged with the staging above; re-`chunk_by` needs no `splices` array.
         for run in blocks.chunk_by(same_class) {
             let last = run[run.len() - 1].0;
-            let _ = self.stack.cross_exchange(
+            let _ = alloc_meta!(
+                self,
+                cross_exchange,
+                cross_exchange_as,
                 last + Self::OVERHEAD,
                 Self::head_off(Self::classify(run[0].1)),
                 8,
@@ -1576,7 +1633,7 @@ impl SegregatedBStackAllocator {
         }
         let mut st = St::ReadLen;
 
-        self.stack.inplace_gen(|res| {
+        alloc_meta!(self, inplace_gen, inplace_gen_as, |res| {
             // A prior read failed. Read-phase reads never stage a write and the
             // write phase issues no reads, so nothing is staged when a read error
             // can arrive: ending with `None` commits nothing.
@@ -2030,6 +2087,11 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SegregatedBStackAllocator::dealloc_bulk")?;
+        for s in &slices {
+            if let Err(source) = self.stack.acl_reclaimable(s.start(), s.len()) {
+                return Err(BStackBulkAllocError::with_handles(source, slices));
+            }
+        }
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
@@ -2124,10 +2186,14 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
             for run in blocks.chunk_by(same_class) {
                 let last = run[run.len() - 1].0;
                 let head_off = Self::head_off(Self::classify(run[0].1));
-                if let Err(e) = self
-                    .stack
-                    .cross_exchange(last + Self::OVERHEAD, head_off, 8)
-                {
+                if let Err(e) = alloc_meta!(
+                    self,
+                    cross_exchange,
+                    cross_exchange_as,
+                    last + Self::OVERHEAD,
+                    head_off,
+                    8
+                ) {
                     first_err.get_or_insert(e);
                 }
             }
@@ -2385,7 +2451,7 @@ impl SegregatedBStackAllocator {
                 let cur_ptr: *mut u64 = &mut cur_len;
                 let mut phase = 0u8;
                 let mut truncated = false;
-                self.stack.process_gen(|| match phase {
+                alloc_meta!(self, process_gen, process_gen_as, || match phase {
                     0 => {
                         phase = 1;
                         // SAFETY: `process_gen` invokes this closure strictly
@@ -3352,7 +3418,9 @@ mod tests {
         let _b = a.alloc(100).unwrap(); // pins a second class-6 block
         a.dealloc(a1).unwrap(); // head[6] → a1
         // Simulate a leak: clear head[6] so a1 is free-tagged but unreachable.
-        a.stack().set(Seg::head_off(6), 0u64.to_le_bytes()).unwrap();
+        // A free-list head is allocator metadata (protected under the ACL
+        // feature), so this simulated write goes through the authorized path.
+        crate::acl::alloc_meta!(a, set, set_as, Seg::head_off(6), 0u64.to_le_bytes()).unwrap();
         assert_eq!(
             unsafe { a.recover() }.unwrap(),
             0,
@@ -3586,13 +3654,11 @@ mod bulk_tests {
         a.stack.set(xb + 272, (48u64 >> 4).to_le_bytes()).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
         // largest_class_le(272) == 256, so it lands on class 15.
-        let head = u64::from_le_bytes(
-            a.stack
-                .get(Seg::head_off(15), Seg::head_off(15) + 8)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
+        let head = {
+            let mut buf = [0u8; 8];
+            crate::acl::alloc_meta!(a, get_into, get_into_as, Seg::head_off(15), &mut buf).unwrap();
+            u64::from_le_bytes(buf)
+        };
         assert_eq!(head, xb);
         // A class-15 request (block 256) reuses it instead of failing the batch.
         let r = a.alloc_bulk([248u64]).unwrap();
