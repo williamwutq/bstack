@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`atomic` is now a default Cargo feature (Rust) *(breaking)*.** A plain `bstack = "0.5"` dependency now compiles in the `atomic` compound-operation API; the subset also gated on `set` still needs `set`, which stays opt-in alongside `alloc`. No on-disk format change and no behavior change to the base stack — `atomic` only exposes journal machinery every file already carries. Consumers who pin an explicit `features = [...]` list are unaffected, as is C (it has no default features). **Migration:** to keep `atomic` out, use `default-features = false` and list the features you want (e.g. `features = ["set"]`).
+
 ## [0.4.5] - 2026-09-15
 
 ### Changed
