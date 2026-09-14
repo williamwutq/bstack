@@ -44,14 +44,18 @@ u64::MAX - 2     SpliceShrink — length-shrinking tail replace (clen' < clen)
 u64::MAX - 3     Repeat       — repeating-pattern fill
 u64::MAX - 4     Copy         — disjoint in-file copy (coordinate-only staging)
 u64::MAX - 5     MultiWrite   — multi-write intent-complete sentinel
+u64::MAX - 6     MultiAtrunc  — multi-region length-changing commit
 other            unknown      — roll back on recovery
 ```
 
 Non-zero modes take values near `u64::MAX`, decrementing as modes are added,
 so the low-value range is free for future packed encodings and unrecognized
 values are unmistakable. `u64::MAX` should never be used. An unrecognized value
-is always treated as unknown and triggers rollback. All modes in the current list
-shipped in 0.4.0, so every 0.4.0 reader recognizes all of them.
+is always treated as unknown and triggers rollback. Every mode through
+`MultiWrite` is non-destructive under that rollback; `MultiAtrunc` is not — it
+overwrites committed bytes before its commit point — so it is gated behind the
+format magic (Rule 2 below): a reader of an older format rejects the file at open
+rather than meeting a mode it cannot safely roll back.
 
 ---
 
@@ -427,10 +431,100 @@ require `wip_ptr != 0`). The intent-complete sentinel is only valid when
 
 ---
 
+## Multi-atrunc journal
+
+**Backs:** `BStackTransaction`'s commit planner, when a transaction's dirty
+ranges *and* a length change must land as one unit — the batched analogue of a
+splice (allocate-a-block-then-link-it, which `bllist` needs). No single existing
+mode expresses it: [Multi-write](#multi-write-journal) pins `clen`, and a splice
+stages exactly one region.
+
+A general transaction is an `atrunc` fused with a multi-write. `MultiWrite`
+cannot be stretched to cover it — its recovery pins block targets to
+`e <= clen` and always finalises with `clen` unchanged. `MultiAtrunc` relaxes the
+target bound to the **new** length and carries that new length in `wip_ptr`.
+
+Let `clen'` be the new committed length and `S = max(clen, clen')` the staging
+base (past both the old and the new payload end). `wip_ptr = 32 + clen'` — always
+non-zero, and the only mode that stores a length in `wip_ptr`. This is
+unambiguous against `MultiWrite` (armed with `wip_ptr == 0`) and against the
+single-region modes (each keyed by its own `wip_aux`), and it is what lets an
+arbitrary number of regions be staged: recovery reads `clen'` directly instead of
+solving for it from the file size (which only works for one region).
+
+### Tail layout
+
+Blocks are packed back-to-back from physical `32 + S` to `file_size`. Each block
+is a 24-byte header followed by a kind-specific payload:
+
+```
+[block + 0  .. +8)    s_i     — start of target range (u64 LE)
+[block + 8  .. +16)   e_i     — end of target range   (u64 LE), e_i <= clen'
+[block + 16 .. +24)   kind    — 0 = Literal, 1 = Repeat (u64 LE)
+
+kind == 0 (Literal):  [+24 .. +24 + (e_i - s_i))   the new bytes
+kind == 1 (Repeat):   [+24 .. +32)   phase (u64 LE)
+                      [+32 .. +40)   plen  (u64 LE), pattern length, > 0, phase < plen
+                      [+40 .. +40 + plen)   pattern
+                      — fills (e_i - s_i) bytes with `pattern` rotated to start at
+                        `phase`; staged in O(plen), not the (e_i - s_i) expansion
+```
+
+The next block begins immediately after the previous block's payload; the
+sequence runs to `file_size` with no explicit count. A gap in `[0, clen')` not
+covered by any block keeps its bytes: old committed bytes below
+`min(clen, clen')`, or (on a grow) sparse zeros above the old end — which cost no
+write I/O, since the `set_len` in step 1 realises them.
+
+### Protocol
+
+1. **Extend and stage.** `file.set_len(32 + S + staged_len)`. Append every block
+   at `[32+S, ...)` → sync.
+2. **Arm.** `write_wip(file, 32 + clen', MultiAtrunc)` → sync.
+3. **Replay.** Write each block into `[32+s_i, 32+e_i)` in place (a literal copies
+   its staged bytes; a repeat streams its pattern). Every target lies in
+   `[0, clen')`, disjoint from the staged tail at `[32+S, ...)`, so the staged
+   copy is an untouched backup and replay is idempotent, order-independent. → sync.
+4. **Commit + Disarm.** `write_header_commit(file, clen', 0, Set)` — one 24-byte
+   write: the new length and the disarm land atomically → update in-memory `clen`
+   → sync.
+5. **Truncate.** `file.set_len(32 + clen')`.
+
+### Crash-safety
+
+| Crash point | On-disk state | Recovery |
+|-------------|---------------|----------|
+| During step 1 | `wip_ptr == 0`, `clen` unchanged | base rule: truncate to `32 + clen` |
+| Between 1 and 2 | `wip_ptr == 0`, full tail staged | base rule: truncate — old payload intact |
+| During step 2 | `wip_ptr` either 0 or `32+clen'` (single block) | either truncate or roll forward |
+| After arm, before step 4 | `wip_ptr != 0`, old `clen` in header | read `clen'` from `wip_ptr`, replay all blocks — idempotent |
+| During step 4 | `clen'` + disarm in one block write | either old `clen` (re-replay) or new `clen'` + disarmed (truncate) |
+| After step 4 | `wip_ptr == 0`, `clen = clen'` | base rule: truncate to `32 + clen'` (drops staging) |
+
+The arm is the commit point: once `wip_ptr != 0` with `MultiAtrunc`, recovery
+rolls **forward** (it cannot roll back — in-place writes destroy the old bytes,
+and the old length is no longer expressible without the staged tail). A
+legitimately-armed tail always validates, because the arm in step 2 follows the
+staged tail's sync in step 1. A tail that fails validation therefore means
+genuine corruption of already-synced bytes (outside the crash model); recovery
+then keeps the old length rather than committing a half-formed `clen'`.
+
+### Recovery (`wip_ptr != 0`, `wip_aux == MultiAtrunc`)
+
+`clen' = wip_ptr - 32`; `S = max(clen, clen')`; `tail_start = 32 + S`. Two-pass
+walk over `[tail_start, file_size)`: pass 1 validates every block (forward range,
+`e_i <= clen'`, recognized kind, `plen > 0`, `phase < plen`, payload present, and
+the sequence ends exactly at `file_size`); pass 2, only if pass 1 is clean,
+replays each block into `[s_i, e_i)` (`move_chunked` from the staged literal, or
+`write_pattern` from the staged descriptor) → sync. Then finalize with `clen'`.
+A malformed tail applies nothing and finalizes with the old `clen`.
+
+---
+
 ## Forward compatibility of `wip_aux`
 
 The mode space is open: future releases may define new modes by decrementing
-from `u64::MAX - 5`. Two rules keep this safe across versions:
+from `u64::MAX - 6`. Two rules keep this safe across versions:
 
 **Rule 1 — Unknown modes roll back.** A reader that sees an unrecognized
 `wip_aux` does not guess at the staging format. It applies the default: roll back
@@ -449,8 +543,9 @@ corrupting it.
 Together: whenever the default rollback fires, the mode is non-destructive and
 no committed data is lost. Destructive modes are always gated behind a magic that
 older readers reject. This is the same mechanism that protected the 0.4.0 journal
-from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x); the rule bites again
-only for modes introduced after 0.4.0.
+from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x); `MultiAtrunc` is such
+a destructive mode, gated behind the current magic so that an older reader
+rejects the file rather than rolling its replay back into a torn region.
 
 ---
 
@@ -471,6 +566,7 @@ wip_ptr  wip_aux          action
   !=0      Copy           disjoint copy: read [src|n] from tail, move_chunked(src→wip_ptr-32), finalize
   !=0      SpliceGrow     derive clen', replay move_chunked(S→a), finalize with clen'
   !=0      SpliceShrink   derive clen', replay move_chunked(S→a), finalize with clen'
+  !=0      MultiAtrunc    read clen' = wip_ptr-32, validate+replay tagged tail, finalize with clen' (roll back on malformation)
   !=0      other          unknown: roll back (finalize with clen unchanged)
 ```
 
