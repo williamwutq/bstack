@@ -1,6 +1,6 @@
 /* Expose POSIX + BSD extensions on non-Windows platforms.
  * _DARWIN_C_SOURCE is defined unconditionally on non-Windows: on real macOS
- * it overrides _POSIX_C_SOURCE restrictions to keep fdatasync/flock visible;
+ * it overrides _POSIX_C_SOURCE restrictions to keep flock visible;
  * on Linux/glibc it is ignored.  This also handles clang cross-compilation
  * that falls back to macOS SDK headers when no Linux sysroot is available.
  * On Windows (_WIN32) these macros are skipped and Win32 APIs are used
@@ -247,9 +247,13 @@ static inline int plat_durable_sync(bstack_fd_t fd)
 #  ifdef __APPLE__
     if (fcntl(fd, F_FULLFSYNC) == 0)
         return 0;
-    /* Device does not support F_FULLFSYNC — fall back to fdatasync. */
-#  endif
+    /* No F_FULLFSYNC support — fall back to fsync (always declared on macOS,
+     * and stronger; fdatasync is availability-gated and hidden under a
+     * versionless -std=c11 apple-darwin target). */
+    return fsync(fd);
+#  else
     return fdatasync(fd);
+#  endif
 #endif
 }
 
