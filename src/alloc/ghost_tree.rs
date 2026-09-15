@@ -869,6 +869,60 @@ impl GhostTreeBstackAllocator {
         );
         self.write_root(new_root)
     }
+
+    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
+    /// in_use_bytes)`.
+    ///
+    /// A free block is exactly an AVL tree node, so `free_blocks`/`free_bytes`
+    /// come from an in-order walk of the tree, summing node sizes. A live
+    /// allocation carries no header, so individual allocations cannot be told
+    /// apart when they sit back to back; `in_use_blocks` instead counts the
+    /// number of maximal contiguous live byte spans between the free nodes.
+    /// `in_use_bytes` is the total arena size minus `free_bytes`.
+    ///
+    /// The walk runs under the same internal lock [`alloc`](BStackAllocator::alloc)
+    /// and [`dealloc`](BStackAllocator::dealloc) take around their own tree
+    /// access, so the snapshot is consistent even under concurrent mutation.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidData`] if the tree traversal exceeds the
+    /// maximum AVL depth (a cycle from a corrupted tree). Any other
+    /// [`io::Error`] from the underlying [`BStack`] reads.
+    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+        #[cfg(feature = "atomic")]
+        let _guard = self.lock.lock().unwrap();
+
+        let stack_len = self.stack.len()?;
+        let root = self.read_root()?;
+
+        let mut blocks: Vec<(u64, u64)> = Vec::new();
+        self.avl_walk_inorder(root, &mut |ptr, size| {
+            blocks.push((ptr, size));
+            Ok(())
+        })?;
+        blocks.sort_by_key(|&(ptr, _)| ptr);
+
+        let free_blocks = blocks.len() as u64;
+        let free_bytes: u64 = blocks.iter().map(|&(_, size)| size).sum();
+
+        let mut in_use_blocks = 0u64;
+        let mut cursor = ARENA_START;
+        for &(ptr, size) in &blocks {
+            if ptr > cursor {
+                in_use_blocks += 1;
+            }
+            cursor = ptr + size;
+        }
+        if cursor < stack_len {
+            in_use_blocks += 1;
+        }
+        let in_use_bytes = stack_len
+            .saturating_sub(ARENA_START)
+            .saturating_sub(free_bytes);
+
+        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+    }
 }
 
 impl GhostTreeBstackAllocator {
@@ -2322,6 +2376,47 @@ mod tests {
         let s2 = unsafe { BStackOwnedSlice::from_raw_parts(&alloc2, start, 64) };
         assert!(s2.read().unwrap().iter().all(|&b| b == 0xAB));
         alloc2.dealloc(s2).unwrap();
+    }
+
+    // ── stats ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stats_empty_arena_is_all_zero() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn stats_single_allocation_is_one_in_use_span() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let _s = alloc.alloc(64).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 64));
+    }
+
+    #[test]
+    fn stats_counts_free_nodes_and_in_use_spans() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path);
+        let a = alloc.alloc(32).unwrap();
+        let b = alloc.alloc(32).unwrap();
+        let c = alloc.alloc(32).unwrap();
+
+        // b sits between two live spans: one free node, two in-use spans.
+        alloc.dealloc(b).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (1, 32, 2, 64));
+
+        // a is not the tail (b, c still follow it), so it becomes a second,
+        // separate free node — GhostTree never merges free neighbours live,
+        // only on the next open's coalesce_and_rebalance. Only c is left live.
+        alloc.dealloc(a).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (2, 64, 1, 32));
+
+        // c is the tail: dealloc discards it instead of inserting a node, so
+        // the arena shrinks to exactly the two existing free spans.
+        alloc.dealloc(c).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (2, 64, 0, 0));
     }
 
     // ── new() error cases ──────────────────────────────────────────────────────
