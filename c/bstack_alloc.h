@@ -1359,6 +1359,35 @@ bstack_t *checked_slab_bstack_allocator_into_stack(
 uint64_t checked_slab_bstack_allocator_data_size(
     const checked_slab_bstack_allocator_t *alloc);
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Byte totals count whole blocks (block_size each, including the 8-byte
+ * overhead), not caller-requested length. The checked-slab format only
+ * records how many block_size blocks a live allocation spans, not the
+ * length the caller asked for.
+ *
+ * Reads the whole arena in one bstack_get_batched_gen sequence under one
+ * held shared lock, so the counts are a consistent snapshot despite
+ * concurrent alloc/dealloc. No allocator-level lock is taken.
+ *
+ * A malformed overhead word (left by an un-recovered crash) ends the scan at
+ * that point; the returned counts cover only the arena prefix that parsed
+ * cleanly — call checked_slab_bstack_allocator_recover first for an
+ * authoritative snapshot.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
  *
@@ -1519,6 +1548,34 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
 BSTACK_WARN_UNUSED_RESULT
 int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
                                          uint64_t *out_fused);
+
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Byte totals count each block's recorded physical size (including the
+ * 8-byte overhead), not the caller's requested length. The segregated
+ * format never persists the requested length, so any retained excess above
+ * a request is counted as in-use bytes, not fragmentation.
+ *
+ * Reads the whole arena in one bstack_get_batched_gen sequence, the same
+ * lock segregated_bstack_allocator_coalesce holds across its scan, so the
+ * counts are a consistent snapshot despite concurrent alloc/dealloc. No
+ * allocator-level lock is taken.
+ *
+ * A malformed overhead word, or a zeroed tail left by a crashed extend, ends
+ * the scan at that point; the returned counts cover only the arena prefix
+ * that parsed cleanly — run segregated_bstack_allocator_coalesce (or
+ * segregated_bstack_allocator_recover) first for an authoritative snapshot.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int segregated_bstack_allocator_stats(
+    const segregated_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /*

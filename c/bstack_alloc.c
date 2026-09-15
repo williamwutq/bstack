@@ -8761,6 +8761,80 @@ uint64_t checked_slab_bstack_allocator_data_size(
     return alloc->block_size - ALCK_OVERHEAD;
 }
 
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+struct alck_stats_ctx {
+    uint8_t  word_buf[8];
+    uint64_t block_size;
+    uint64_t stack_len;
+    uint64_t p;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* word_buf holds an unprocessed read from the last call */
+};
+
+static int alck_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alck_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t overhead = read_le64(c->word_buf);
+        c->pending = 0;
+        if (overhead & ALCK_IN_USE_BIT) {
+            uint64_t n = overhead & ALCK_BLOCKS_MASK;
+            uint64_t span;
+            /* Malformed: stop the scan here (n == 0, or n * block_size or
+             * p + span overflows / runs past stack_len). */
+            if (n == 0 || n > UINT64_MAX / c->block_size) {
+                c->p = c->stack_len; return 0;
+            }
+            span = n * c->block_size;
+            if (span > c->stack_len - c->p) {
+                c->p = c->stack_len; return 0;
+            }
+            c->in_use_blocks++;
+            c->in_use_bytes += span;
+            c->p += span;
+        } else {
+            c->free_blocks++;
+            c->free_bytes += c->block_size;
+            c->p += c->block_size;
+        }
+    }
+    if (c->p >= c->stack_len) return 0;
+    c->pending  = 1;
+    *out_offset = c->p;
+    *out_buf    = c->word_buf;
+    *out_len    = 8;
+    return 1;
+}
+
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alck_stats_ctx c;
+    uint64_t stack_len;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+    memset(&c, 0, sizeof c);
+    c.block_size = alloc->block_size;
+    c.stack_len  = stack_len;
+    c.p          = ALCK_ARENA_START;
+
+    if (stack_len > ALCK_ARENA_START) {
+        if (bstack_get_batched_gen(alloc->bs, alck_stats_gen, &c) != 0) return -1;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set / bstack_zero and, under
@@ -9657,6 +9731,76 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
     free(c.writes);
     if (r) return -1;
     if (out_fused) *out_fused = c.fused;
+    return 0;
+}
+
+/* ---- stats -------------------------------------------------------------- */
+
+struct alsg_stats_ctx {
+    uint64_t stack_len;
+    uint64_t p;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* word_buf holds an unprocessed read from the last call */
+    uint8_t  word_buf[8];
+};
+
+static int alsg_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alsg_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t word = read_le64(c->word_buf);
+        c->pending = 0;
+        if (word == 0) {
+            c->p = c->stack_len; return 0;
+        }
+        if (word & ALSG_IN_USE_BIT) {
+            uint64_t size = (word & ~ALSG_IN_USE_BIT) << 4;
+            if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > c->stack_len - c->p) {
+                c->p = c->stack_len; return 0; /* malformed: stop the scan here */
+            }
+            c->in_use_blocks++;
+            c->in_use_bytes += size;
+            c->p += size;
+        } else {
+            uint64_t size = word << 4;
+            if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > c->stack_len - c->p) {
+                c->p = c->stack_len; return 0; /* malformed: stop the scan here */
+            }
+            c->free_blocks++;
+            c->free_bytes += size;
+            c->p += size;
+        }
+    }
+    if (ALSG_OVERHEAD > c->stack_len - c->p) return 0;
+    c->pending  = 1;
+    *out_offset = c->p;
+    *out_buf    = c->word_buf;
+    *out_len    = 8;
+    return 1;
+}
+
+int segregated_bstack_allocator_stats(
+    const segregated_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alsg_stats_ctx c;
+    uint64_t stack_len;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+    memset(&c, 0, sizeof c);
+    c.stack_len = stack_len;
+    c.p         = ALSG_ARENA_START;
+
+    if (stack_len > ALSG_ARENA_START) {
+        if (bstack_get_batched_gen(alloc->bs, alsg_stats_gen, &c) != 0) return -1;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
     return 0;
 }
 #endif /* BSTACK_FEATURE_ATOMIC */
