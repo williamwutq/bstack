@@ -16,9 +16,9 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example atomic_ops --features atomic
+//! cargo run --example atomic_ops
 //! # to also exercise the set+atomic operations:
-//! cargo run --example atomic_ops --features "atomic,set"
+//! cargo run --example atomic_ops --features set
 //! ```
 
 #[cfg(feature = "atomic")]

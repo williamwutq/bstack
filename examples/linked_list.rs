@@ -26,7 +26,7 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example linked_list --features atomic
+//! cargo run --example linked_list
 //! ```
 
 #[cfg(feature = "atomic")]

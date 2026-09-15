@@ -30,7 +30,7 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example checksummed_cache --features "set,atomic"
+//! cargo run --example checksummed_cache --features set
 //! ```
 
 #[cfg(all(feature = "set", feature = "atomic"))]
