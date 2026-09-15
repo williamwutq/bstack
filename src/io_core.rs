@@ -54,6 +54,26 @@ pub(crate) const ATOMIC_BLOCK: u64 = 256;
 /// feature-gated: recovery's repeat-fill replay ([`write_repeated`]) uses it.
 const MOVE_CHUNK: u64 = 4 * 1024;
 
+/// Block-kind tag prefixing each staged [`WipAux::MultiAtrunc`] block: a literal
+/// span of `e - s` bytes.
+const MA_LITERAL: u64 = 0;
+/// Block-kind tag: a compact repeat descriptor `[phase | plen | pattern]` that
+/// fills `e - s` bytes with `pattern` rotated to start at `phase` — staged in
+/// `O(pattern)` bytes rather than the `e - s` expansion.
+const MA_REPEAT: u64 = 1;
+/// Block-kind tag: a cyclic rotation of `k` disjoint `n`-byte regions, carrying
+/// its own resumable progress counter `[counter | offsets | snapshot]`. See the
+/// *Multi-atrunc journal* Cycle blocks in `algos/WIP.md`.
+const MA_CYCLE: u64 = 2;
+
+/// Round `n` up to the next multiple of 8. Multi-atrunc blocks are 8-aligned so a
+/// [`MA_CYCLE`] counter update is a non-tearing 8-byte write (an 8-aligned `u64`
+/// lies within one [`ATOMIC_BLOCK`], since `8` divides `256`).
+#[inline]
+const fn align8(n: u64) -> u64 {
+    (n + 7) & !7
+}
+
 // ------------------------------------------- OS Primitives -------------------------------------------
 
 /// Read `len` bytes from absolute file position `offset` without modifying
@@ -1259,44 +1279,93 @@ pub(crate) fn recover_multi_write(
 
 // --------------------------------------- Multi-atrunc journal --------------------------------------
 
-/// Block-kind tag prefixing each staged [`WipAux::MultiAtrunc`] block: a literal
-/// span of `e - s` bytes.
-const MA_LITERAL: u64 = 0;
-/// Block-kind tag: a compact repeat descriptor `[phase | plen | pattern]` that
-/// fills `e - s` bytes with `pattern` rotated to start at `phase` — staged in
-/// `O(pattern)` bytes rather than the `e - s` expansion.
-const MA_REPEAT: u64 = 1;
-
-/// Encoded length of one staged multi-atrunc block: the 24-byte `[s | e | kind]`
-/// header plus its payload (the `e - s` literal bytes, or the
-/// `16 + pattern.len()` compact repeat descriptor).
+/// One entry in a [`journaled_multi_atrunc`] batch.
+///
+/// A `Write` places bytes into a single range; a `Cycle` rotates several equal-
+/// length regions. Both are staged as tagged blocks in the same tail. See the
+/// *Multi-atrunc journal* in `algos/WIP.md`.
 #[cfg(all(feature = "set", feature = "atomic"))]
-#[inline]
-fn ma_block_len(d: &OverlayData) -> u64 {
-    match d {
-        OverlayData::Literal(x) => 24 + x.len() as u64,
-        OverlayData::Repeat { pattern, .. } => 24 + 16 + pattern.len() as u64,
-    }
+#[allow(dead_code)]
+pub(crate) enum MaSpec<'a> {
+    /// Write `data` into `[offset, offset + data.len())` (staged as `Literal`/`Repeat`).
+    Write(u64, OverlayData<'a>),
+    /// Rotate `k` disjoint `n`-byte regions: the content of `offsets[i]` moves to
+    /// `offsets[(i + 1) % k]` (and `offsets[k - 1]` to `offsets[0]`). Requires
+    /// `k >= 2` and `n > 0`.
+    Cycle { offsets: &'a [u64], n: u64 },
 }
 
-/// Crash-atomically commit `k` non-overlapping in-place writes that **together
-/// change the payload length** to `clen_new`, through the multi-atrunc journal.
-/// The batched, length-changing analogue of [`journaled_splice`]: it fuses an
-/// `atrunc` with a multi-write, which no single existing mode expresses
+/// Encoded on-disk length of one staged multi-atrunc block, padded to a multiple
+/// of 8 so the following block (and any [`MA_CYCLE`] counter) stays 8-aligned. The
+/// 24-byte `[a | b | kind]` header plus the kind's payload: the `e - s` literal
+/// bytes, the `16 + pattern.len()` repeat descriptor, or `8 + 8k + n` for a cycle
+/// (counter, `k` offsets, and the one-region snapshot).
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[inline]
+fn ma_block_len(spec: &MaSpec) -> u64 {
+    let raw = match spec {
+        MaSpec::Write(_, OverlayData::Literal(x)) => 24 + x.len() as u64,
+        MaSpec::Write(_, OverlayData::Repeat { pattern, .. }) => 24 + 16 + pattern.len() as u64,
+        MaSpec::Cycle { offsets, n } => 24 + 8 + 8 * offsets.len() as u64 + n,
+    };
+    align8(raw)
+}
+
+/// Run (or resume) a cyclic rotation's ordered steps, persisting progress after
+/// each. `counter` is the number of steps remaining (`k` for a fresh cycle);
+/// `counter_logical` is the logical offset of the block's 8-aligned counter, and
+/// `snap_logical` the logical offset of the staged snapshot of `offsets[k - 1]`.
+///
+/// Steps run `j = counter - 1` down to `0`: for `j >= 1`, `offsets[j] ← offsets[j
+/// - 1]`; for `j == 0`, `offsets[0] ← snapshot`. Each step's source is untouched
+/// until a later (smaller-`j`) step, so re-running a step reads original bytes —
+/// idempotent — and resuming from the persisted counter is what makes the single
+/// snapshot sufficient. See the Cycle protocol in `algos/WIP.md`.
+///
+/// Not feature-gated: recovery must resume a cycle armed by any build.
+fn replay_cycle(
+    file: &mut File,
+    offsets: &[u64],
+    n: u64,
+    counter_logical: u64,
+    snap_logical: u64,
+    mut counter: u64,
+) -> io::Result<()> {
+    while counter > 0 {
+        let j = (counter - 1) as usize;
+        if j >= 1 {
+            move_chunked(file, offsets[j - 1], offsets[j], n)?;
+        } else {
+            move_chunked(file, snap_logical, offsets[0], n)?;
+        }
+        durable_sync(file)?;
+        counter -= 1;
+        write_at(file, counter_logical, &counter.to_le_bytes())?;
+        durable_sync(file)?;
+    }
+    Ok(())
+}
+
+/// Crash-atomically commit a batch of non-overlapping in-place edits that
+/// **together change the payload length** to `clen_new`, through the multi-atrunc
+/// journal. The batched, length-changing analogue of [`journaled_splice`]: it
+/// fuses an `atrunc` with a multi-write, which no single existing mode expresses
 /// ([`journaled_multi_set`] pins `clen`; a splice stages exactly one region).
 ///
-/// Each block's target `[offset, offset + d.len())` must satisfy `offset + d.len()
-/// <= clen_new`, the blocks must be pairwise non-overlapping, and gaps in
-/// `[0, clen_new)` keep whatever they held — old committed bytes below
-/// `min(clen, clen_new)`, or (on a grow) sparse zeros above the old end, which
-/// cost no write I/O. A [`OverlayData::Repeat`] block stages a compact descriptor,
-/// so a batched gigabyte fill costs `O(pattern)` staging, not `O(count·len)`.
+/// Each [`MaSpec::Write`] target and each [`MaSpec::Cycle`] region must lie in
+/// `[0, clen_new)`, and all targets/regions across the batch must be pairwise
+/// non-overlapping. Gaps in `[0, clen_new)` keep whatever they held — old
+/// committed bytes below `min(clen, clen_new)`, or (on a grow) sparse zeros above
+/// the old end, which cost no write I/O. A [`OverlayData::Repeat`] stages a compact
+/// descriptor (`O(pattern)`, not `O(count·len)`); a [`MaSpec::Cycle`] stages one
+/// region's snapshot regardless of `k`.
 ///
 /// The five-barrier protocol (extend+stage → arm → replay → commit+disarm →
 /// truncate) matches the splice journal, except the new length rides in `wip_ptr`
 /// (`HEADER_SIZE + clen_new`, always non-zero) rather than being derived from the
-/// file size — which is what lets an arbitrary number of regions be staged. See
-/// the *Multi-atrunc journal* in `algos/WIP.md`. Updates `*clen` to `clen_new` on
+/// file size — which is what lets an arbitrary number of regions be staged. A
+/// cycle's per-step progress rides in its own staged block, not `wip_ptr`. See the
+/// *Multi-atrunc journal* in `algos/WIP.md`. Updates `*clen` to `clen_new` on
 /// success. **O(1) memory** beyond the caller's own slices/patterns.
 ///
 /// Marked `dead_code` until its caller — `BStackTransaction`'s commit planner
@@ -1307,63 +1376,104 @@ pub(crate) fn journaled_multi_atrunc(
     file: &mut File,
     clen: &mut u64,
     clen_new: u64,
-    blocks: &[(u64, OverlayData)],
+    specs: &[MaSpec],
 ) -> io::Result<()> {
     let old_clen = *clen;
-    let s_base = old_clen.max(clen_new); // staging base, past both payload ends
-    // Total staged bytes, guarding against a (practically impossible) overflow.
+    // Staging base, rounded up to 8 so `32 + s_base` — and thus every 8-padded
+    // block start — is 8-aligned (a `Cycle` counter write must not tear).
+    let s_base = align8(old_clen.max(clen_new));
+    // Total staged bytes (each block padded to 8), guarding against a (practically
+    // impossible) overflow.
     let mut staged_len = 0u64;
-    for (_, d) in blocks {
+    for spec in specs {
         staged_len = staged_len
-            .checked_add(ma_block_len(d))
+            .checked_add(ma_block_len(spec))
             .ok_or_else(|| io_error!(InvalidData, "journaled_multi_atrunc: staging overflow"))?;
     }
-    // 1. Extend to hold the new payload and the staged tail, then stage every
-    //    block `[s | e | kind | payload]` back-to-back at `[s_base, ...)`. The
-    //    grow region `[old_clen, clen_new)` (if any) reads back as sparse zero.
+    // 1. Extend to hold the new payload and the staged tail. `set_len` realises the
+    //    grow region and every inter-block padding byte as sparse zero. Stage each
+    //    block 8-aligned at `[32 + s_base, ...)`; a cycle snapshots its overwritten
+    //    region file→file from the (still-original) payload.
     file.set_len(HEADER_SIZE + s_base + staged_len)?;
-    file.seek(SeekFrom::Start(HEADER_SIZE + s_base))?;
-    for (offset, d) in blocks {
-        debug_assert!(
-            offset.saturating_add(d.len()) <= clen_new,
-            "block past clen'"
-        );
-        let e = offset + d.len();
-        file.write_all(&offset.to_le_bytes())?;
-        file.write_all(&e.to_le_bytes())?;
-        match d {
-            OverlayData::Literal(x) => {
-                file.write_all(&MA_LITERAL.to_le_bytes())?;
-                file.write_all(x)?;
+    let mut pos = HEADER_SIZE + s_base;
+    for spec in specs {
+        file.seek(SeekFrom::Start(pos))?;
+        match spec {
+            MaSpec::Write(offset, d) => {
+                debug_assert!(
+                    offset.saturating_add(d.len()) <= clen_new,
+                    "block past clen'"
+                );
+                let e = offset + d.len();
+                file.write_all(&offset.to_le_bytes())?;
+                file.write_all(&e.to_le_bytes())?;
+                match d {
+                    OverlayData::Literal(x) => {
+                        file.write_all(&MA_LITERAL.to_le_bytes())?;
+                        file.write_all(x)?;
+                    }
+                    OverlayData::Repeat { pattern, phase, .. } => {
+                        file.write_all(&MA_REPEAT.to_le_bytes())?;
+                        file.write_all(&(*phase as u64).to_le_bytes())?;
+                        file.write_all(&(pattern.len() as u64).to_le_bytes())?;
+                        file.write_all(pattern)?;
+                    }
+                }
             }
-            OverlayData::Repeat { pattern, phase, .. } => {
-                file.write_all(&MA_REPEAT.to_le_bytes())?;
-                file.write_all(&(*phase as u64).to_le_bytes())?;
-                file.write_all(&(pattern.len() as u64).to_le_bytes())?;
-                file.write_all(pattern)?;
+            MaSpec::Cycle { offsets, n } => {
+                let k = offsets.len() as u64;
+                debug_assert!(k >= 2 && *n > 0, "degenerate cycle");
+                file.write_all(&n.to_le_bytes())?; // header slot `a` = n
+                file.write_all(&k.to_le_bytes())?; // header slot `b` = k
+                file.write_all(&MA_CYCLE.to_le_bytes())?;
+                file.write_all(&k.to_le_bytes())?; // counter, staged as k (no step done)
+                for off in *offsets {
+                    debug_assert!(
+                        off.saturating_add(*n) <= clen_new,
+                        "cycle region past clen'"
+                    );
+                    file.write_all(&off.to_le_bytes())?;
+                }
+                // Snapshot the one region overwritten before it is read (the last),
+                // from the still-original payload into the tail.
+                let snap_logical = (pos + 24 + 8 + 8 * k) - HEADER_SIZE;
+                move_chunked(file, offsets[offsets.len() - 1], snap_logical, *n)?;
             }
         }
+        pos += ma_block_len(spec);
     }
     durable_sync(file)?;
     // 2. Arm, carrying `clen_new` in `wip_ptr` (non-zero — recovery reads the new
     //    length from it instead of deriving it from the file size).
     write_wip(file, HEADER_SIZE + clen_new, WipAux::MultiAtrunc)?;
     durable_sync(file)?;
-    // 3. Replay every block into its target in place. Targets lie in
-    //    `[0, clen_new)`, disjoint from the staged tail at `[s_base, ...)`, so the
-    //    staged copy is an untouched crash backup and replay is idempotent.
-    for (offset, d) in blocks {
-        match d {
-            OverlayData::Literal(x) => write_at(file, *offset, x)?,
-            OverlayData::Repeat {
-                pattern,
-                phase,
-                len,
-            } => {
+    // 3. Replay every block into its target(s) in place. Every target lies in
+    //    `[0, clen_new)`, disjoint from the staged tail at `[32 + s_base, ...)`, so
+    //    literal/repeat replay is idempotent from the immutable backup; a cycle
+    //    runs its ordered, resumable steps (each internally syncs).
+    let mut pos = HEADER_SIZE + s_base;
+    for spec in specs {
+        match spec {
+            MaSpec::Write(offset, OverlayData::Literal(x)) => write_at(file, *offset, x)?,
+            MaSpec::Write(
+                offset,
+                OverlayData::Repeat {
+                    pattern,
+                    phase,
+                    len,
+                },
+            ) => {
                 file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
                 write_pattern(file, pattern, *phase, *len)?;
             }
+            MaSpec::Cycle { offsets, n } => {
+                let k = offsets.len() as u64;
+                let counter_logical = (pos + 24) - HEADER_SIZE;
+                let snap_logical = (pos + 24 + 8 + 8 * k) - HEADER_SIZE;
+                replay_cycle(file, offsets, *n, counter_logical, snap_logical, k)?;
+            }
         }
+        pos += ma_block_len(spec);
     }
     durable_sync(file)?;
     // 4. Commit the new length while disarming, in one atomic header write.
@@ -1375,8 +1485,9 @@ pub(crate) fn journaled_multi_atrunc(
 }
 
 /// One parsed block from a [`WipAux::MultiAtrunc`] staged tail, ready to replay
-/// into `[dst, dst + len)`. Physical offsets are into the staged tail, which is
-/// disjoint from every target.
+/// into `[dst, dst + len)`. Offsets are logical (payload-relative, as everywhere
+/// else in this module); the staged source lies in the tail, disjoint from every
+/// target.
 enum MaBlock {
     /// Copy `len` staged literal bytes (at logical `src_logical`) into the target.
     Literal {
@@ -1384,14 +1495,26 @@ enum MaBlock {
         src_logical: u64,
         len: u64,
     },
-    /// Fill the target with `pattern` (at physical `pattern_phys`, `plen` bytes)
+    /// Fill the target with `pattern` (at logical `pattern_logical`, `plen` bytes)
     /// rotated to start at `phase`.
     Repeat {
         dst: u64,
-        pattern_phys: u64,
+        pattern_logical: u64,
         plen: u64,
         phase: usize,
         len: u64,
+    },
+    /// Rotate `k` disjoint `n`-byte regions, resuming from the block's own
+    /// `counter` (steps remaining). `counter_logical`/`offsets_logical`/
+    /// `snap_logical` are the logical offsets of the counter, the `k`-entry offset
+    /// array, and the one staged snapshot, all in the tail.
+    Cycle {
+        n: u64,
+        k: u64,
+        counter: u64,
+        counter_logical: u64,
+        offsets_logical: u64,
+        snap_logical: u64,
     },
 }
 
@@ -1399,12 +1522,14 @@ enum MaBlock {
 /// well-formed tagged block, invoke `apply`.
 ///
 /// Returns `Ok(true)` iff the whole tail parses into a clean sequence that ends
-/// exactly at `raw_size`, with every target range within `[0, clen_new)`, every
-/// block-kind recognized, and every repeat descriptor consistent (`plen > 0`,
-/// `phase < plen`). `Ok(false)` on any malformation. Unlike [`walk_multi_blocks`]
-/// the target bound is the **new** committed length (`e <= clen_new`), which is
-/// what admits length-changing blocks. Not feature-gated: recovery must parse a
-/// tail armed by any build.
+/// exactly at `raw_size` (blocks are 8-padded), with every target range within
+/// `[0, clen_new)`, every block-kind recognized, every repeat descriptor
+/// consistent (`plen > 0`, `phase < plen`), and every cycle consistent (`n > 0`,
+/// `k >= 2`, `counter <= k`, each region within `[0, clen_new)` and pairwise
+/// disjoint). `Ok(false)` on any malformation. Unlike [`walk_multi_blocks`] the
+/// target bound is the **new** committed length (`e <= clen_new`), which is what
+/// admits length-changing blocks. Not feature-gated: recovery must parse a tail
+/// armed by any build.
 fn walk_multi_atrunc_blocks(
     file: &mut File,
     clen_new: u64,
@@ -1424,14 +1549,14 @@ fn walk_multi_atrunc_blocks(
         let s = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
         let e = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
         let kind = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
-        // Well-formedness: forward range, within the new committed payload.
-        if e < s || e > clen_new {
-            return Ok(false);
-        }
-        let fill = e - s;
         let payload_phys = cursor + 24;
         match kind {
             MA_LITERAL => {
+                // Forward target range within the new committed payload.
+                if e < s || e > clen_new {
+                    return Ok(false);
+                }
+                let fill = e - s;
                 if payload_phys.saturating_add(fill) > raw_size {
                     return Ok(false);
                 }
@@ -1443,9 +1568,13 @@ fn walk_multi_atrunc_blocks(
                         len: fill,
                     },
                 )?;
-                cursor = payload_phys + fill;
+                cursor = align8(payload_phys + fill);
             }
             MA_REPEAT => {
+                if e < s || e > clen_new {
+                    return Ok(false);
+                }
+                let fill = e - s;
                 // `[phase | plen]` then the pattern bytes.
                 if payload_phys.saturating_add(16) > raw_size {
                     return Ok(false);
@@ -1467,13 +1596,70 @@ fn walk_multi_atrunc_blocks(
                     file,
                     MaBlock::Repeat {
                         dst: s,
-                        pattern_phys,
+                        pattern_logical: pattern_phys - HEADER_SIZE,
                         plen,
                         phase: phase as usize,
                         len: fill,
                     },
                 )?;
-                cursor = pattern_phys + plen;
+                cursor = align8(pattern_phys + plen);
+            }
+            MA_CYCLE => {
+                // Header slots carry `a = n` (region length), `b = k` (cycle length).
+                let (n, k) = (s, e);
+                if n == 0 || k < 2 || usize::try_from(n).is_err() || usize::try_from(k).is_err() {
+                    return Ok(false);
+                }
+                // Payload: counter(8) | k offsets(8k) | snapshot(n).
+                let Some(body) = 8u64
+                    .checked_mul(k)
+                    .and_then(|x| x.checked_add(8))
+                    .and_then(|x| x.checked_add(n))
+                else {
+                    return Ok(false);
+                };
+                if payload_phys.saturating_add(body) > raw_size {
+                    return Ok(false);
+                }
+                let mut cbuf = [0u8; 8];
+                file.seek(SeekFrom::Start(payload_phys))?;
+                file.read_exact(&mut cbuf)?;
+                let counter = u64::from_le_bytes(cbuf);
+                if counter > k {
+                    return Ok(false);
+                }
+                // Read the k offsets; every region within `[0, clen')`, pairwise disjoint.
+                let offsets_phys = payload_phys + 8;
+                let mut offs = vec![0u64; k as usize];
+                file.seek(SeekFrom::Start(offsets_phys))?;
+                for o in offs.iter_mut() {
+                    let mut ob = [0u8; 8];
+                    file.read_exact(&mut ob)?;
+                    *o = u64::from_le_bytes(ob);
+                }
+                for (i, &a) in offs.iter().enumerate() {
+                    if a.saturating_add(n) > clen_new {
+                        return Ok(false);
+                    }
+                    for &b in &offs[i + 1..] {
+                        let disjoint = a.saturating_add(n) <= b || b.saturating_add(n) <= a;
+                        if !disjoint {
+                            return Ok(false);
+                        }
+                    }
+                }
+                apply(
+                    file,
+                    MaBlock::Cycle {
+                        n,
+                        k,
+                        counter,
+                        counter_logical: payload_phys - HEADER_SIZE,
+                        offsets_logical: offsets_phys - HEADER_SIZE,
+                        snap_logical: (offsets_phys + 8 * k) - HEADER_SIZE,
+                    },
+                )?;
+                cursor = align8(offsets_phys + 8 * k + n);
             }
             _ => return Ok(false),
         }
@@ -1493,18 +1679,21 @@ fn walk_multi_atrunc_blocks(
 /// always validates; `false` means genuine corruption of the staged bytes, for
 /// which neither length is fully recoverable, so recovery keeps the old one.
 ///
-/// Every replay is idempotent (the staged bytes and patterns are immutable and
+/// Every replay is idempotent: literal/repeat staged bytes are immutable and
 /// disjoint from every target, all of which lie in `[0, clen_new)` below the
-/// staging base), so a crash during recovery is safe to re-run. Not feature-gated:
-/// a file armed by a feature-enabled build must still recover under a build
-/// without that feature. The caller ([`recover_wip`]) performs the shared finalize.
+/// staging base; a cycle resumes from its own persisted counter and each ordered
+/// step re-reads original bytes. So a crash during recovery is safe to re-run. Not
+/// feature-gated: a file armed by a feature-enabled build must still recover under
+/// a build without that feature. The caller ([`recover_wip`]) performs the shared
+/// finalize.
 pub(crate) fn recover_multi_atrunc(
     file: &mut File,
     committed_len: u64,
     clen_new: u64,
     raw_size: u64,
 ) -> io::Result<bool> {
-    let s_base = committed_len.max(clen_new);
+    // Matches the writer's 8-aligned staging base.
+    let s_base = align8(committed_len.max(clen_new));
     let tail_start = HEADER_SIZE + s_base;
     // Pass 1: validate without touching the payload.
     let valid = walk_multi_atrunc_blocks(file, clen_new, tail_start, raw_size, |_, _| Ok(()))?;
@@ -1524,16 +1713,34 @@ pub(crate) fn recover_multi_atrunc(
                 } => move_chunked(f, src_logical, dst, len),
                 MaBlock::Repeat {
                     dst,
-                    pattern_phys,
+                    pattern_logical,
                     plen,
                     phase,
                     len,
                 } => {
                     let mut pat = vec![0u8; plen as usize];
-                    f.seek(SeekFrom::Start(pattern_phys))?;
+                    f.seek(SeekFrom::Start(HEADER_SIZE + pattern_logical))?;
                     f.read_exact(&mut pat)?;
                     f.seek(SeekFrom::Start(HEADER_SIZE + dst))?;
                     write_pattern(f, &pat, phase, len)
+                }
+                MaBlock::Cycle {
+                    n,
+                    k,
+                    counter,
+                    counter_logical,
+                    offsets_logical,
+                    snap_logical,
+                } => {
+                    // Re-read the k offsets, then resume the rotation from `counter`.
+                    let mut offs = vec![0u64; k as usize];
+                    f.seek(SeekFrom::Start(HEADER_SIZE + offsets_logical))?;
+                    for o in offs.iter_mut() {
+                        let mut ob = [0u8; 8];
+                        f.read_exact(&mut ob)?;
+                        *o = u64::from_le_bytes(ob);
+                    }
+                    replay_cycle(f, &offs, n, counter_logical, snap_logical, counter)
                 }
             },
         )?;

@@ -454,13 +454,19 @@ solving for it from the file size (which only works for one region).
 
 ### Tail layout
 
-Blocks are packed back-to-back from physical `32 + S` to `file_size`. Each block
-is a 24-byte header followed by a kind-specific payload:
+Blocks are packed back-to-back from physical `32 + S` to `file_size`, `S` rounded
+up to a multiple of 8 so `32 + S` is 8-aligned. Each block is padded to a multiple
+of 8, so every block starts 8-aligned — this is load-bearing only for `Cycle`,
+whose progress counter must be updated by a non-tearing 8-byte write (an 8-aligned
+`u64` stays within one 256-byte atomic block, since `8 | 256`; see *Derived
+atomicity*). Each block is a 24-byte header followed by a kind-specific payload:
 
 ```
-[block + 0  .. +8)    s_i     — start of target range (u64 LE)
-[block + 8  .. +16)   e_i     — end of target range   (u64 LE), e_i <= clen'
-[block + 16 .. +24)   kind    — 0 = Literal, 1 = Repeat (u64 LE)
+[block + 0  .. +8)    s_i / n   — Literal|Repeat: start of target range (u64 LE)
+                                  Cycle: region length n (u64 LE), > 0
+[block + 8  .. +16)   e_i / k   — Literal|Repeat: end of target range (u64 LE), e_i <= clen'
+                                  Cycle: cycle length k (u64 LE), >= 2
+[block + 16 .. +24)   kind      — 0 = Literal, 1 = Repeat, 2 = Cycle (u64 LE)
 
 kind == 0 (Literal):  [+24 .. +24 + (e_i - s_i))   the new bytes
 kind == 1 (Repeat):   [+24 .. +32)   phase (u64 LE)
@@ -468,23 +474,59 @@ kind == 1 (Repeat):   [+24 .. +32)   phase (u64 LE)
                       [+40 .. +40 + plen)   pattern
                       — fills (e_i - s_i) bytes with `pattern` rotated to start at
                         `phase`; staged in O(plen), not the (e_i - s_i) expansion
+kind == 2 (Cycle):    [+24 .. +32)   counter (u64 LE), in [0, k], staged as k
+                      [+32 .. +32 + 8k)   offsets off_0..off_{k-1} (u64 LE each),
+                                          each off_j + n <= clen', pairwise disjoint
+                      [+32 + 8k .. +32 + 8k + n)   snapshot: original bytes of off_{k-1}
+                      — rotates k disjoint n-byte regions: content of off_j moves
+                        to off_{j+1} (and off_{k-1} → off_0). The +24 counter is the
+                        only tail byte a replay mutates; see the Cycle protocol below
 ```
 
-The next block begins immediately after the previous block's payload; the
+The next block begins at the next 8-byte boundary after the previous block's
+payload (padding bytes are the sparse zeros `set_len` already realised); the
 sequence runs to `file_size` with no explicit count. A gap in `[0, clen')` not
 covered by any block keeps its bytes: old committed bytes below
 `min(clen, clen')`, or (on a grow) sparse zeros above the old end — which cost no
 write I/O, since the `set_len` in step 1 realises them.
+
+### Cycle blocks
+
+A `Cycle` block is the in-list form of a cyclic multi-region rotation (the same
+primitive as the standalone `CycleSwap` mode), so a transaction that rotates
+regions and changes length lands as one commit. Any number of `Cycle` blocks may
+appear in one tail; each touches only its own `k` regions, which the disjoint-
+target rule keeps disjoint from every other block, so cycles are independent of
+each other and of the literal/repeat blocks — cross-block replay order stays
+irrelevant.
+
+Within one cycle the steps *are* ordered and resumable. A rotation of `k` regions
+is `k` copies; performed as `j = k-1` down to `0`, each step's source `off_{j-1}`
+is not overwritten until a later (smaller-`j`) step, so re-running a step reads
+the original bytes and is idempotent. The one region overwritten before it is read
+is `off_{k-1}` (destination of the first step, source of the last), so its original
+is staged as the `snapshot`; the final step `off_0 ← snapshot` uses it.
+
+Progress is the `counter` (steps remaining, staged as `k`). It rides in the block,
+not `wip_ptr` — `wip_ptr` already carries `clen'`, and multiple cycles each need
+their own counter. Each step syncs its copy, decrements the counter with one
+8-aligned (non-tearing) write, and syncs again, exactly as `CycleSwap` advances
+`wip_ptr`. Recovery resumes a cycle from its persisted counter rather than
+restarting it, which is what makes the 1-snapshot encoding re-run-safe.
 
 ### Protocol
 
 1. **Extend and stage.** `file.set_len(32 + S + staged_len)`. Append every block
    at `[32+S, ...)` → sync.
 2. **Arm.** `write_wip(file, 32 + clen', MultiAtrunc)` → sync.
-3. **Replay.** Write each block into `[32+s_i, 32+e_i)` in place (a literal copies
-   its staged bytes; a repeat streams its pattern). Every target lies in
-   `[0, clen')`, disjoint from the staged tail at `[32+S, ...)`, so the staged
-   copy is an untouched backup and replay is idempotent, order-independent. → sync.
+3. **Replay.** Write each block into its target(s) in place — a literal copies its
+   staged bytes, a repeat streams its pattern, a cycle runs its `k` ordered steps
+   (each: copy → sync → decrement the block's counter with an 8-aligned write →
+   sync). Every literal/repeat target and every cycle region lies in `[0, clen')`,
+   disjoint from the staged tail at `[32+S, ...)`. Literal/repeat replay reads only
+   the immutable staged tail, so it is idempotent and order-independent; a cycle
+   reads its own regions plus its staged snapshot and resumes from its counter, so
+   it too is idempotent (the counter is the only staged byte a replay writes). → sync.
 4. **Commit + Disarm.** `write_header_commit(file, clen', 0, Set)` — one 24-byte
    write: the new length and the disarm land atomically → update in-memory `clen`
    → sync.
@@ -513,11 +555,13 @@ then keeps the old length rather than committing a half-formed `clen'`.
 
 `clen' = wip_ptr - 32`; `S = max(clen, clen')`; `tail_start = 32 + S`. Two-pass
 walk over `[tail_start, file_size)`: pass 1 validates every block (forward range,
-`e_i <= clen'`, recognized kind, `plen > 0`, `phase < plen`, payload present, and
-the sequence ends exactly at `file_size`); pass 2, only if pass 1 is clean,
-replays each block into `[s_i, e_i)` (`move_chunked` from the staged literal, or
-`write_pattern` from the staged descriptor) → sync. Then finalize with `clen'`.
-A malformed tail applies nothing and finalizes with the old `clen`.
+`e_i <= clen'`, recognized kind, `plen > 0`, `phase < plen`; for a cycle, `n > 0`,
+`k >= 2`, `counter <= k`, every `off_j + n <= clen'`, pairwise-disjoint offsets;
+payload present, and the sequence ends exactly at `file_size` after 8-byte
+padding); pass 2, only if pass 1 is clean, replays each block (`move_chunked` from
+the staged literal, `write_pattern` from the staged descriptor, or a cycle's
+resumed ordered steps) → sync. Then finalize with `clen'`. A malformed tail
+applies nothing and finalizes with the old `clen`.
 
 ---
 
@@ -572,8 +616,10 @@ wip_ptr  wip_aux          action
 
 All replay operations are idempotent: the staged tail is immutable and disjoint
 from its target (or, for Copy, the source is disjoint from the destination and
-was never modified). A crash during recovery is safe to re-run from the
-beginning.
+was never modified; for a `MultiAtrunc` `Cycle`, the only staged byte a replay
+writes is the block's own progress counter, and each ordered step re-reads
+original bytes because it resumes from that counter). A crash during recovery is
+safe to re-run from the beginning.
 
 After recovery, `durable_sync` ensures the repaired state is on stable storage
 before any caller can observe or modify the file.
