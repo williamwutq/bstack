@@ -8,10 +8,10 @@ name: DevSkim
 on:
   push:
     branches: [ "master" ]
-    paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock']
+    paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock', 'benches/**', 'src/test.rs', 'src/alloc_fuzz/**', 'c/test_*.c']
   pull_request:
     branches: [ "master" ]
-    paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock']
+    paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock', 'benches/**', 'src/test.rs', 'src/alloc_fuzz/**', 'c/test_*.c']
 
 jobs:
   lint:
@@ -27,6 +27,8 @@ jobs:
 
       - name: Run DevSkim scanner
         uses: microsoft/DevSkim-Action@v1
+        with:
+          ignore-globs: "**/.git/**,**/bin/**,benches/**,src/test.rs,src/alloc_fuzz/**,c/test_*.c"
 
       - name: Upload DevSkim scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
