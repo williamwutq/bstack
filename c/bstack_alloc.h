@@ -1129,6 +1129,31 @@ void ghost_tree_bstack_allocator_free(ghost_tree_bstack_allocator_t *alloc);
  */
 bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *alloc);
 
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * A free block is exactly an AVL tree node, so free_blocks/free_bytes come
+ * from an in-order walk of the tree, summing node sizes. A live allocation
+ * carries no header, so individual allocations cannot be told apart when
+ * they sit back to back; in_use_blocks instead counts the number of maximal
+ * contiguous live byte spans between the free nodes. in_use_bytes is the
+ * total arena size minus free_bytes.
+ *
+ * The walk runs under the same internal lock the alloc/dealloc vtable
+ * functions take around their own tree access, so the snapshot is
+ * consistent even under concurrent mutation.
+ *
+ * Returns 0 on success, -1 on error (errno set): an I/O error from the
+ * underlying bstack reads, or EINVAL if the tree traversal exceeds the
+ * maximum AVL depth (a cycle from a corrupted tree).
+ */
+BSTACK_WARN_UNUSED_RESULT
+int ghost_tree_bstack_allocator_stats(
+    ghost_tree_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+
 /* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
  *

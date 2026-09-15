@@ -5468,6 +5468,46 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
     return bs;
 }
 
+int ghost_tree_bstack_allocator_stats(
+    ghost_tree_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    uint64_t stack_len, root;
+    struct algt_walk_ctx ctx;
+    uint64_t free_bytes = 0, in_use_blocks = 0, cursor, arena_bytes, in_use_bytes;
+    size_t i;
+
+    memset(&ctx, 0, sizeof ctx);
+
+    MUTEX_LOCK(alloc);
+    if (bstack_len(alloc->bs, &stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    if (algt_read_root(alloc->bs, &root) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    algt_avl_walk_inorder(alloc->bs, root, &ctx);
+    MUTEX_UNLOCK(alloc);
+    if (ctx.err) { free(ctx.blocks); errno = EINVAL; return -1; }
+
+    qsort(ctx.blocks, ctx.count, sizeof *ctx.blocks, algt_cmp_by_ptr);
+
+    cursor = ALGT_ARENA_START;
+    for (i = 0; i < ctx.count; i++) {
+        free_bytes += ctx.blocks[i].size;
+        if (ctx.blocks[i].ptr > cursor) in_use_blocks++;
+        cursor = ctx.blocks[i].ptr + ctx.blocks[i].size;
+    }
+    if (cursor < stack_len) in_use_blocks++;
+    arena_bytes = (stack_len > ALGT_ARENA_START) ? stack_len - ALGT_ARENA_START : 0;
+    in_use_bytes = (arena_bytes > free_bytes) ? arena_bytes - free_bytes : 0;
+
+    if (out_free_blocks)   *out_free_blocks   = (uint64_t)ctx.count;
+    if (out_free_bytes)    *out_free_bytes    = free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_bytes;
+
+    free(ctx.blocks);
+    return 0;
+}
+
 /* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
