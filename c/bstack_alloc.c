@@ -6643,6 +6643,116 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
     return alloc->block_size;
 }
 
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Unlike checked_slab/segregated, a plain slab block carries no per-block
+ * state, so free blocks are only known by chasing the singly-linked free
+ * list. seen[] accumulates visited offsets (realloc-doubled; the list is
+ * typically short, as elsewhere in this file) so a revisit is caught before
+ * it can loop forever. */
+struct slab_stats_ctx {
+    uint8_t   buf[8];
+    uint64_t  arena_start;
+    uint64_t  block_size;
+    uint64_t  stack_len;
+    uint64_t  next_read;   /* offset the next READ should target */
+    uint64_t  free_blocks;
+    uint64_t *seen;
+    size_t    seen_count, seen_cap;
+    int       pending;     /* buf holds an unprocessed read from the last call */
+    int       done;
+};
+
+/* Returns 0 if val was newly added, 1 if val was already present (a cycle),
+ * -1 on allocation failure. */
+static int slab_stats_seen_has_or_add(struct slab_stats_ctx *c, uint64_t val)
+{
+    size_t i;
+    for (i = 0; i < c->seen_count; i++)
+        if (c->seen[i] == val) return 1;
+    if (c->seen_count == c->seen_cap) {
+        size_t newcap = c->seen_cap ? c->seen_cap * 2 : 16;
+        uint64_t *nw = realloc(c->seen, newcap * sizeof *nw);
+        if (!nw) return -1;
+        c->seen = nw; c->seen_cap = newcap;
+    }
+    c->seen[c->seen_count++] = val;
+    return 0;
+}
+
+static int slab_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct slab_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t val = read_le64(c->buf);
+        c->pending = 0;
+        if (val == SLAB_SENTINEL
+            || val < c->arena_start
+            || (val - c->arena_start) % c->block_size != 0
+            || val >= c->stack_len) {
+            /* End of list, or a malformed free list: stop, reporting the
+             * best-effort count so far. */
+            c->done = 1;
+        } else {
+            int r = slab_stats_seen_has_or_add(c, val);
+            if (r < 0) { errno = ENOMEM; return -1; }
+            if (r > 0) {
+                /* Cycle: stop, best-effort, same as a malformed pointer. */
+                c->done = 1;
+            } else {
+                c->free_blocks++;
+                c->next_read = val;
+            }
+        }
+    }
+    if (c->done) return 0;
+    c->pending  = 1;
+    *out_offset = c->next_read;
+    *out_buf    = c->buf;
+    *out_len    = 8;
+    return 1;
+}
+
+int slab_bstack_allocator_stats(
+    const slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct slab_stats_ctx c;
+    uint64_t stack_len, total_blocks, in_use_blocks;
+    int r;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+    if (stack_len <= SLAB_ARENA_START) {
+        if (out_free_blocks)   *out_free_blocks   = 0;
+        if (out_free_bytes)    *out_free_bytes    = 0;
+        if (out_in_use_blocks) *out_in_use_blocks = 0;
+        if (out_in_use_bytes)  *out_in_use_bytes  = 0;
+        return 0;
+    }
+    total_blocks = (stack_len - SLAB_ARENA_START) / alloc->block_size;
+
+    memset(&c, 0, sizeof c);
+    c.arena_start = SLAB_ARENA_START;
+    c.block_size  = alloc->block_size;
+    c.stack_len   = stack_len;
+    c.next_read   = SLAB_FREE_HEAD_OFFSET;
+
+    r = bstack_get_batched_gen(alloc->bs, slab_stats_gen, &c);
+    free(c.seen);
+    if (r != 0) return -1;
+
+    in_use_blocks = (total_blocks > c.free_blocks) ? total_blocks - c.free_blocks : 0;
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_blocks * alloc->block_size;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_blocks * alloc->block_size;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
