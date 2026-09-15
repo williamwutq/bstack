@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`CheckedSlabBStackAllocator::stats` / `SegregatedBStackAllocator::stats` (Rust) / `checked_slab_bstack_allocator_stats` / `segregated_bstack_allocator_stats` (C) (`alloc` + `set` + `atomic` / `BSTACK_FEATURE_SET` + `BSTACK_FEATURE_ATOMIC`).** Each reports `(free_blocks, free_bytes, in_use_blocks, in_use_bytes)`, the C form as four out-parameters, any of which may be NULL, from a single linear arena scan under one `BStack::get_batched_gen` / `bstack_get_batched_gen` sequence, so the snapshot is consistent even under concurrent `alloc`/`dealloc` and needs no allocator-level lock. Byte totals count whole physical block size (including the per-block overhead word), not the caller's requested length. A malformed overhead word or crashed-`extend` tail ends the scan early and reports only the cleanly-parsed prefix; run `recover`/`coalesce` first for an authoritative snapshot.
+
 ## [0.4.5] - 2026-09-15
 
 ### Changed
