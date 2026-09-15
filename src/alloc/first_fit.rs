@@ -1659,6 +1659,148 @@ impl FirstFitBStackAllocator {
         // the CAS clear, which under the `atomic` feature would fail when the flag is not 1.
         self.stack.set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
     }
+
+    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
+    /// in_use_bytes)`.
+    ///
+    /// Every block carries a header recording its size and an `is_free` flag,
+    /// so a linear scan strides through the arena classifying each block
+    /// directly, running the same walk [`recovery`](Self::recovery) does but
+    /// without the repair. Byte totals count the whole on-disk block (header,
+    /// payload, and footer), not just the caller's requested length, since a
+    /// block may be larger than its live request from a first-fit reuse.
+    ///
+    /// Under `atomic`, every header in the scan is read inside one
+    /// [`BStack::get_batched_gen`] sequence — a single lock acquisition for
+    /// the whole walk rather than one per block — additionally held under
+    /// the same internal lock [`alloc`](BStackAllocator::alloc)/
+    /// [`dealloc`](BStackAllocator::dealloc) take around their free-list
+    /// access, so the snapshot is consistent even under concurrent mutation.
+    /// Without `atomic` the allocator is `!Sync`, so plain sequential reads
+    /// are used and no lock is needed.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
+    /// block header, or too little space left for one, ends the scan at that
+    /// point; the returned counts cover only the arena prefix that parsed
+    /// cleanly — call [`recovery`](Self::recovery) first for an authoritative
+    /// snapshot.
+    #[cfg(feature = "atomic")]
+    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+        let _guard = self.lock.lock().unwrap();
+
+        let stack_len = self.stack.len()?;
+        let mut pos = Self::ARENA_START;
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+        let mut hdr_buf = [0u8; 16];
+        // Set once a read has been issued; the *next* call processes the
+        // buffer it filled before issuing (or declining) the next one.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                pending = false;
+                let size = read_buf_le!(hdr_buf, 0 => u64);
+                let is_free = hdr_buf[8] & 1 != 0;
+                // `pos <= stack_len` is a loop invariant, so this cannot underflow.
+                let remaining = stack_len - pos;
+
+                let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE) {
+                    Some(t)
+                        if size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                            && size % 8 == 0
+                            && t <= remaining =>
+                    {
+                        t
+                    }
+                    // Malformed header: stop, best-effort.
+                    _ => return None,
+                };
+
+                if is_free {
+                    free_blocks += 1;
+                    free_bytes += block_total;
+                } else {
+                    in_use_blocks += 1;
+                    in_use_bytes += block_total;
+                }
+                pos += block_total;
+            }
+            if stack_len - pos < Self::BLOCK_OVERHEAD_SIZE {
+                return None; // partial tail, or arena exhausted: stop
+            }
+            pending = true;
+            Some((
+                pos,
+                // SAFETY: `hdr_buf` outlives this call.
+                bstack_unsafe_reborrow_mut!(&mut hdr_buf[..]),
+            ))
+        })?;
+
+        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+    }
+
+    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
+    /// in_use_bytes)`.
+    ///
+    /// See the `atomic` overload of this method for the field semantics.
+    /// This allocator is `!Sync` without `atomic`, so the scan is a plain
+    /// sequential walk with no lock.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
+    /// block header, or too little space left for one, ends the scan at that
+    /// point; the returned counts cover only the arena prefix that parsed
+    /// cleanly — call [`recovery`](Self::recovery) first for an authoritative
+    /// snapshot.
+    #[cfg(not(feature = "atomic"))]
+    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+        let stack_len = self.stack.len()?;
+        let mut pos = Self::ARENA_START;
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+
+        while pos < stack_len {
+            let remaining = stack_len - pos;
+            if remaining < Self::BLOCK_OVERHEAD_SIZE {
+                break; // partial tail: stop, best-effort
+            }
+
+            let mut hdr_buf = [0u8; 16];
+            self.stack.get_into(pos, &mut hdr_buf)?;
+            let size = read_buf_le!(hdr_buf, 0 => u64);
+            let is_free = hdr_buf[8] & 1 != 0;
+
+            let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE) {
+                Some(t)
+                    if size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                        && size % 8 == 0
+                        && t <= remaining =>
+                {
+                    t
+                }
+                // Malformed header: stop, best-effort.
+                _ => break,
+            };
+
+            if is_free {
+                free_blocks += 1;
+                free_bytes += block_total;
+            } else {
+                in_use_blocks += 1;
+                in_use_bytes += block_total;
+            }
+            pos += block_total;
+        }
+
+        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+    }
 }
 
 #[cfg(feature = "set")]

@@ -1068,6 +1068,34 @@ void first_fit_bstack_allocator_free(first_fit_bstack_allocator_t *alloc);
  */
 bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *alloc);
 
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Every block carries a header recording its size and an is_free flag, so a
+ * linear scan strides through the arena classifying each block directly,
+ * running the same walk the recovery scan does but without the repair. Byte
+ * totals count the whole on-disk block (header, payload, and footer), not
+ * just the caller's requested length, since a block may be larger than its
+ * live request from a first-fit reuse.
+ *
+ * Under -DBSTACK_FEATURE_ATOMIC, every header in the scan is read inside one
+ * bstack_get_batched_gen sequence -- a single lock acquisition for the whole
+ * walk rather than one bstack_get per block -- additionally held under the
+ * same internal lock the alloc/dealloc vtable functions take around their
+ * free-list access, so the snapshot is consistent even under concurrent
+ * mutation. Without it, plain sequential bstack_get calls are used.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set). A malformed block
+ * header, or too little space left for one, ends the scan at that point;
+ * the returned counts cover only the arena prefix that parsed cleanly.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+
 /* =========================================================================
  * ghost_tree_bstack_allocator_t — best-fit AVL tree allocator
  *
