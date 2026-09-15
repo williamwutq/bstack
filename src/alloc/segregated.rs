@@ -1758,10 +1758,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
     /// Allocate one independently-freeable region per requested length.
     ///
     /// In four steps: classed requests drain their free lists in one
-    /// [`pop_all_classes`](Self::pop_all_classes); oversized requests take blocks
-    /// from [`match_oversized_bounded`](Self::match_oversized_bounded), carving a
-    /// match whose slack clears [`SPLIT_MIN`](Self::SPLIT_MIN) (like single
-    /// [`alloc`](BStackAllocator::alloc)); the remaining misses share one
+    /// `pop_all_classes`; oversized requests take blocks from
+    /// `match_oversized_bounded`, carving a match whose slack clears
+    /// `SPLIT_MIN` (like single [`alloc`](BStackAllocator::alloc)); the
+    /// remaining misses share one
     /// [`BStack::extend_sparse_batched`]; and every block is claimed in one
     /// [`BStack::set_batched`], after which carve remainders are relinked.
     /// Zero-length requests yield the null sentinel slice.

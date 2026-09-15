@@ -32,7 +32,7 @@ fn main() -> io::Result<()> {
         assert_eq!(stack.locked_len(), 0);
 
         let header = make_header(1, 1_000_000, 0b0000_0011);
-        let off = stack.push(&header)?;
+        let off = stack.push(header)?;
         println!("header at offset {off}; stack len = {}", stack.len()?);
 
         stack.lock_up_to(HEADER_SIZE)?;

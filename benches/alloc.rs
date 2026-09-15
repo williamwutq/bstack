@@ -535,10 +535,10 @@ fn bench_allocator<A, M, OG, SG>(
                                         } else {
                                             let i = rng.random_range(0..live.len());
                                             let sl = live.swap_remove(i);
-                                            if let Err(e) = alloc.dealloc(sl) {
-                                                if let Some(h) = e.handle {
-                                                    live.push(h);
-                                                }
+                                            if let Err(e) = alloc.dealloc(sl)
+                                                && let Some(h) = e.handle
+                                            {
+                                                live.push(h);
                                             }
                                         }
                                     }

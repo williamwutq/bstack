@@ -1405,9 +1405,8 @@ impl BStackBulkAllocator for SlabBStackAllocator {
     ///
     /// Each allocation's blocks are threaded into one chain and spliced onto the
     /// free list with a single [`BStack::set_batched`] plus one atomic
-    /// [`BStack::cross_exchange`] (see
-    /// [`splice_blocks_onto_free_list`](SlabBStackAllocator::splice_blocks_onto_free_list)),
-    /// so a concurrent push/pop cannot be lost. Null sentinel handles are ignored.
+    /// [`BStack::cross_exchange`] (see `splice_blocks_onto_free_list`), so a
+    /// concurrent push/pop cannot be lost. Null sentinel handles are ignored.
     ///
     /// Unlike the single-item [`dealloc`](BStackAllocator::dealloc), a run that
     /// happens to sit at the tail is **not** discarded — every block goes to the

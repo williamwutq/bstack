@@ -262,6 +262,7 @@ fn main() -> io::Result<()> {
         println!("write+read → {:?}", String::from_utf8_lossy(&owned.read()?));
         // Drop is a no-op: the allocation persists on disk until explicitly dealloc'd.
         // Must drop before into_stack() so the borrow of `alloc` ends.
+        #[allow(clippy::drop_non_drop)]
         drop(owned);
 
         // alloc_read_back works for SequenceBumpAllocator via Into<BStackOwnedSlice>.

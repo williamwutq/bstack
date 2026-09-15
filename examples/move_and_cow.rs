@@ -52,7 +52,7 @@ fn move_semantics_demo() -> io::Result<()> {
 
     // "Take" message #2 (offset 32) by swapping it with zeros.
     // We need a staging area for the zeros and the retrieved message.
-    let sentinel_offset = stack.push(&vec![0u8; MSG_SIZE as usize])?;
+    let sentinel_offset = stack.push(vec![0u8; MSG_SIZE as usize])?;
     println!("\nTaking message #2 (offset 32)...");
 
     // cross_exchange(a, b, n): swaps [a, a+n) with [b, b+n).
@@ -107,14 +107,14 @@ fn copy_on_write_demo() -> io::Result<()> {
     let value_v2 = 2000u64;
 
     // First, extend the stack to make room for the copy.
-    stack.push(&vec![0u8; 16])?;
+    stack.push(vec![0u8; 16])?;
     let offset_v2 = offset_v1 + 16; // the new copy location
 
     // Now copy v1 to v2.
     stack.copy(offset_v1, offset_v2, 16)?;
 
     // Now overwrite just the value field (bytes 8..16) in the new copy.
-    stack.set(offset_v2 + 8, &value_v2.to_le_bytes())?;
+    stack.set(offset_v2 + 8, value_v2.to_le_bytes())?;
     println!(
         "v2: key={}, value={} at offset {} (copied from v1)",
         key, value_v2, offset_v2
@@ -124,12 +124,12 @@ fn copy_on_write_demo() -> io::Result<()> {
     let value_v3 = 3000u64;
 
     // Extend for v3.
-    stack.push(&vec![0u8; 16])?;
+    stack.push(vec![0u8; 16])?;
     let offset_v3 = offset_v2 + 16;
 
     // Copy v2 to v3.
     stack.copy(offset_v2, offset_v3, 16)?;
-    stack.set(offset_v3 + 8, &value_v3.to_le_bytes())?;
+    stack.set(offset_v3 + 8, value_v3.to_le_bytes())?;
     println!(
         "v3: key={}, value={} at offset {} (copied from v2)",
         key, value_v3, offset_v3

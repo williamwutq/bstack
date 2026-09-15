@@ -63,7 +63,7 @@ impl ChecksummedBlock {
     fn open(path: &str) -> io::Result<Arc<BStack>> {
         let _ = std::fs::remove_file(path);
         let stack = BStack::open(path)?;
-        stack.push(&[0u8; BLOCK_SIZE])?;
+        stack.push([0u8; BLOCK_SIZE])?;
         Ok(Arc::new(stack))
     }
 
@@ -100,7 +100,7 @@ impl ChecksummedBlock {
 
         if self
             .stack
-            .eq_crds(0, &expected_checksum, 0, block)?
+            .eq_crds(0, expected_checksum, 0, block)?
             .is_some()
         {
             // Committed — update the cache to reflect the new file state.

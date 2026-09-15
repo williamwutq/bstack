@@ -88,7 +88,7 @@ fn main() -> io::Result<()> {
     #[cfg(feature = "set")]
     {
         // Push an 8-byte status record: 4-byte ASCII tag + 4-byte LE counter.
-        let status_off = stack.push(&[0u8; 8])?;
+        let status_off = stack.push([0u8; 8])?;
         println!("status record at offset {status_off}");
 
         // swap: atomically read N bytes at offset and overwrite them, returning

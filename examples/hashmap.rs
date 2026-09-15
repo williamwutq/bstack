@@ -51,7 +51,7 @@ impl PersistentHashMap {
         let index = BStack::open(index_path)?;
         if index.is_empty()? {
             // All 0xFF bytes → every slot reads as u64::MAX (EMPTY).
-            index.push(&[0xFF_u8; TABLE_BYTES])?;
+            index.push([0xFF_u8; TABLE_BYTES])?;
         }
         Ok(Self { strings, index })
     }
@@ -76,7 +76,7 @@ impl PersistentHashMap {
         entry.extend_from_slice(value.as_bytes());
         entry.push(0); // null terminator
         let offset = self.strings.push(&entry)?;
-        self.index.set(slot * SLOT_SIZE, &offset.to_le_bytes())
+        self.index.set(slot * SLOT_SIZE, offset.to_le_bytes())
     }
 
     /// Look up `key`. Returns `None` if the slot is empty or if the stored key

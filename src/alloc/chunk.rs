@@ -726,7 +726,7 @@ impl<'a> BStackChunk<'a> {
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
     /// BULK_READ_BUDGET`), not a fresh allocation per probe. Below
-    /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
+    /// `BULK_READ_BUDGET` total bytes, skips probing altogether and takes
     /// the `not(atomic)` path's own whole-region read instead.
     ///
     /// Atomic as a whole either way: the probing path runs every probe inside
@@ -918,7 +918,7 @@ impl<'a> BStackChunk<'a> {
     /// Reads only the probed chunks — O(log n) chunk reads, never the whole
     /// region — into one reused buffer (stack-allocated for `chunk_len <=
     /// BULK_READ_BUDGET`), not a fresh allocation per probe. Below
-    /// [`BULK_READ_BUDGET`] total bytes, skips probing altogether and takes
+    /// `BULK_READ_BUDGET` total bytes, skips probing altogether and takes
     /// the `not(atomic)` path's own whole-region read instead.
     ///
     /// Atomic as a whole either way, on the same terms as the `atomic`-feature

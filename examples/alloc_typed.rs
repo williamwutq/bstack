@@ -68,7 +68,7 @@ impl Record {
 #[cfg(all(feature = "alloc", feature = "set"))]
 fn insert(alloc: &FirstFitBStackAllocator, record: &Record) -> io::Result<[u8; 16]> {
     let mut slice = alloc.alloc(RECORD_SIZE)?;
-    slice.write(&record.to_bytes())?;
+    slice.write(record.to_bytes())?;
     // Serialise coords to a persistent 16-byte token. Drop is a no-op.
     Ok(BStackRange::new(slice.start(), slice.len()).to_bytes())
 }
@@ -90,7 +90,7 @@ fn update(alloc: &FirstFitBStackAllocator, token: &[u8; 16], record: &Record) ->
     let range = BStackRange::from_bytes(*token);
     // Reconstruct an owned handle in order to write. Drop is a no-op.
     let mut slice = unsafe { bstack::BStackOwnedSlice::from_raw_range(alloc, range) };
-    slice.write(&record.to_bytes())
+    slice.write(record.to_bytes())
 }
 
 /// Free the record pointed to by `token`.

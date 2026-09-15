@@ -1115,7 +1115,6 @@ mod tests {
     #[cfg(feature = "set")]
     #[test]
     fn to_owned_in_copies_decoded_bytes() {
-        use crate::BStackAllocator;
         let (stack, _c) = mk_stack();
         let key = 0x5A;
         let plain = b"secret payload!!";

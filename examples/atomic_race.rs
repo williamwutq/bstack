@@ -57,7 +57,7 @@ fn ticket_race() -> io::Result<()> {
                 let mut retries = 0u32;
                 loop {
                     let snap = s.len()?;
-                    if s.try_extend(snap, &[id as u8])? {
+                    if s.try_extend(snap, [id as u8])? {
                         return Ok((id, retries));
                     }
                     retries += 1;
@@ -93,7 +93,7 @@ fn counter_race() -> io::Result<()> {
     let stack = Arc::new(BStack::open(path)?);
 
     // Reserve a 4-byte little-endian counter initialised to 0.
-    stack.push(&0u32.to_le_bytes())?;
+    stack.push(0u32.to_le_bytes())?;
 
     // Every thread increments the counter ITERS times.  process holds the
     // write lock for the full read-modify-write, so concurrent calls
