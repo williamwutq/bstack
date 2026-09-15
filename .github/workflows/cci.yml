@@ -12,7 +12,49 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      base: ${{ steps.filter.outputs.base }}
+      alloc: ${{ steps.filter.outputs.alloc }}
+      bytevec: ${{ steps.filter.outputs.bytevec }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          base:
+            - 'c/bstack.c'
+            - 'c/bstack.h'
+            - 'c/test_bstack.c'
+            - 'c/Makefile'
+            - '.github/workflows/cci.yml'
+          alloc:
+            - 'c/bstack.c'
+            - 'c/bstack.h'
+            - 'c/bstack_alloc.c'
+            - 'c/bstack_alloc.h'
+            - 'c/test_first_fit.c'
+            - 'c/test_ghost_tree.c'
+            - 'c/test_slab.c'
+            - 'c/test_checked_slab.c'
+            - 'c/Makefile'
+            - '.github/workflows/cci.yml'
+          bytevec:
+            - 'c/bstack.c'
+            - 'c/bstack.h'
+            - 'c/bstack_alloc.c'
+            - 'c/bstack_alloc.h'
+            - 'c/bstack_bytevec.c'
+            - 'c/bstack_bytevec.h'
+            - 'c/test_bstack_bytevec.c'
+            - 'c/Makefile'
+            - '.github/workflows/cci.yml'
+
   test-c:
+    needs: changes
+    if: needs.changes.outputs.base == 'true' || needs.changes.outputs.alloc == 'true' || needs.changes.outputs.bytevec == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -32,34 +74,44 @@ jobs:
       if: runner.os == 'Windows'
       run: echo "CC=cl" >> $GITHUB_ENV
     - name: Build and test
+      if: needs.changes.outputs.base == 'true'
       run: cd c && make test
     - name: Build and test with set
+      if: needs.changes.outputs.base == 'true'
       run: cd c && make test-set
     - name: Build and test with atomic
+      if: needs.changes.outputs.base == 'true'
       run: cd c && make test-atomic
     - name: Build and test with set and atomic
+      if: needs.changes.outputs.base == 'true'
       run: cd c && make test-set-atomic
     - name: Build and test first-fit allocator
+      if: needs.changes.outputs.alloc == 'true'
       run: cd c && make test-first-fit
     - name: Build and test first-fit allocator (atomic)
-      if: runner.os != 'Windows'
+      if: needs.changes.outputs.alloc == 'true' && runner.os != 'Windows'
       run: cd c && make test-first-fit-atomic
     - name: Build and test ghost-tree allocator
+      if: needs.changes.outputs.alloc == 'true'
       run: cd c && make test-ghost-tree
     - name: Build and test ghost-tree allocator (atomic)
-      if: runner.os != 'Windows'
+      if: needs.changes.outputs.alloc == 'true' && runner.os != 'Windows'
       run: cd c && make test-ghost-tree-atomic
     - name: Build and test slab allocator
+      if: needs.changes.outputs.alloc == 'true'
       run: cd c && make test-slab
     - name: Build and test slab allocator (atomic)
-      if: runner.os != 'Windows'
+      if: needs.changes.outputs.alloc == 'true' && runner.os != 'Windows'
       run: cd c && make test-slab-atomic
     - name: Build and test checked-slab allocator
+      if: needs.changes.outputs.alloc == 'true'
       run: cd c && make test-checked-slab
     - name: Build and test checked-slab allocator (atomic)
-      if: runner.os != 'Windows'
+      if: needs.changes.outputs.alloc == 'true' && runner.os != 'Windows'
       run: cd c && make test-checked-slab-atomic
     - name: Build and test bytevec
+      if: needs.changes.outputs.bytevec == 'true'
       run: cd c && make test-bytevec
     - name: Build alloc libraries (all feature variants)
+      if: needs.changes.outputs.alloc == 'true'
       run: cd c && make libbstack-alloc.a libbstack-alloc-set.a
