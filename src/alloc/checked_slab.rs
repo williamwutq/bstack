@@ -1714,6 +1714,78 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
 
 #[cfg(feature = "atomic")]
 impl CheckedSlabBStackAllocator {
+    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
+    /// in_use_bytes)`.
+    ///
+    /// Byte totals count whole blocks (`block_size` each, including the
+    /// 8-byte overhead), not caller-requested length — the checked-slab
+    /// format only records how many `block_size` blocks a live allocation
+    /// spans, not the length the caller asked for.
+    ///
+    /// Reads the whole arena in one [`BStack::get_batched_gen`] sequence
+    /// under one held shared lock, so the counts are a consistent snapshot
+    /// despite concurrent `alloc`/`dealloc`. No allocator-level lock is
+    /// taken.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack::get_batched_gen`]
+    /// call. A malformed overhead word (left by an un-recovered crash) ends
+    /// the scan at that point; the returned counts cover only the arena
+    /// prefix that parsed cleanly — call [`recover`](Self::recover) first
+    /// for an authoritative snapshot.
+    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+        let stack_len = self.stack.len()?;
+        if stack_len <= Self::ARENA_START {
+            return Ok((0, 0, 0, 0));
+        }
+        let bs = self.block_size;
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+        let mut p = Self::ARENA_START;
+        let mut word_buf = [0u8; 8];
+        // Set once a read has been issued; the *next* call processes the
+        // buffer it filled before issuing (or declining) the next one.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                pending = false;
+                let overhead = u64::from_le_bytes(word_buf);
+                if overhead & Self::IN_USE_BIT != 0 {
+                    let n = overhead & Self::BLOCKS_MASK;
+                    let valid = n != 0
+                        && n.checked_mul(bs)
+                            .and_then(|span| p.checked_add(span))
+                            .is_some_and(|end| end <= stack_len);
+                    if !valid {
+                        p = stack_len; // malformed: stop the scan here
+                        return None;
+                    }
+                    let span = n * bs;
+                    in_use_blocks += 1;
+                    in_use_bytes += span;
+                    p += span;
+                } else {
+                    free_blocks += 1;
+                    free_bytes += bs;
+                    p += bs;
+                }
+            }
+            if p >= stack_len {
+                return None;
+            }
+            pending = true;
+            Some((
+                p,
+                // SAFETY: `word_buf` outlives this call.
+                bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
+            ))
+        })?;
+        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+    }
+
     /// Bulk free-list pop, used only by the
     /// [`alloc_bulk`](BStackBulkAllocator::alloc_bulk) extend path.
     ///
@@ -2989,6 +3061,49 @@ mod tests {
         // A second run finds nothing further and changes nothing.
         assert_eq!(alloc.recover().unwrap(), 0);
         assert_eq!(alloc.stack().len().unwrap(), len_after);
+    }
+
+    // ── stats (feature = "atomic") ──────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_empty_arena_is_all_zero() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_counts_free_and_in_use_blocks() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        // data_size = 24, block_size = 32.
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        let a = alloc.alloc(24).unwrap();
+        let b = alloc.alloc(24).unwrap();
+        let c = alloc.alloc(24).unwrap();
+        alloc.dealloc(b).unwrap();
+        // a, c in use (32 B each); b free (32 B).
+        assert_eq!(alloc.stats().unwrap(), (1, 32, 2, 64));
+        // c is the tail block, so freeing it truncates the arena (`discard`)
+        // rather than adding a third free block; only a and b remain free.
+        alloc.dealloc(c).unwrap();
+        alloc.dealloc(a).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (2, 64, 0, 0));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_multi_block_allocation_counts_as_one_block_spanning_several() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        // data_size = 8, block_size = 16; request spans 3 blocks
+        // (2 blocks give only 2*16-8 = 24 usable bytes < 30).
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
+        let _s = alloc.alloc(30).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 48));
     }
 
     // ── concurrent (feature = "atomic") ───────────────────────────────────────
