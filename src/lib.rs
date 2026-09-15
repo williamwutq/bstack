@@ -41,8 +41,8 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x04\x05\x00` (0.4.5).  [`open`](BStack::open)
-//!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
+//!   This version writes `BSTK\x00\x05\x00\x00` (format 0.5.0).  [`open`](BStack::open)
+//!   accepts any file whose first 6 bytes match `BSTK\x00\x05` (any 0.5.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
 //!   It is updated atomically with each [`push`](BStack::push) or
@@ -408,7 +408,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.5"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.5.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -754,12 +754,15 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// On-disk **format** version encoded in the magic header. This is independent
 /// of the crate version: it bumps only when the file format changes in a way an
-/// older reader cannot handle. 0.4.0 introduces the 32-byte write-in-progress
-/// journal header (see `algos/WIP.md`); bumping the minor here makes older binaries
-/// reject the new files loudly instead of misreading them.
+/// older reader cannot handle. 0.4.0 introduced the 32-byte write-in-progress
+/// journal header (see `algos/WIP.md`); 0.5.0 adds the `MultiAtrunc` journal
+/// mode, which overwrites committed bytes in place before its commit point — a
+/// reader that does not recognize it cannot safely roll it back (WIP.md Rule 2),
+/// so the minor bumps to make older binaries reject the new files loudly instead
+/// of misreading them.
 const FORMAT_MAJOR: u8 = 0;
-const FORMAT_MINOR: u8 = 4;
-const FORMAT_PATCH: u8 = 5;
+const FORMAT_MINOR: u8 = 5;
+const FORMAT_PATCH: u8 = 0;
 
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
