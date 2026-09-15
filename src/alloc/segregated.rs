@@ -1318,6 +1318,90 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
 #[cfg(feature = "atomic")]
 impl SegregatedBStackAllocator {
+    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
+    /// in_use_bytes)`.
+    ///
+    /// Byte totals count each block's recorded **physical** size (including
+    /// the 8-byte overhead), not the caller's requested length — the
+    /// segregated format never persists the requested length, so any
+    /// retained excess above a request is counted as in-use bytes, not
+    /// fragmentation.
+    ///
+    /// Reads the whole arena in one [`BStack::get_batched_gen`] sequence, the
+    /// same lock [`coalesce`](Self::coalesce) holds across its scan, so the
+    /// counts are a consistent snapshot despite concurrent `alloc`/`dealloc`.
+    /// No allocator-level lock is taken.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack::get_batched_gen`]
+    /// call. A malformed overhead word, or a zeroed tail left by a crashed
+    /// `extend`, ends the scan at that point; the returned counts cover only
+    /// the arena prefix that parsed cleanly — run
+    /// [`coalesce`](Self::coalesce) (or the `unsafe` [`recover`](Self::recover))
+    /// first for an authoritative snapshot.
+    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+        let stack_len = self.stack.len()?;
+        if stack_len <= Self::ARENA_START {
+            return Ok((0, 0, 0, 0));
+        }
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+        let mut p = Self::ARENA_START;
+        let mut word_buf = [0u8; 8];
+        // Set once a read has been issued; the *next* call processes the
+        // buffer it filled before issuing (or declining) the next one.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                pending = false;
+                let word = u64::from_le_bytes(word_buf);
+                if word == 0 {
+                    // Zeroed tail from a crashed `extend`: stop (recover()
+                    // and coalesce() both discard/skip this the same way).
+                    p = stack_len;
+                    return None;
+                }
+                // `size` is decoded from an on-disk word that a crash or
+                // corruption may have left arbitrary, so `size > stack_len -
+                // p` (never underflows: the read below only ever runs with
+                // `p < stack_len`) is used instead of `p + size > stack_len`,
+                // which could overflow for a `size` near `u64::MAX`.
+                if word & Self::IN_USE_BIT != 0 {
+                    let size = (word & !Self::IN_USE_BIT) << 4;
+                    if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
+                        p = stack_len; // malformed: stop the scan here
+                        return None;
+                    }
+                    in_use_blocks += 1;
+                    in_use_bytes += size;
+                    p += size;
+                } else {
+                    let size = word << 4;
+                    if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
+                        p = stack_len; // malformed: stop the scan here
+                        return None;
+                    }
+                    free_blocks += 1;
+                    free_bytes += size;
+                    p += size;
+                }
+            }
+            if Self::OVERHEAD > stack_len - p {
+                return None;
+            }
+            pending = true;
+            Some((
+                p,
+                // SAFETY: `word_buf` outlives this call.
+                bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
+            ))
+        })?;
+        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+    }
+
     /// Pop up to `want[c]` blocks from every classed free list in one crash-atomic
     /// [`BStack::inplace_gen`], returning the popped starts flattened in ascending
     /// class order plus the per-class count (fewer than `want[c]` if a list ran
@@ -2850,6 +2934,42 @@ mod tests {
         let shrunk = a.realloc_uninit(x, 100).unwrap();
         assert_eq!(shrunk.len(), 100);
         assert_eq!(shrunk.read().unwrap(), vec![0x22u8; 100]);
+    }
+
+    // ── stats (feature = "atomic") ───────────────────────────────────────────
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_empty_arena_is_all_zero() {
+        let (a, _g) = new_alloc();
+        assert_eq!(a.stats().unwrap(), (0, 0, 0, 0));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_counts_free_and_in_use_blocks() {
+        let (a, _g) = new_alloc();
+        // len=100 -> physical size 112 (linear class, passes through).
+        let x = a.alloc(100).unwrap();
+        let y = a.alloc(100).unwrap();
+        let z = a.alloc(100).unwrap();
+        a.dealloc(y).unwrap();
+        assert_eq!(a.stats().unwrap(), (1, 112, 2, 224));
+        // Unlike `CheckedSlabBStackAllocator`, a classed (non-oversized) block
+        // always goes to its free list on `dealloc`, tail or not.
+        a.dealloc(x).unwrap();
+        a.dealloc(z).unwrap();
+        assert_eq!(a.stats().unwrap(), (3, 336, 0, 0));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_oversized_block_counts_physical_size() {
+        let (a, _g) = new_alloc();
+        // len=5000 -> need = round_up(5000+8, 16) = 5008 > MAX_CLASS(4096),
+        // so it lands in the oversized bucket at its raw rounded size.
+        let _s = a.alloc(5000).unwrap();
+        assert_eq!(a.stats().unwrap(), (0, 0, 1, 5008));
     }
 
     // ── classification math ──────────────────────────────────────────────────
