@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [src/**]
   pull_request:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [src/**]
 
 permissions:

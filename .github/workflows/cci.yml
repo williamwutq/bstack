@@ -2,10 +2,10 @@ name: CCI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [c/**, .github/workflows/cci.yml]
   pull_request:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [c/**, .github/workflows/cci.yml]
 
 permissions:

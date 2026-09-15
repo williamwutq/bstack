@@ -2,10 +2,10 @@ name: Check
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: ['src/**', 'benches/**', 'examples/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/check.yml']
   pull_request:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: ['src/**', 'benches/**', 'examples/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/check.yml']
 
 permissions:

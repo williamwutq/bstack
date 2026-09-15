@@ -2,10 +2,10 @@ name: Alloc Fuzz
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [ src/alloc/**, src/alloc_fuzz/**, src/fault.rs ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, '**backport**' ]
     paths: [ src/alloc/**, src/alloc_fuzz/**, src/fault.rs ]
 
 permissions:

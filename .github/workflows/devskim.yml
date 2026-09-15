@@ -7,10 +7,10 @@ name: DevSkim
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "master", "**backport**" ]
     paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock', 'benches/**', 'src/test.rs', 'src/alloc_fuzz/**', 'c/test_*.c']
   pull_request:
-    branches: [ "master" ]
+    branches: [ "master", "**backport**" ]
     paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock', 'benches/**', 'src/test.rs', 'src/alloc_fuzz/**', 'c/test_*.c']
 
 jobs:
