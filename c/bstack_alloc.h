@@ -936,6 +936,36 @@ bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc);
  */
 uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Snapshot block occupancy: writes the free and in-use block counts and byte
+ * totals into the four out-pointers, any of which may be NULL to skip it.
+ *
+ * A plain slab block carries no per-block state, so chasing the singly-linked
+ * free list from free_head is the only way to tell that a block is free. This
+ * walks that list in one bstack_get_batched_gen sequence, validating each node
+ * before following it: in bounds, and block_size-aligned. in_use_blocks is
+ * then total_blocks - free_blocks, for total_blocks the arena size divided by
+ * block_size.
+ *
+ * A list holds at most total_blocks nodes. That count alone bounds the walk
+ * and serves as the cycle check: a malformed pointer ends it where it is
+ * found, and a cycle ends it at total_blocks, reporting the whole arena free.
+ *
+ * Reads happen under one held shared lock. The counts are therefore a
+ * consistent snapshot even under concurrent alloc/dealloc, and this allocator
+ * carries no allocator-level lock at all.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int slab_bstack_allocator_stats(
+    const slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
  *
