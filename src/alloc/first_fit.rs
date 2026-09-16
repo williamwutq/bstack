@@ -1665,27 +1665,27 @@ impl FirstFitBStackAllocator {
     ///
     /// Every block carries a header recording its size and an `is_free` flag,
     /// so a linear scan strides through the arena classifying each block
-    /// directly, running the same walk [`recovery`](Self::recovery) does but
-    /// without the repair. Byte totals count the whole on-disk block (header,
-    /// payload, and footer), not just the caller's requested length, since a
-    /// block may be larger than its live request from a first-fit reuse.
+    /// directly, running the same walk the recovery scan does but without the
+    /// repair: a malformed header, or too little space left for one, ends the
+    /// scan there rather than being fixed, so the counts cover only the arena
+    /// prefix that parsed cleanly. [`new`](Self::new) runs the repairing walk
+    /// when the header's `recovery_needed` flag is set, so reopening the stack
+    /// first gives an authoritative snapshot. Byte totals count the whole
+    /// on-disk block (header, payload, and footer), not just the caller's
+    /// requested length, since a block may be larger than its live request
+    /// from a first-fit reuse.
     ///
     /// Under `atomic`, every header in the scan is read inside one
-    /// [`BStack::get_batched_gen`] sequence — a single lock acquisition for
-    /// the whole walk rather than one per block — additionally held under
-    /// the same internal lock [`alloc`](BStackAllocator::alloc)/
-    /// [`dealloc`](BStackAllocator::dealloc) take around their free-list
-    /// access, so the snapshot is consistent even under concurrent mutation.
-    /// Without `atomic` the allocator is `!Sync`, so plain sequential reads
-    /// are used and no lock is needed.
+    /// [`BStack::get_batched_gen`] sequence, held under the same internal lock
+    /// [`alloc`](BStackAllocator::alloc)/[`dealloc`](BStackAllocator::dealloc)
+    /// take around their free-list access, so the snapshot is consistent even
+    /// under concurrent mutation. Without `atomic` the allocator is `!Sync`, so
+    /// plain sequential reads are used and no lock is needed.
     ///
     /// # Errors
     ///
     /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
-    /// block header, or too little space left for one, ends the scan at that
-    /// point; the returned counts cover only the arena prefix that parsed
-    /// cleanly — call [`recovery`](Self::recovery) first for an authoritative
-    /// snapshot.
+    /// block header is not an error; it truncates the scan.
     #[cfg(feature = "atomic")]
     pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
         let _guard = self.lock.lock().unwrap();
@@ -1759,10 +1759,7 @@ impl FirstFitBStackAllocator {
     /// # Errors
     ///
     /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
-    /// block header, or too little space left for one, ends the scan at that
-    /// point; the returned counts cover only the arena prefix that parsed
-    /// cleanly — call [`recovery`](Self::recovery) first for an authoritative
-    /// snapshot.
+    /// block header is not an error; it truncates the scan.
     #[cfg(not(feature = "atomic"))]
     pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
         let stack_len = self.stack.len()?;
