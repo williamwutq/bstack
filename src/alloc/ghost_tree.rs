@@ -1,5 +1,5 @@
 use super::{
-    BStackAllocError, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator,
+    BStackAllocError, BStackAllocStats, BStackAllocator, BStackBulkAllocError, BStackBulkAllocator,
     BStackInPlaceResizeAllocator, BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
     ensure_own_handles,
 };
@@ -870,8 +870,7 @@ impl GhostTreeBstackAllocator {
         self.write_root(new_root)
     }
 
-    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
-    /// in_use_bytes)`.
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
     ///
     /// A free block is exactly an AVL tree node, so `free_blocks`/`free_bytes`
     /// come from an in-order walk of the tree, summing node sizes. A live
@@ -891,7 +890,7 @@ impl GhostTreeBstackAllocator {
     /// [`io::ErrorKind::InvalidData`] if the tree traversal exceeds the
     /// maximum AVL depth (a cycle from a corrupted tree). Any other
     /// [`io::Error`] from the underlying [`BStack`] reads.
-    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
         #[cfg(feature = "atomic")]
         let _guard = self.lock.lock().unwrap();
 
@@ -931,7 +930,12 @@ impl GhostTreeBstackAllocator {
             .saturating_sub(ARENA_START)
             .saturating_sub(free_bytes);
 
-        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
     }
 }
 
@@ -2394,7 +2398,15 @@ mod tests {
     fn stats_empty_arena_is_all_zero() {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[test]
@@ -2402,7 +2414,15 @@ mod tests {
         let (alloc, path) = open_fresh();
         let _g = Guard(path);
         let _s = alloc.alloc(64).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 64));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 1,
+                in_use_bytes: 64,
+            }
+        );
     }
 
     #[test]
@@ -2415,18 +2435,42 @@ mod tests {
 
         // b sits between two live spans: one free node, two in-use spans.
         alloc.dealloc(b).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (1, 32, 2, 64));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 1,
+                free_bytes: 32,
+                in_use_blocks: 2,
+                in_use_bytes: 64,
+            }
+        );
 
         // a is not the tail (b, c still follow it), so it becomes a second,
         // separate free node — GhostTree never merges free neighbours live,
         // only on the next open's coalesce_and_rebalance. Only c is left live.
         alloc.dealloc(a).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (2, 64, 1, 32));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 2,
+                free_bytes: 64,
+                in_use_blocks: 1,
+                in_use_bytes: 32,
+            }
+        );
 
         // c is the tail: dealloc discards it instead of inserting a node, so
         // the arena shrinks to exactly the two existing free spans.
         alloc.dealloc(c).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (2, 64, 0, 0));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 2,
+                free_bytes: 64,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[test]
@@ -2440,7 +2484,15 @@ mod tests {
         alloc.dealloc(b).unwrap();
         alloc.dealloc(c).unwrap();
         // b and c are adjacent free nodes between two live spans (a and d).
-        assert_eq!(alloc.stats().unwrap(), (2, 64, 2, 64));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 2,
+                free_bytes: 64,
+                in_use_blocks: 2,
+                in_use_bytes: 64,
+            }
+        );
 
         // A partial rotation crash can leave one node reachable from two
         // parents; point both of the root's child slots at the same node.
@@ -2459,7 +2511,15 @@ mod tests {
 
         // The in-order walk now visits `child` twice; dedup keeps the counts
         // honest, as it does in `coalesce_and_rebalance`.
-        assert_eq!(alloc.stats().unwrap(), (2, 64, 2, 64));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 2,
+                free_bytes: 64,
+                in_use_blocks: 2,
+                in_use_bytes: 64,
+            }
+        );
     }
 
     // ── new() error cases ──────────────────────────────────────────────────────

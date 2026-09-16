@@ -1,6 +1,6 @@
 use super::{
-    BStackAllocError, BStackAllocator, BStackInPlaceResizeAllocator, BStackOwnedSlice,
-    BStackUninitAllocator, ensure_own_handle,
+    BStackAllocError, BStackAllocStats, BStackAllocator, BStackInPlaceResizeAllocator,
+    BStackOwnedSlice, BStackUninitAllocator, ensure_own_handle,
 };
 use crate::BStack;
 #[cfg(feature = "atomic")]
@@ -1660,8 +1660,7 @@ impl FirstFitBStackAllocator {
         self.stack.set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
     }
 
-    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
-    /// in_use_bytes)`.
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
     ///
     /// Every block carries a header recording its size and an `is_free` flag,
     /// so a linear scan strides through the arena classifying each block
@@ -1687,7 +1686,7 @@ impl FirstFitBStackAllocator {
     /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
     /// block header is not an error; it truncates the scan.
     #[cfg(feature = "atomic")]
-    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
         let _guard = self.lock.lock().unwrap();
 
         let stack_len = self.stack.len()?;
@@ -1695,7 +1694,7 @@ impl FirstFitBStackAllocator {
         // check, so a stack truncated under the header must not reach it. The
         // sequential overload needs no guard: its `while pos < stack_len` is one.
         if stack_len <= Self::ARENA_START {
-            return Ok((0, 0, 0, 0));
+            return Ok(BStackAllocStats::default());
         }
         let mut pos = Self::ARENA_START;
         let mut free_blocks = 0u64;
@@ -1746,11 +1745,15 @@ impl FirstFitBStackAllocator {
             ))
         })?;
 
-        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
     }
 
-    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
-    /// in_use_bytes)`.
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
     ///
     /// See the `atomic` overload of this method for the field semantics.
     /// This allocator is `!Sync` without `atomic`, so the scan is a plain
@@ -1761,7 +1764,7 @@ impl FirstFitBStackAllocator {
     /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
     /// block header is not an error; it truncates the scan.
     #[cfg(not(feature = "atomic"))]
-    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
         let stack_len = self.stack.len()?;
         let mut pos = Self::ARENA_START;
         let mut free_blocks = 0u64;
@@ -1800,7 +1803,12 @@ impl FirstFitBStackAllocator {
             pos += block_total;
         }
 
-        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
     }
 }
 

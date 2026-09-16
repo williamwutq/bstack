@@ -5608,7 +5608,8 @@ mod alloc_tests {
 mod first_fit_tests {
     use crate::BStack;
     use crate::alloc::{
-        BStackAllocator, BStackSlice, BStackUninitAllocator, FirstFitBStackAllocator,
+        BStackAllocStats, BStackAllocator, BStackSlice, BStackUninitAllocator,
+        FirstFitBStackAllocator,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -6822,7 +6823,15 @@ mod first_fit_tests {
     fn stats_empty_arena_is_all_zero() {
         let (alloc, path) = mk_ff("stats_empty");
         let _g = Guard(path);
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[test]
@@ -6831,7 +6840,15 @@ mod first_fit_tests {
         let _g = Guard(path);
         let _s = alloc.alloc(64).unwrap();
         // payload 64 + overhead 24 = 88.
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 88));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 1,
+                in_use_bytes: 88,
+            }
+        );
     }
 
     #[test]
@@ -6845,18 +6862,42 @@ mod first_fit_tests {
 
         // b has no free neighbour: one free block, two still in use.
         alloc.dealloc(b).map_err(|e| e.source).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (1, 40, 2, 80));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 1,
+                free_bytes: 40,
+                in_use_blocks: 2,
+                in_use_bytes: 80,
+            }
+        );
 
         // a's right neighbour (b) is free, so dealloc coalesces them into one
         // free block spanning both — same total bytes, fewer free blocks.
         alloc.dealloc(a).map_err(|e| e.source).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (1, 80, 1, 40));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 1,
+                free_bytes: 80,
+                in_use_blocks: 1,
+                in_use_bytes: 40,
+            }
+        );
 
         // c's left neighbour (the merged a+b block) is free, and the merge
         // now reaches the tail, so dealloc discards the whole arena instead
         // of leaving a free node.
         alloc.dealloc(c).map_err(|e| e.source).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[test]
@@ -6866,7 +6907,15 @@ mod first_fit_tests {
         // A stack cut below ARENA_START must report nothing rather than
         // underflow the scan's `stack_len - pos`.
         alloc.stack().discard(8).unwrap();
-        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+        assert_eq!(
+            alloc.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 }
 

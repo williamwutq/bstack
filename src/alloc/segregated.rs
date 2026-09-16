@@ -40,6 +40,8 @@
 //! OS); the non-`atomic` build cannot fuse that safely, so it retains a tail shrink
 //! too.
 
+#[cfg(feature = "atomic")]
+use super::BStackAllocStats;
 use super::{
     BStackAllocError, BStackAllocator, BStackInPlaceResizeAllocator, BStackOwnedSlice,
     BStackUninitAllocator, ensure_own_handle,
@@ -1322,8 +1324,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
 
 #[cfg(feature = "atomic")]
 impl SegregatedBStackAllocator {
-    /// Snapshot block occupancy: `(free_blocks, free_bytes, in_use_blocks,
-    /// in_use_bytes)`.
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
     ///
     /// Byte totals count each block's recorded **physical** size (including
     /// the 8-byte overhead), not the caller's requested length — the
@@ -1345,7 +1346,7 @@ impl SegregatedBStackAllocator {
     /// the arena prefix that parsed cleanly — run
     /// [`coalesce`](Self::coalesce) (or the `unsafe` [`recover`](Self::recover))
     /// first for an authoritative snapshot.
-    pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
         // The length is sampled outside the lock `get_batched_gen` holds, so a
         // concurrent tail discard can leave the scan reading past the new end.
         // Only a stale bound can raise `InvalidInput` here, so retry on it and
@@ -1364,9 +1365,9 @@ impl SegregatedBStackAllocator {
     }
 
     /// One linear arena scan for [`stats`](Self::stats), bounded by `stack_len`.
-    fn stats_scan(&self, stack_len: u64) -> io::Result<(u64, u64, u64, u64)> {
+    fn stats_scan(&self, stack_len: u64) -> io::Result<BStackAllocStats> {
         if stack_len <= Self::ARENA_START {
-            return Ok((0, 0, 0, 0));
+            return Ok(BStackAllocStats::default());
         }
         // `new` enforces a whole number of quanta; clamp rather than assume, so
         // a torn tail truncates the walk instead of shortening a read. Every
@@ -1419,7 +1420,12 @@ impl SegregatedBStackAllocator {
                 bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
             ))
         })?;
-        Ok((free_blocks, free_bytes, in_use_blocks, in_use_bytes))
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
     }
 
     /// Pop up to `want[c]` blocks from every classed free list in one crash-atomic
@@ -2765,6 +2771,8 @@ mod _assertions {
 mod tests {
     use super::SegregatedBStackAllocator as Seg;
     use crate::BStack;
+    #[cfg(feature = "atomic")]
+    use crate::alloc::BStackAllocStats;
     use crate::alloc::{BStackAllocator, BStackInPlaceResizeAllocator, BStackUninitAllocator};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2962,7 +2970,15 @@ mod tests {
     #[test]
     fn seg_stats_empty_arena_is_all_zero() {
         let (a, _g) = new_alloc();
-        assert_eq!(a.stats().unwrap(), (0, 0, 0, 0));
+        assert_eq!(
+            a.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[cfg(feature = "atomic")]
@@ -2974,12 +2990,28 @@ mod tests {
         let y = a.alloc(100).unwrap();
         let z = a.alloc(100).unwrap();
         a.dealloc(y).unwrap();
-        assert_eq!(a.stats().unwrap(), (1, 112, 2, 224));
+        assert_eq!(
+            a.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 1,
+                free_bytes: 112,
+                in_use_blocks: 2,
+                in_use_bytes: 224,
+            }
+        );
         // Unlike `CheckedSlabBStackAllocator`, a classed (non-oversized) block
         // always goes to its free list on `dealloc`, tail or not.
         a.dealloc(x).unwrap();
         a.dealloc(z).unwrap();
-        assert_eq!(a.stats().unwrap(), (3, 336, 0, 0));
+        assert_eq!(
+            a.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 3,
+                free_bytes: 336,
+                in_use_blocks: 0,
+                in_use_bytes: 0,
+            }
+        );
     }
 
     #[cfg(feature = "atomic")]
@@ -2989,7 +3021,15 @@ mod tests {
         // len=5000 -> need = round_up(5000+8, 16) = 5008 > MAX_CLASS(4096),
         // so it lands in the oversized bucket at its raw rounded size.
         let _s = a.alloc(5000).unwrap();
-        assert_eq!(a.stats().unwrap(), (0, 0, 1, 5008));
+        assert_eq!(
+            a.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 1,
+                in_use_bytes: 5008,
+            }
+        );
     }
 
     #[cfg(feature = "atomic")]
@@ -3029,10 +3069,14 @@ mod tests {
         let mut runs = 0u64;
         while done.load(Ordering::Acquire) < CHURN {
             runs += 1;
-            let (_, _, in_use_blocks, _) = alloc
+            let stats = alloc
                 .stats()
                 .expect("stats must not fail under a concurrent tail discard");
-            assert!(in_use_blocks >= 8, "lost live blocks: {in_use_blocks}");
+            assert!(
+                stats.in_use_blocks >= 8,
+                "lost live blocks: {}",
+                stats.in_use_blocks
+            );
         }
         for h in churn {
             h.join().unwrap();
@@ -3047,7 +3091,15 @@ mod tests {
         let _x = a.alloc(100).unwrap(); // physical size 112
         // A crashed `extend` can leave the arena a non-multiple of QUANTUM.
         a.stack().extend(4).unwrap();
-        assert_eq!(a.stats().unwrap(), (0, 0, 1, 112));
+        assert_eq!(
+            a.stats().unwrap(),
+            BStackAllocStats {
+                free_blocks: 0,
+                free_bytes: 0,
+                in_use_blocks: 1,
+                in_use_bytes: 112,
+            }
+        );
     }
 
     // ── classification math ──────────────────────────────────────────────────
