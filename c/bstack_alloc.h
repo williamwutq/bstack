@@ -1369,6 +1369,11 @@ uint64_t checked_slab_bstack_allocator_data_size(
  * records how many block_size blocks a live allocation spans, not the
  * length the caller asked for.
  *
+ * Blocks are classified as the recovery scan classifies them, except that
+ * this walk does not read the free list, so a leaked block (overhead == 0 but
+ * unreachable from free_head) counts as free.
+ * checked_slab_bstack_allocator_recover reclaims those.
+ *
  * Reads the whole arena in one bstack_get_batched_gen sequence under one
  * held shared lock, so the counts are a consistent snapshot despite
  * concurrent alloc/dealloc. No allocator-level lock is taken.
@@ -1558,9 +1563,10 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * format never persists the requested length, so any retained excess above
  * a request is counted as in-use bytes, not fragmentation.
  *
- * Reads the whole arena in one bstack_get_batched_gen sequence, the same
- * lock segregated_bstack_allocator_coalesce holds across its scan, so the
- * counts are a consistent snapshot despite concurrent alloc/dealloc. No
+ * Reads the whole arena in one bstack_get_batched_gen sequence, so the counts
+ * are a consistent snapshot despite concurrent alloc/dealloc. Unlike
+ * segregated_bstack_allocator_coalesce, which rewrites what it reads and so
+ * scans under a bstack_process_gen, this walk needs only the shared lock. No
  * allocator-level lock is taken.
  *
  * A malformed overhead word, or a zeroed tail left by a crashed extend, ends

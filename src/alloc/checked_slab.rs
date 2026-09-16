@@ -248,6 +248,10 @@ impl CheckedSlabBStackAllocator {
     const IN_USE_BIT: u64 = 0x8000_0000_0000_0000;
     /// Mask extracting the block-count field from an in-use overhead value.
     const BLOCKS_MASK: u64 = !Self::IN_USE_BIT;
+    /// How many times [`stats`](Self::stats) re-scans after a concurrent tail
+    /// discard invalidates the arena length it sampled.
+    #[cfg(feature = "atomic")]
+    const STATS_SHRINK_RETRIES: u32 = 4;
 
     /// Initialise a new `CheckedSlabBStackAllocator` over an empty `stack`.
     ///
@@ -1722,6 +1726,11 @@ impl CheckedSlabBStackAllocator {
     /// format only records how many `block_size` blocks a live allocation
     /// spans, not the length the caller asked for.
     ///
+    /// Blocks are classified as the recovery scan classifies them, except that
+    /// this walk does not read the free list, so a **leaked** block
+    /// (`overhead == 0` but unreachable from `free_head`) counts as free.
+    /// [`recover`](Self::recover) reclaims those.
+    ///
     /// Reads the whole arena in one [`BStack::get_batched_gen`] sequence
     /// under one held shared lock, so the counts are a consistent snapshot
     /// despite concurrent `alloc`/`dealloc`. No allocator-level lock is
@@ -1735,11 +1744,32 @@ impl CheckedSlabBStackAllocator {
     /// prefix that parsed cleanly — call [`recover`](Self::recover) first
     /// for an authoritative snapshot.
     pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
-        let stack_len = self.stack.len()?;
+        // The length is sampled outside the lock `get_batched_gen` holds, so a
+        // concurrent tail discard can leave the scan reading past the new end.
+        // Only a stale bound can raise `InvalidInput` here, so retry on it and
+        // surface anything else as the read failure it is.
+        let mut attempts = Self::STATS_SHRINK_RETRIES;
+        loop {
+            let stack_len = self.stack.len()?;
+            match self.stats_scan(stack_len) {
+                Ok(v) => return Ok(v),
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput && attempts > 0 => {
+                    attempts -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One linear arena scan for [`stats`](Self::stats), bounded by `stack_len`.
+    fn stats_scan(&self, stack_len: u64) -> io::Result<(u64, u64, u64, u64)> {
         if stack_len <= Self::ARENA_START {
             return Ok((0, 0, 0, 0));
         }
         let bs = self.block_size;
+        // `open` enforces a whole number of blocks; clamp rather than assume, so
+        // a torn tail truncates the walk instead of shortening a read.
+        let scan_end = Self::ARENA_START + (stack_len - Self::ARENA_START) / bs * bs;
         let mut free_blocks = 0u64;
         let mut free_bytes = 0u64;
         let mut in_use_blocks = 0u64;
@@ -1753,27 +1783,30 @@ impl CheckedSlabBStackAllocator {
             if pending {
                 pending = false;
                 let overhead = u64::from_le_bytes(word_buf);
-                if overhead & Self::IN_USE_BIT != 0 {
-                    let n = overhead & Self::BLOCKS_MASK;
-                    let valid = n != 0
-                        && n.checked_mul(bs)
-                            .and_then(|span| p.checked_add(span))
-                            .is_some_and(|end| end <= stack_len);
-                    if !valid {
-                        p = stack_len; // malformed: stop the scan here
-                        return None;
-                    }
-                    let span = n * bs;
-                    in_use_blocks += 1;
-                    in_use_bytes += span;
-                    p += span;
-                } else {
+                if overhead == 0 {
+                    // Free, or leaked: indistinguishable without the free list.
                     free_blocks += 1;
                     free_bytes += bs;
                     p += bs;
+                } else {
+                    // Same test recovery applies; the engulf check wants the
+                    // free list, which this walk lacks, so it gets an empty one.
+                    match self.valid_in_use(overhead, p, scan_end, &[]) {
+                        Some(n) => {
+                            let span = n * bs; // `valid_in_use` proved this fits
+                            in_use_blocks += 1;
+                            in_use_bytes += span;
+                            p += span;
+                        }
+                        // Suspicious: stop, reporting the clean prefix.
+                        None => {
+                            p = scan_end;
+                            return None;
+                        }
+                    }
                 }
             }
-            if p >= stack_len {
+            if p >= scan_end {
                 return None;
             }
             pending = true;
@@ -3104,6 +3137,86 @@ mod tests {
         let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
         let _s = alloc.alloc(30).unwrap();
         assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 48));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_stops_at_a_suspicious_overhead_word() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        // data_size = 24, block_size = 32; three live blocks.
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        let _a = alloc.alloc(24).unwrap();
+        let _b = alloc.alloc(24).unwrap();
+        let _c = alloc.alloc(24).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 3, 96));
+
+        // Neither 0 (free) nor a valid in-use marker: `classify` calls this
+        // `Suspicious`, and the scan must stop rather than read it as free.
+        let b_start = CheckedSlabBStackAllocator::ARENA_START + 32;
+        alloc.stack().set(b_start, 0x1234u64.to_le_bytes()).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 32));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_survives_a_concurrent_tail_discard() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        // A `dealloc` of the tail block discards it; one landing between the
+        // length sample and the read lock used to fail with `InvalidInput`.
+        const CHURN: usize = 4;
+        const ROUNDS: usize = 4000;
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(CheckedSlabBStackAllocator::new(stack, 24).unwrap());
+        let _keep: Vec<_> = (0..8).map(|_| alloc.alloc(24).unwrap()).collect();
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let churn: Vec<_> = (0..CHURN)
+            .map(|_| {
+                let a = Arc::clone(&alloc);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        if let Ok(s) = a.alloc(24) {
+                            let _ = a.dealloc(s);
+                        }
+                    }
+                    done.fetch_add(1, Ordering::Release);
+                })
+            })
+            .collect();
+
+        let mut runs = 0u64;
+        while done.load(Ordering::Acquire) < CHURN {
+            runs += 1;
+            let (_, _, in_use_blocks, _) = alloc
+                .stats()
+                .expect("stats must not fail under a concurrent tail discard");
+            // The 8 retained blocks are never freed, so they always show up.
+            assert!(in_use_blocks >= 8, "lost live blocks: {in_use_blocks}");
+        }
+        for h in churn {
+            h.join().unwrap();
+        }
+        assert!(runs > 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn stats_clamps_a_tail_that_is_not_a_whole_block() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        // data_size = 24, block_size = 32.
+        let alloc = CheckedSlabBStackAllocator::new(stack, 24).unwrap();
+        let _a = alloc.alloc(24).unwrap();
+        // A crashed `extend` can leave a partial block on the tail.
+        alloc.stack().extend(5).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 1, 32));
     }
 
     // ── concurrent (feature = "atomic") ───────────────────────────────────────

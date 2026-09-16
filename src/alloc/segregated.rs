@@ -183,6 +183,10 @@ impl SegregatedBStackAllocator {
     const SENTINEL: u64 = 0;
     /// High bit of the overhead word: set when a block is live.
     const IN_USE_BIT: u64 = 0x8000_0000_0000_0000;
+    /// How many times [`stats`](Self::stats) re-scans after a concurrent tail
+    /// discard invalidates the arena length it sampled.
+    #[cfg(feature = "atomic")]
+    const STATS_SHRINK_RETRIES: u32 = 4;
 
     /// Round a caller `len` up to the physical need `round_up(len + 8, 16)`.
     #[inline]
@@ -1327,10 +1331,11 @@ impl SegregatedBStackAllocator {
     /// retained excess above a request is counted as in-use bytes, not
     /// fragmentation.
     ///
-    /// Reads the whole arena in one [`BStack::get_batched_gen`] sequence, the
-    /// same lock [`coalesce`](Self::coalesce) holds across its scan, so the
-    /// counts are a consistent snapshot despite concurrent `alloc`/`dealloc`.
-    /// No allocator-level lock is taken.
+    /// Reads the whole arena in one [`BStack::get_batched_gen`] sequence, so
+    /// the counts are a consistent snapshot despite concurrent
+    /// `alloc`/`dealloc`. Unlike [`coalesce`](Self::coalesce), which rewrites
+    /// what it reads and so scans under a [`BStack::process_gen`], this walk
+    /// needs only the shared lock. No allocator-level lock is taken.
     ///
     /// # Errors
     ///
@@ -1341,10 +1346,32 @@ impl SegregatedBStackAllocator {
     /// [`coalesce`](Self::coalesce) (or the `unsafe` [`recover`](Self::recover))
     /// first for an authoritative snapshot.
     pub fn stats(&self) -> io::Result<(u64, u64, u64, u64)> {
-        let stack_len = self.stack.len()?;
+        // The length is sampled outside the lock `get_batched_gen` holds, so a
+        // concurrent tail discard can leave the scan reading past the new end.
+        // Only a stale bound can raise `InvalidInput` here, so retry on it and
+        // surface anything else as the read failure it is.
+        let mut attempts = Self::STATS_SHRINK_RETRIES;
+        loop {
+            let stack_len = self.stack.len()?;
+            match self.stats_scan(stack_len) {
+                Ok(v) => return Ok(v),
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput && attempts > 0 => {
+                    attempts -= 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// One linear arena scan for [`stats`](Self::stats), bounded by `stack_len`.
+    fn stats_scan(&self, stack_len: u64) -> io::Result<(u64, u64, u64, u64)> {
         if stack_len <= Self::ARENA_START {
             return Ok((0, 0, 0, 0));
         }
+        // `new` enforces a whole number of quanta; clamp rather than assume, so
+        // a torn tail truncates the walk instead of shortening a read. Every
+        // offset below `scan_end` then has QUANTUM (16) ≥ OVERHEAD (8) bytes.
+        let scan_end = Self::ARENA_START + ((stack_len - Self::ARENA_START) & !(Self::QUANTUM - 1));
         let mut free_blocks = 0u64;
         let mut free_bytes = 0u64;
         let mut in_use_blocks = 0u64;
@@ -1361,35 +1388,28 @@ impl SegregatedBStackAllocator {
                 if word == 0 {
                     // Zeroed tail from a crashed `extend`: stop (recover()
                     // and coalesce() both discard/skip this the same way).
-                    p = stack_len;
+                    p = scan_end;
                     return None;
                 }
-                // `size` is decoded from an on-disk word that a crash or
-                // corruption may have left arbitrary, so `size > stack_len -
-                // p` (never underflows: the read below only ever runs with
-                // `p < stack_len`) is used instead of `p + size > stack_len`,
-                // which could overflow for a `size` near `u64::MAX`.
+                // `size` comes off disk and may be arbitrary, so the fit test
+                // is `size > scan_end - p` (no underflow: `p < scan_end` here)
+                // rather than `p + size`, which could overflow. `<< 4` makes it
+                // a multiple of QUANTUM, so only the lower bound is left.
+                let size = (word & !Self::IN_USE_BIT) << 4;
+                if size < Self::QUANTUM || size > scan_end - p {
+                    p = scan_end; // malformed: stop the scan here
+                    return None;
+                }
                 if word & Self::IN_USE_BIT != 0 {
-                    let size = (word & !Self::IN_USE_BIT) << 4;
-                    if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
-                        p = stack_len; // malformed: stop the scan here
-                        return None;
-                    }
                     in_use_blocks += 1;
                     in_use_bytes += size;
-                    p += size;
                 } else {
-                    let size = word << 4;
-                    if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
-                        p = stack_len; // malformed: stop the scan here
-                        return None;
-                    }
                     free_blocks += 1;
                     free_bytes += size;
-                    p += size;
                 }
+                p += size;
             }
-            if Self::OVERHEAD > stack_len - p {
+            if p >= scan_end {
                 return None;
             }
             pending = true;
@@ -2970,6 +2990,64 @@ mod tests {
         // so it lands in the oversized bucket at its raw rounded size.
         let _s = a.alloc(5000).unwrap();
         assert_eq!(a.stats().unwrap(), (0, 0, 1, 5008));
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_survives_a_concurrent_tail_discard() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        // Freeing an *oversized* tail block discards it (a classed block only
+        // returns to its free list); one landing between the length sample and
+        // the read lock used to fail with `InvalidInput`.
+        const CHURN: usize = 4;
+        const ROUNDS: usize = 2000;
+        const OVERSIZED: u64 = 5000; // > MAX_CLASS, so dealloc discards the tail
+
+        let (a, _g) = new_alloc();
+        let alloc = Arc::new(a);
+        let _keep: Vec<_> = (0..8).map(|_| alloc.alloc(OVERSIZED).unwrap()).collect();
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let churn: Vec<_> = (0..CHURN)
+            .map(|_| {
+                let a = Arc::clone(&alloc);
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        if let Ok(s) = a.alloc(OVERSIZED) {
+                            let _ = a.dealloc(s);
+                        }
+                    }
+                    done.fetch_add(1, Ordering::Release);
+                })
+            })
+            .collect();
+
+        let mut runs = 0u64;
+        while done.load(Ordering::Acquire) < CHURN {
+            runs += 1;
+            let (_, _, in_use_blocks, _) = alloc
+                .stats()
+                .expect("stats must not fail under a concurrent tail discard");
+            assert!(in_use_blocks >= 8, "lost live blocks: {in_use_blocks}");
+        }
+        for h in churn {
+            h.join().unwrap();
+        }
+        assert!(runs > 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_clamps_a_tail_that_is_not_a_whole_quantum() {
+        let (a, _g) = new_alloc();
+        let _x = a.alloc(100).unwrap(); // physical size 112
+        // A crashed `extend` can leave the arena a non-multiple of QUANTUM.
+        a.stack().extend(4).unwrap();
+        assert_eq!(a.stats().unwrap(), (0, 0, 1, 112));
     }
 
     // ── classification math ──────────────────────────────────────────────────
