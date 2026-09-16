@@ -1067,6 +1067,39 @@ bstack_t *checked_slab_bstack_allocator_into_stack(
 uint64_t checked_slab_bstack_allocator_data_size(
     const checked_slab_bstack_allocator_t *alloc);
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Snapshot block occupancy: writes the free and in-use block counts and byte
+ * totals into the four out-pointers, any of which may be NULL to skip it.
+ *
+ * Byte totals count whole blocks, block_size each including the 8-byte
+ * overhead. The checked-slab format records how many blocks a live allocation
+ * spans and leaves the caller's requested length unrecorded.
+ *
+ * Blocks are classified as the recovery scan classifies them, with one
+ * difference: this walk reads block tags alone, which leaves a leaked block
+ * counted as free (overhead == 0, yet unreachable from free_head).
+ * checked_slab_bstack_allocator_recover reclaims those.
+ *
+ * The whole arena is read in one bstack_get_batched_gen sequence under one
+ * held shared lock. The counts are therefore a consistent snapshot even under
+ * concurrent alloc/dealloc, and the recovery lock stays free, as it does for
+ * alloc/dealloc themselves.
+ *
+ * A malformed overhead word ends the scan at that point. The returned counts
+ * then cover the arena prefix that parsed cleanly; call
+ * checked_slab_bstack_allocator_recover first for an authoritative snapshot.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus

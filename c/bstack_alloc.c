@@ -5794,6 +5794,105 @@ uint64_t checked_slab_bstack_allocator_data_size(
     return alloc->block_size - ALCK_OVERHEAD;
 }
 
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Retries of the stats scan after a concurrent tail discard invalidates the
+ * arena length it sampled. */
+#define ALCK_STATS_SHRINK_RETRIES 4
+
+struct alck_stats_ctx {
+    uint8_t  word_buf[8];
+    uint64_t block_size;
+    uint64_t scan_end;
+    uint64_t p;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* word_buf holds an unprocessed read from the last call */
+};
+
+static int alck_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alck_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t overhead = read_le64(c->word_buf);
+        c->pending = 0;
+        if (overhead == 0) {
+            /* Free, or leaked: indistinguishable without the free list. */
+            c->free_blocks++;
+            c->free_bytes += c->block_size;
+            c->p += c->block_size;
+        } else {
+            /* Same test recovery applies; the engulf check wants the free
+             * list, which this walk lacks, so it gets an empty one. */
+            uint64_t n = alck_valid_in_use(overhead, c->p, c->scan_end,
+                                           c->block_size, NULL, 0);
+            if (n == 0) {
+                c->p = c->scan_end; /* suspicious: stop at the clean prefix */
+                return 0;
+            }
+            c->in_use_blocks++;
+            c->in_use_bytes += n * c->block_size; /* proved to fit above */
+            c->p += n * c->block_size;
+        }
+    }
+    if (c->p >= c->scan_end) return 0;
+    c->pending  = 1;
+    *out_offset = c->p;
+    *out_buf    = c->word_buf;
+    *out_len    = 8;
+    return 1;
+}
+
+/*
+ * One linear arena scan, bounded by stack_len. The constructor enforces a
+ * whole number of blocks; clamp rather than assume, so a torn tail truncates
+ * the walk instead of shortening a read.
+ */
+static int alck_stats_scan(const checked_slab_bstack_allocator_t *alloc,
+                           uint64_t stack_len, struct alck_stats_ctx *c)
+{
+    memset(c, 0, sizeof *c);
+    c->block_size = alloc->block_size;
+    c->p          = ALCK_ARENA_START;
+    if (stack_len <= ALCK_ARENA_START) {
+        c->scan_end = ALCK_ARENA_START;
+        return 0;
+    }
+    c->scan_end = ALCK_ARENA_START
+                + (stack_len - ALCK_ARENA_START) / alloc->block_size
+                      * alloc->block_size;
+    if (c->p >= c->scan_end) return 0;
+    return bstack_get_batched_gen(alloc->bs, alck_stats_gen, c);
+}
+
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alck_stats_ctx c;
+    uint64_t stack_len;
+    int      attempts = ALCK_STATS_SHRINK_RETRIES;
+
+    for (;;) {
+        if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+        if (alck_stats_scan(alloc, stack_len, &c) == 0) break;
+        /* The length is sampled outside the lock bstack_get_batched_gen holds,
+         * so a concurrent tail discard can leave the scan reading past the new
+         * end. Only a stale bound can raise EINVAL here, so retry on it and
+         * surface anything else as the read failure it is. */
+        if (errno != EINVAL || attempts-- <= 0) return -1;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 #endif /* BSTACK_FEATURE_SET */
 
 #ifdef __cplusplus
