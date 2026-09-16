@@ -240,6 +240,29 @@ pub mod slice;
 pub use slice::BStackSliceWriter;
 pub use slice::{BStackSlice, BStackSliceReader};
 
+/// A point-in-time occupancy report, as returned by an allocator's `stats`.
+///
+/// What a *block* is differs by allocator, so the counts describe one
+/// allocator's arena and are not comparable across implementations. Each
+/// `stats` method documents its own unit, and whether a corrupt or
+/// un-recovered arena can cut the report short.
+///
+/// Byte totals are physical: they include each block's on-disk overhead, not
+/// just the length the caller asked for. `free_bytes + in_use_bytes` is
+/// therefore the arena size only when the whole arena parsed cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct BStackAllocStats {
+    /// Number of free blocks.
+    pub free_blocks: u64,
+    /// Bytes spanned by [`free_blocks`](Self::free_blocks).
+    pub free_bytes: u64,
+    /// Number of blocks in use.
+    pub in_use_blocks: u64,
+    /// Bytes spanned by [`in_use_blocks`](Self::in_use_blocks).
+    pub in_use_bytes: u64,
+}
+
 /// Reject a slice that was not issued by `allocator`.
 ///
 /// `op` names the calling method for the error message.  See the module's
