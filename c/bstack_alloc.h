@@ -1236,11 +1236,14 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
  * A plain slab block carries no per-block state — free blocks are only known by
  * chasing the singly-linked free list from free_head. This walks that list in
  * one bstack_get_batched_gen sequence, validating each node (in-bounds,
- * block_size-aligned, not already visited) as it goes; a malformed pointer or a
- * cycle ends the walk at that point, so the returned free count may undercount
- * on a corrupt list, but never overcounts or loops forever. in_use_blocks is
- * then (total_blocks - free_blocks), where total_blocks is the arena size
- * divided by block_size.
+ * block_size-aligned) as it goes. in_use_blocks is then
+ * (total_blocks - free_blocks), where total_blocks is the arena size divided by
+ * block_size.
+ *
+ * A list can hold at most total_blocks nodes, so the count doubles as the cycle
+ * bound and no visited set is needed. A malformed pointer ends the walk there;
+ * a cycle ends it at total_blocks, which reports the whole arena free rather
+ * than looping.
  *
  * Reads happen under one held shared lock, so the counts are a consistent
  * snapshot despite concurrent alloc/dealloc. This allocator carries no
