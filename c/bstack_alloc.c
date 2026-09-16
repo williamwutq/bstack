@@ -3989,7 +3989,9 @@ int first_fit_bstack_allocator_stats(
     if (bstack_len(alloc->bs, &c.stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
     c.pos = ALFF_ARENA_START;
 
-    if (bstack_get_batched_gen(alloc->bs, alff_stats_gen, &c) != 0) {
+    /* A stack truncated below the header would underflow stack_len - pos. */
+    if (c.stack_len > ALFF_ARENA_START
+        && bstack_get_batched_gen(alloc->bs, alff_stats_gen, &c) != 0) {
         MUTEX_UNLOCK(alloc); return -1;
     }
     MUTEX_UNLOCK(alloc);

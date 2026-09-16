@@ -6858,6 +6858,16 @@ mod first_fit_tests {
         alloc.dealloc(c).map_err(|e| e.source).unwrap();
         assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
     }
+
+    #[test]
+    fn stats_on_a_stack_truncated_under_the_header() {
+        let (alloc, path) = mk_ff("stats_short");
+        let _g = Guard(path);
+        // A stack cut below ARENA_START must report nothing rather than
+        // underflow the scan's `stack_len - pos`.
+        alloc.stack().discard(8).unwrap();
+        assert_eq!(alloc.stats().unwrap(), (0, 0, 0, 0));
+    }
 }
 
 // -------------------------------------------------------------------------

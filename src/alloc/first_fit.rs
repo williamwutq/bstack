@@ -1691,6 +1691,12 @@ impl FirstFitBStackAllocator {
         let _guard = self.lock.lock().unwrap();
 
         let stack_len = self.stack.len()?;
+        // The generator below subtracts `pos` from `stack_len` before any bound
+        // check, so a stack truncated under the header must not reach it. The
+        // sequential overload needs no guard: its `while pos < stack_len` is one.
+        if stack_len <= Self::ARENA_START {
+            return Ok((0, 0, 0, 0));
+        }
         let mut pos = Self::ARENA_START;
         let mut free_blocks = 0u64;
         let mut free_bytes = 0u64;
@@ -1779,9 +1785,7 @@ impl FirstFitBStackAllocator {
 
             let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE) {
                 Some(t)
-                    if size >= Self::MIN_BLOCK_PAYLOAD_SIZE
-                        && size % 8 == 0
-                        && t <= remaining =>
+                    if size >= Self::MIN_BLOCK_PAYLOAD_SIZE && size % 8 == 0 && t <= remaining =>
                 {
                     t
                 }
