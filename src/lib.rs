@@ -485,6 +485,13 @@
 //!   not a silent leak.  [`BStackBulkAllocError`] is its `dealloc_bulk`
 //!   counterpart, returning a `Vec` of the handles it did not free.
 //!
+//! * [`BStackAllocStats`] — occupancy report from an allocator's inherent
+//!   `stats` method: `free_blocks`, `free_bytes`, `in_use_blocks`,
+//!   `in_use_bytes`. Available on the first-fit and ghost-tree allocators, and
+//!   on the slab, checked-slab and segregated allocators with `atomic`. Each
+//!   allocator defines what a *block* is; the counts describe that one
+//!   allocator's arena. Byte totals are physical, per-block overhead included.
+//!
 //! * [`BStackRange`] — raw `(offset, len)` pair; `Copy`, no pointer, no I/O.
 //!   Serialises to/from `[u8; 16]` for persistent bookkeeping.
 //!

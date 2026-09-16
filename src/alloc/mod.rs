@@ -55,6 +55,10 @@
 //! * [`BStackOwnedSliceAllocator`] — convenience supertrait:
 //!   `BStackAllocator<Error = io::Error, Allocated<'a> = BStackOwnedSlice<'a, Self>>`.
 //!
+//! * [`BStackAllocStats`] — the occupancy report an allocator's inherent
+//!   `stats` method returns. Each allocator defines what a *block* is, which
+//!   keeps `stats` inherent. See [Occupancy reporting](#occupancy-reporting).
+//!
 //! * [`BStackByteVec`] — growable `u8` vector backed by a [`BStack`] allocation
 //!   (`alloc` + `set`).  16-byte header stores `len`/`cap` for crash recovery.
 //!
@@ -134,6 +138,33 @@
 //! when `A` implements the trait itself — it never fabricates the trait for an
 //! allocator that has no cheaper uninitialised path.
 //!
+//!
+//! # Occupancy reporting
+//!
+//! Five of the six allocators have an inherent `stats` method returning a
+//! [`BStackAllocStats`] from a single scan of the arena. It carries free and
+//! in-use block counts plus the bytes they span.
+//!
+//! It stays inherent because `in_use_blocks` means something different in each
+//! implementation, which is what the table records:
+//!
+//! | Allocator | `in_use_blocks` counts | Needs |
+//! |---|---|---|
+//! | [`FirstFitBStackAllocator`] | live blocks | — |
+//! | [`GhostTreeBstackAllocator`] | maximal contiguous live spans | — |
+//! | [`SlabBStackAllocator`] | `total_blocks - free_blocks` | `atomic` |
+//! | [`CheckedSlabBStackAllocator`] | live allocations, each spanning 1..n blocks | `atomic` |
+//! | [`SegregatedBStackAllocator`] | live blocks | `atomic` |
+//!
+//! The last three scan through [`BStack::get_batched_gen`], which the `atomic`
+//! feature gates; the first two use sequential reads without it. Byte totals
+//! are physical everywhere: per-block overhead counts, and a block left wider
+//! than its request counts in full.
+//!
+//! A scan reads the arena itself. A corrupt or un-recovered arena cuts the
+//! report short where the walk stops parsing. Each method documents its own
+//! stopping point. For [`DebugCheckingAllocator`], `stats` lives on the wrapped
+//! allocator, reached through [`inner`](DebugCheckingAllocator::inner).
 //!
 //! # Debug wrapper
 //!

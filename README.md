@@ -1242,6 +1242,20 @@ For detailed on-disk layouts, allocation policies, coalescing rules, crash
 consistency guarantees, and thread safety analysis for each allocator, see
 [algos/ALLOCATOR.md](algos/ALLOCATOR.md).
 
+### Occupancy reporting — `stats`
+
+Five of the six allocators have an inherent `stats` method that scans the arena
+once and returns a `BStackAllocStats`, carrying `free_blocks`, `free_bytes`,
+`in_use_blocks` and `in_use_bytes`. It is `#[non_exhaustive]`; construct it
+through `stats` or `Default`.
+
+Each allocator defines what a *block* is. The counts therefore describe that
+one allocator's arena. Every allocator section below states its own unit. Byte
+totals are physical everywhere, counting per-block overhead. A scan reads the
+arena itself. A corrupt or un-recovered arena cuts the report short at the point
+the walk stops parsing; see [algos/ALLOCATOR.md](algos/ALLOCATOR.md) for
+each walk.
+
 ### `LinearBStackAllocator`
 
 Bump allocator — regions appended sequentially to the tail.  `dealloc` on a
@@ -1262,6 +1276,8 @@ cross-edge grow/shrink is `Unsupported`.
 Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` via an internal
 `Mutex` serialising free-list mutations.
 
+`stats` counts live blocks, headers and footers included.
+
 ### `GhostTreeBstackAllocator` (`alloc + set`)
 
 AVL tree keyed on `(size, address)`; best-fit; zero per-allocation overhead.
@@ -1271,6 +1287,9 @@ free block; grows are `Unsupported`, as a headerless exact-size block has no
 neighbour tag to grow into without moving).  Without `atomic`: `Send` only.
 With `atomic`: `Send + Sync` via an internal `Mutex`.
 
+`stats` counts maximal contiguous live spans: a live allocation carries no
+header, leaving adjacent ones to read as a single span.
+
 ### `SlabBStackAllocator` (`alloc + set`)
 
 Fixed `block_size` slab; singly-linked free list; zero per-block overhead.
@@ -1278,6 +1297,9 @@ Constructors: `new(stack, block_size)` for a fresh stack, `open(stack)` to
 reattach.  Without `atomic`: `Send` only.  With `atomic`: `Send + Sync` with
 no allocator-level lock (uses `BStack::process_gen` / `cross_exchange`), and
 additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`).
+
+`stats` (`atomic`) reports `total_blocks - free_blocks` in use, derived from a
+walk of the free list.
 
 ### `CheckedSlabBStackAllocator` (`alloc + set`)
 
@@ -1288,6 +1310,9 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`), and
 additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`;
 freed batches leave only `recover`-reclaimable leaks on a crash).
+
+`stats` (`atomic`) counts live allocations, each spanning one or more blocks;
+leaked blocks count as free until `recover()`.
 
 ### `SegregatedBStackAllocator` (`alloc + set`)
 
@@ -1304,6 +1329,9 @@ alloc/dealloc; 8-byte overhead tag per block.  Single `new(stack)` constructor
 `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`; oversized requests matched
 largest-first against the oversized free list).
 
+`stats` (`atomic`) counts live blocks, each charged its whole physical size,
+including class slack retained above the request.
+
 ### `DebugCheckingAllocator` (`alloc`)
 
 Transparent debug wrapper that can be placed around any allocator.  Tracks
@@ -1312,6 +1340,8 @@ double-frees, partial-frees, and multi-span frees.  When the inner allocator
 reports a lost handle (`handle: None`), the region is removed from tracking
 entirely.  Intended for tests and debugging only — the O(n) overlap checks add
 significant per-operation overhead.
+
+`stats` lives on the wrapped allocator; reach it through `inner()`.
 
 ```rust
 use bstack::{BStack, BStackAllocator, DebugCheckingAllocator, LinearBStackAllocator};

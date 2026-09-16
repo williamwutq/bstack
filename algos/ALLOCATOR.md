@@ -180,6 +180,12 @@ Unlike `LinearBStackAllocator`, which uses optimistic `try_extend`/`try_discard`
 and reports a lost tail race as `Unsupported`, a contended `FirstFit` operation
 *blocks* on the mutex and proceeds once the lock is free.
 
+### Occupancy scan (`stats`)
+
+`stats()` strides the arena block by block, reading each header's `(size, is_free)` and charging the whole physical block to the free or in-use side. Header, payload and footer all count. It is the recovery walk in read-only form: a malformed size, or a block whose span would run past the arena end, stops the scan where the repairing walk would rewrite it, leaving the counts to describe the prefix that parsed cleanly. `new` runs the repairing walk when `recovery_needed` is set; reopening first gives an authoritative snapshot.
+
+With `atomic` the whole stride runs inside one `BStack::get_batched_gen` sequence held under the same internal `Mutex` that `alloc`/`dealloc` take, and a `stack_len <= ARENA_START` guard runs *before* the generator, because the closure subtracts `pos` from `stack_len` ahead of any bound check. Without `atomic` the allocator is `!Sync`, and the scan is a plain sequential loop whose `while pos < stack_len` condition is that same guard.
+
 ---
 
 ## `GhostTreeBstackAllocator` (`alloc + set` features)
@@ -274,6 +280,12 @@ serialises all AVL tree mutations; tail operations use
 atomically under `BStack`'s own write lock without holding the allocator
 mutex.
 
+### Occupancy scan (`stats`)
+
+Free blocks *are* AVL nodes: `free_blocks`/`free_bytes` come from an in-order walk of the tree. The collected `(ptr, size)` pairs are sorted by address and deduplicated by `ptr`, for the same reason `coalesce_and_rebalance` does it: a crash mid-rotation can leave one node reachable from two parents, and the walk would otherwise count it twice. A cycle in a corrupt tree drives the traversal past the maximum AVL depth, which is reported as `InvalidData`.
+
+A live allocation carries no header, leaving adjacent allocations to read as one run on disk. `in_use_blocks` therefore counts **maximal contiguous live spans**: the gaps between free nodes. The walk over the sorted list keeps its cursor monotone with `cursor.max(ptr + size)`, which leaves each gap counted once even where a corrupt node overlaps. `in_use_bytes` is the whole arena minus `free_bytes`.
+
 ---
 
 ## `SlabBStackAllocator` (`alloc + set` features)
@@ -345,6 +357,14 @@ With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. 
 |-----------------------------------------------|---------------|-------------------------------------------------------------------------------------------------------------------|
 | `SlabBStackAllocator::new(stack, block_size)` | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data.                     |
 | `SlabBStackAllocator::open(stack)`            | **non-empty** | Reads and validates the stored header; fails with `InvalidInput` if the stack is empty or has a mismatched magic. |
+
+### Occupancy scan (`stats`)
+
+A plain slab block carries no per-block state; chasing the singly-linked free list is the only way to tell that a block is free. `stats()` walks it from `free_head` inside one `BStack::get_batched_gen` sequence, validating every node before following it: not the sentinel, at or past `ARENA_START`, `block_size`-aligned, and below the clamped arena end. `in_use_blocks` is then `total_blocks - free_blocks`, for `total_blocks = (stack_len - ARENA_START) / block_size`.
+
+A well-formed list holds at most `total_blocks` nodes. That count alone bounds the walk and serves as the cycle check: a cycle ends it at `total_blocks`, reporting the arena as entirely free, and a malformed pointer ends it where it is found.
+
+`dealloc` truncates only the caller's own in-use blocks. Every free-list node therefore stays inside the arena, and the scan runs without the shrink retry the checked variants carry.
 
 ---
 
@@ -430,6 +450,14 @@ With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take
 | `CheckedSlabBStackAllocator::new(stack, data_size)` | **empty**     | Writes the 48-byte allocator header; fails with `InvalidInput` if the stack already has data or `data_size < 8`.                                                                                                                                                 |
 | `CheckedSlabBStackAllocator::open(stack)`           | **non-empty** | Reads and validates the stored header, then runs `recover()` automatically. Fails with `InvalidData` on magic mismatch, invalid block size, or misaligned arena.                                                                                                 |
 | `CheckedSlabBStackAllocator::recover()`             | any           | Reclaims leaked blocks and discards orphaned tails left by an unclean shutdown. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). Called automatically by `open`; exposed for explicit inspection or re-runs. |
+
+### Occupancy scan (`stats`)
+
+Each block carries an 8-byte overhead prefix, making `stats()` a linear stride that reads one word per block, inside one `BStack::get_batched_gen` sequence. Classification is the recovery scan's, through the same `valid_in_use` predicate: `0` is free, a valid in-use word yields the block count `n` the allocation spans and advances the cursor by `n * block_size`, and a rejected word stops the scan. The walk reads block tags alone, which leaves a **leaked** block counted as free: `overhead == 0`, yet unreachable from `free_head`. `recover()` reclaims those.
+
+The bound is clamped down to a whole number of blocks, `ARENA_START + (stack_len - ARENA_START) / block_size * block_size`, letting a torn tail truncate the walk instead of shortening a read.
+
+`stack_len` is sampled outside the shared lock the generator holds. A concurrent tail discard can therefore leave it stale, with the scan reading past the new end. Only a stale bound yields `InvalidInput` here; `stats()` retries on that kind up to `STATS_SHRINK_RETRIES` (4) times and surfaces any other error as the read failure it is.
 
 ---
 
@@ -586,3 +614,11 @@ then write without holding a lock across the pair).
 | `SegregatedBStackAllocator::new(stack)`       | **empty**     | Writes the header (magic + 33 zeroed heads) with one sparse extend to the arena start.                                                                                                                                                                                     |
 | `SegregatedBStackAllocator::new(stack)`       | **non-empty** | Validates the magic prefix and arena alignment, then runs `recover()` automatically before returning. Fails with `InvalidData`/`UnexpectedEof` on mismatch or misalignment.                                                                                                |
 | `unsafe SegregatedBStackAllocator::recover()` | any           | Reclaims leaks and discards orphaned tails. Returns the count of blocks that could not be classified with certainty (`0` = fully accounted for). `unsafe`: the caller must guarantee the allocator is quiescent (no concurrent operations). Called automatically by `new`. |
+
+### Occupancy scan (`stats`)
+
+Every block opens with an 8-byte overhead word holding its physical size and the in-use bit. `stats()` strides the arena one block at a time, decoding `size = (word & !IN_USE_BIT) << 4` and charging the whole physical span, overhead included, to the free or in-use side. The format persists the physical size alone, counting excess a size class retained above a request as in-use bytes.
+
+The bound is clamped to the quantum grid, `ARENA_START + ((stack_len - ARENA_START) & !(QUANTUM - 1))`, which also guarantees every offset below it has `QUANTUM` (16) ≥ `OVERHEAD` (8) bytes left. A zeroed tail from a crashed `extend`, or a size below `QUANTUM` or wider than the remaining arena, ends the scan there; `coalesce()` (or the `unsafe` `recover()`) first gives an authoritative snapshot.
+
+`coalesce` rewrites what it reads and must scan under `BStack::process_gen`; this walk reads only, and the shared lock of `BStack::get_batched_gen` suffices, with the allocator-level lock left free. It carries the same stale-`stack_len` retry as `CheckedSlabBStackAllocator`.
