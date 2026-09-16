@@ -1074,21 +1074,24 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
  *
  * Every block carries a header recording its size and an is_free flag, so a
  * linear scan strides through the arena classifying each block directly,
- * running the same walk the recovery scan does but without the repair. Byte
- * totals count the whole on-disk block (header, payload, and footer), not
- * just the caller's requested length, since a block may be larger than its
- * live request from a first-fit reuse.
+ * running the same walk the recovery scan does but without the repair: a
+ * malformed header, or too little space left for one, ends the scan there
+ * rather than being fixed, so the counts cover only the arena prefix that
+ * parsed cleanly. first_fit_bstack_allocator_new runs the repairing walk when
+ * the header's recovery_needed flag is set, so reopening the stack first gives
+ * an authoritative snapshot.
+ * Byte totals count the whole on-disk block (header, payload, and footer),
+ * not just the caller's requested length, since a block may be larger than
+ * its live request from a first-fit reuse.
  *
  * Under -DBSTACK_FEATURE_ATOMIC, every header in the scan is read inside one
- * bstack_get_batched_gen sequence -- a single lock acquisition for the whole
- * walk rather than one bstack_get per block -- additionally held under the
- * same internal lock the alloc/dealloc vtable functions take around their
- * free-list access, so the snapshot is consistent even under concurrent
- * mutation. Without it, plain sequential bstack_get calls are used.
+ * bstack_get_batched_gen sequence, held under the same internal lock the
+ * alloc/dealloc vtable functions take around their free-list access, so the
+ * snapshot is consistent even under concurrent mutation. Without it, plain
+ * sequential bstack_get calls are used.
  *
- * Returns 0 on success, -1 on I/O error (errno set). A malformed block
- * header, or too little space left for one, ends the scan at that point;
- * the returned counts cover only the arena prefix that parsed cleanly.
+ * Returns 0 on success, -1 on I/O error (errno set). A malformed block header
+ * is not an error; it truncates the scan.
  */
 BSTACK_WARN_UNUSED_RESULT
 int first_fit_bstack_allocator_stats(
