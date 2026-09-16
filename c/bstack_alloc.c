@@ -5483,17 +5483,37 @@ int ghost_tree_bstack_allocator_stats(
     MUTEX_LOCK(alloc);
     if (bstack_len(alloc->bs, &stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
     if (algt_read_root(alloc->bs, &root) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    errno = 0; /* the walk reports depth-exceeded without setting errno */
     algt_avl_walk_inorder(alloc->bs, root, &ctx);
     MUTEX_UNLOCK(alloc);
-    if (ctx.err) { free(ctx.blocks); errno = EINVAL; return -1; }
+    if (ctx.err) {
+        if (errno == 0) errno = EINVAL; /* depth exceeded: a corrupted tree */
+        free(ctx.blocks);
+        return -1;
+    }
 
+    /* Dedup for the same reason algt_coalesce_and_rebalance does: a partial
+     * rotation crash can leave a node reachable from two parents, and the
+     * in-order walk would then count it twice. */
     qsort(ctx.blocks, ctx.count, sizeof *ctx.blocks, algt_cmp_by_ptr);
+    {
+        size_t j = 0, k;
+        for (k = 0; k < ctx.count; k++) {
+            if (j == 0 || ctx.blocks[k].ptr != ctx.blocks[j - 1].ptr)
+                ctx.blocks[j++] = ctx.blocks[k];
+        }
+        ctx.count = j;
+    }
 
+    /* cursor only ever moves forward, so a corrupt overlapping node cannot
+     * rewind it and double-count the gap it already covered. */
     cursor = ALGT_ARENA_START;
     for (i = 0; i < ctx.count; i++) {
-        free_bytes += ctx.blocks[i].size;
-        if (ctx.blocks[i].ptr > cursor) in_use_blocks++;
-        cursor = ctx.blocks[i].ptr + ctx.blocks[i].size;
+        uint64_t ptr = ctx.blocks[i].ptr, size = ctx.blocks[i].size, end;
+        free_bytes = (size > UINT64_MAX - free_bytes) ? UINT64_MAX : free_bytes + size;
+        if (ptr > cursor) in_use_blocks++;
+        end = (size > UINT64_MAX - ptr) ? UINT64_MAX : ptr + size;
+        if (end > cursor) cursor = end;
     }
     if (cursor < stack_len) in_use_blocks++;
     arena_bytes = (stack_len > ALGT_ARENA_START) ? stack_len - ALGT_ARENA_START : 0;

@@ -1779,6 +1779,162 @@ static int test_concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates(void)
 /* A slice issued by one allocator instance must be refused by another: the
  * language cannot catch it, so the allocator does, at run time, before
  * touching any metadata.  See "Foreign slices" in bstack_alloc.h. */
+/* ---- stats ----------------------------------------------------------- */
+
+/* Mirrors the private layout in bstack_alloc.c: 48-byte header with the tree
+ * root at +40, and 32-byte AVL nodes with left/right at +16/+24. */
+#define GT_ARENA_START     48
+#define GT_ROOT_OFFSET     40
+#define GT_NODE_LEFT_OFF   16
+#define GT_NODE_RIGHT_OFF  24
+
+static uint64_t gt_get_le64(bstack_t *bs, uint64_t off)
+{
+    uint8_t b[8];
+    uint64_t v = 0;
+    int i;
+    if (bstack_get(bs, off, off + 8, b) != 0) return 0;
+    for (i = 7; i >= 0; i--) v = (v << 8) | b[i];
+    return v;
+}
+
+static int gt_set_le64(bstack_t *bs, uint64_t off, uint64_t v)
+{
+    uint8_t b[8];
+    int i;
+    for (i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (8 * i));
+    return bstack_set(bs, off, b, 8);
+}
+
+static int test_stats_empty_arena_is_all_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+static int test_stats_accepts_null_out_pointers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+
+    CHECK(ghost_tree_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+    uint64_t uy = 0;
+    CHECK(ghost_tree_bstack_allocator_stats(a, NULL, NULL, NULL, &uy) == 0);
+    CHECK(uy == 64);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+static int test_stats_single_allocation_is_one_in_use_span(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 64);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+static int test_stats_counts_free_nodes_and_in_use_spans(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 32, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &z) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* y sits between two live spans: one free node, two in-use spans. */
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 32 && ub == 2 && uy == 64);
+
+    /* x is not the tail, so it becomes a second free node; GhostTree never
+     * merges free neighbours live, only on the next open's coalesce. */
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 64 && ub == 1 && uy == 32);
+
+    /* z is the tail: dealloc discards it instead of inserting a node. */
+    CHECK(bstack_allocator_dealloc(al, z) == 0);
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 64 && ub == 0 && uy == 0);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
+static int test_stats_dedups_a_node_reachable_from_two_parents(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t w, x, y, z;
+    CHECK(bstack_allocator_alloc(al, 32, &w) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 32, &z) == 0);
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* x and y are adjacent free nodes between two live spans (w and z). */
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 64 && ub == 2 && uy == 64);
+
+    /* A partial rotation crash can leave one node reachable from two parents;
+     * point both of the root's child slots at the same node. */
+    uint64_t root = gt_get_le64(bs, GT_ROOT_OFFSET);
+    CHECK(root != 0);
+    uint64_t left  = gt_get_le64(bs, root + GT_NODE_LEFT_OFF);
+    uint64_t right = gt_get_le64(bs, root + GT_NODE_RIGHT_OFF);
+    uint64_t child = left ? left : right;
+    CHECK(child != 0);
+    CHECK(gt_set_le64(bs, root + GT_NODE_LEFT_OFF,  child) == 0);
+    CHECK(gt_set_le64(bs, root + GT_NODE_RIGHT_OFF, child) == 0);
+
+    /* The in-order walk now visits `child` twice; dedup keeps the counts
+     * honest, as it does in the coalesce-and-rebalance path. */
+    CHECK(ghost_tree_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 64 && ub == 2 && uy == 64);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp); return 0;
+}
+
 static int test_foreign_slice_is_rejected(void)
 {
     char t1[64], t2[64];
@@ -1888,6 +2044,13 @@ int main(void)
     T(test_concurrent_realloc_hammers_tail_paths);
     T(test_concurrent_alloc_bulk_dealloc_bulk_no_live_duplicates);
 #endif
+
+    /* stats */
+    T(test_stats_empty_arena_is_all_zero);
+    T(test_stats_accepts_null_out_pointers);
+    T(test_stats_single_allocation_is_one_in_use_span);
+    T(test_stats_counts_free_nodes_and_in_use_spans);
+    T(test_stats_dedups_a_node_reachable_from_two_parents);
 
     T(test_foreign_slice_is_rejected);
 

@@ -1140,12 +1140,13 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
  * contiguous live byte spans between the free nodes. in_use_bytes is the
  * total arena size minus free_bytes.
  *
- * The walk runs under the same internal lock the alloc/dealloc vtable
- * functions take around their own tree access, so the snapshot is
- * consistent even under concurrent mutation.
+ * Under -DBSTACK_FEATURE_ATOMIC the walk runs under the same internal lock the
+ * alloc/dealloc vtable functions take around their own tree access, so the
+ * snapshot is consistent even under concurrent mutation. Without it the
+ * allocator is single-threaded, so no lock is needed.
  *
- * Returns 0 on success, -1 on error (errno set): an I/O error from the
- * underlying bstack reads, or EINVAL if the tree traversal exceeds the
+ * Returns 0 on success, -1 on error (errno set): the errno of the failing
+ * bstack read or allocation, or EINVAL if the tree traversal exceeds the
  * maximum AVL depth (a cycle from a corrupted tree).
  */
 BSTACK_WARN_UNUSED_RESULT
