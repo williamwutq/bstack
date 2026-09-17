@@ -1,4 +1,4 @@
-use super::{BStackAllocator, BStackSlice, ensure_own_slice};
+use super::{BStackAllocStats, BStackAllocator, BStackSlice, ensure_own_slice};
 use crate::BStack;
 #[cfg(not(feature = "atomic"))]
 use std::cell::Cell;
@@ -938,6 +938,163 @@ impl FirstFitBStackAllocator {
         // clear (e.g. an out-of-range free_head in `new`), so write 0 directly rather than via
         // the CAS clear, which under the `atomic` feature would fail when the flag is not 1.
         self.stack.set(Self::OFFSET_SIZE + 8, [0u8; 4].as_slice())
+    }
+
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
+    ///
+    /// Every block carries a header recording its size and an `is_free` flag,
+    /// which lets a linear scan stride the arena classifying each block
+    /// directly. It is the recovery walk in read-only form: a malformed
+    /// header, or too little space left for one, stops the scan where the
+    /// repairing walk would rewrite it, leaving the counts to describe the
+    /// arena prefix that parsed cleanly. [`new`](Self::new) runs the repairing
+    /// walk when the header's `recovery_needed` flag is set; reopening the
+    /// stack first therefore gives an authoritative snapshot.
+    ///
+    /// Byte totals count the whole on-disk block: header, payload and footer.
+    /// A first-fit reuse can leave a block wider than the request it serves,
+    /// and that excess counts in full.
+    ///
+    /// Under `atomic` every header is read inside one
+    /// [`BStack::get_batched_gen`] sequence, held under the same internal lock
+    /// [`alloc`](BStackAllocator::alloc)/[`dealloc`](BStackAllocator::dealloc)
+    /// take around their free-list access, so the snapshot is consistent even
+    /// under concurrent mutation. Without `atomic` the allocator is `!Sync`,
+    /// and the scan is a plain sequential walk that runs unlocked.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
+    /// block header truncates the scan; the call still succeeds.
+    #[cfg(feature = "atomic")]
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
+        let _guard = self.lock.lock().unwrap();
+
+        let stack_len = self.stack.len()?;
+        // The generator below subtracts `pos` from `stack_len` before any bound
+        // check, so a stack truncated under the header must not reach it. The
+        // sequential overload needs no guard: its `while pos < stack_len` is one.
+        if stack_len <= Self::ARENA_START {
+            return Ok(BStackAllocStats::default());
+        }
+        let mut pos = Self::ARENA_START;
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+        let mut hdr_buf = [0u8; 16];
+        // Set once a read has been issued; the *next* call processes the
+        // buffer it filled before issuing (or declining) the next one.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                pending = false;
+                let size = read_buf_le!(hdr_buf, 0 => u64);
+                let is_free = hdr_buf[8] & 1 != 0;
+                // `pos <= stack_len` is a loop invariant, so this cannot underflow.
+                let remaining = stack_len - pos;
+
+                let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE) {
+                    Some(t)
+                        if size >= Self::MIN_BLOCK_PAYLOAD_SIZE
+                            && size % 8 == 0
+                            && t <= remaining =>
+                    {
+                        t
+                    }
+                    // Malformed header: stop, best-effort.
+                    _ => return None,
+                };
+
+                if is_free {
+                    free_blocks += 1;
+                    free_bytes += block_total;
+                } else {
+                    in_use_blocks += 1;
+                    in_use_bytes += block_total;
+                }
+                pos += block_total;
+            }
+            if stack_len - pos < Self::BLOCK_OVERHEAD_SIZE {
+                return None; // partial tail, or arena exhausted: stop
+            }
+            pending = true;
+            // `get_batched_gen` wants a `&'a mut [u8]` for an `'a` it chooses,
+            // which the borrow checker refuses to derive from a closure
+            // capture. Reborrowing through a raw pointer extends the lifetime
+            // and nothing else.
+            //
+            // SAFETY: `hdr_buf` is declared before this call and never moved,
+            // so it outlives the whole sequence; each buffer is consumed before
+            // the closure runs again, so no other access overlaps it.
+            let scratch: &mut [u8] = &mut hdr_buf[..];
+            Some((pos, unsafe { &mut *(scratch as *mut [u8]) }))
+        })?;
+
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
+    }
+
+    /// Snapshot block occupancy as a [`BStackAllocStats`].
+    ///
+    /// See the `atomic` overload of this method for the field semantics. This
+    /// allocator is `!Sync` without `atomic`, and the scan is a plain
+    /// sequential walk that runs unlocked.
+    ///
+    /// # Errors
+    ///
+    /// Any [`io::Error`] from the underlying [`BStack`] reads. A malformed
+    /// block header truncates the scan; the call still succeeds.
+    #[cfg(not(feature = "atomic"))]
+    pub fn stats(&self) -> io::Result<BStackAllocStats> {
+        let stack_len = self.stack.len()?;
+        let mut pos = Self::ARENA_START;
+        let mut free_blocks = 0u64;
+        let mut free_bytes = 0u64;
+        let mut in_use_blocks = 0u64;
+        let mut in_use_bytes = 0u64;
+
+        while pos < stack_len {
+            let remaining = stack_len - pos;
+            if remaining < Self::BLOCK_OVERHEAD_SIZE {
+                break; // partial tail: stop, best-effort
+            }
+
+            let mut hdr_buf = [0u8; 16];
+            self.stack.get_into(pos, &mut hdr_buf)?;
+            let size = read_buf_le!(hdr_buf, 0 => u64);
+            let is_free = hdr_buf[8] & 1 != 0;
+
+            let block_total = match size.checked_add(Self::BLOCK_OVERHEAD_SIZE) {
+                Some(t)
+                    if size >= Self::MIN_BLOCK_PAYLOAD_SIZE && size % 8 == 0 && t <= remaining =>
+                {
+                    t
+                }
+                // Malformed header: stop, best-effort.
+                _ => break,
+            };
+
+            if is_free {
+                free_blocks += 1;
+                free_bytes += block_total;
+            } else {
+                in_use_blocks += 1;
+                in_use_bytes += block_total;
+            }
+            pos += block_total;
+        }
+
+        Ok(BStackAllocStats {
+            free_blocks,
+            free_bytes,
+            in_use_blocks,
+            in_use_bytes,
+        })
     }
 }
 

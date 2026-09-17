@@ -2245,6 +2245,135 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
     return bs;
 }
 
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Every header in the scan is read inside one bstack_get_batched_gen sequence,
+ * in addition to the allocator's own MUTEX_LOCK, which serialises the walk
+ * against concurrent alloc/dealloc. */
+struct alff_stats_ctx {
+    uint8_t  hdr_buf[16];
+    uint64_t stack_len;
+    uint64_t pos;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* hdr_buf holds an unprocessed read from the last call */
+};
+
+static int alff_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alff_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t size, block_total, remaining;
+        int is_free;
+        c->pending = 0;
+        size    = read_le64(c->hdr_buf);
+        is_free = c->hdr_buf[8] & 1;
+        /* pos <= stack_len is a loop invariant, so this cannot underflow. */
+        remaining = c->stack_len - c->pos;
+
+        /* Malformed header: stop, best-effort. */
+        if (size < ALFF_MIN_PAYLOAD || size % 8 != 0
+            || size > UINT64_MAX - ALFF_BLOCK_OVERHEAD) {
+            return 0;
+        }
+        block_total = size + ALFF_BLOCK_OVERHEAD;
+        if (block_total > remaining) return 0;
+
+        if (is_free) {
+            c->free_blocks++;
+            c->free_bytes += block_total;
+        } else {
+            c->in_use_blocks++;
+            c->in_use_bytes += block_total;
+        }
+        c->pos += block_total;
+    }
+    /* Partial tail from a crashed write, or arena exhausted: stop. */
+    if (c->stack_len - c->pos < ALFF_BLOCK_OVERHEAD) return 0;
+    c->pending  = 1;
+    *out_offset = c->pos;
+    *out_buf    = c->hdr_buf;
+    *out_len    = 16;
+    return 1;
+}
+
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alff_stats_ctx c;
+
+    MUTEX_LOCK(alloc);
+    memset(&c, 0, sizeof c);
+    if (bstack_len(alloc->bs, &c.stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    c.pos = ALFF_ARENA_START;
+
+    /* A stack truncated below the header would underflow stack_len - pos. */
+    if (c.stack_len > ALFF_ARENA_START
+        && bstack_get_batched_gen(alloc->bs, alff_stats_gen, &c) != 0) {
+        MUTEX_UNLOCK(alloc); return -1;
+    }
+    MUTEX_UNLOCK(alloc);
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
+    return 0;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    uint64_t stack_len, pos;
+    uint64_t free_blocks = 0, free_bytes = 0, in_use_blocks = 0, in_use_bytes = 0;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+
+    pos = ALFF_ARENA_START;
+    while (pos < stack_len) {
+        uint64_t remaining = stack_len - pos;
+        uint8_t  hdr_buf[16];
+        uint64_t size, block_total;
+        int      is_free;
+
+        /* Partial tail from a crashed write: stop, best-effort. */
+        if (remaining < ALFF_BLOCK_OVERHEAD) break;
+
+        if (bstack_get(alloc->bs, pos, pos + 16, hdr_buf) != 0) return -1;
+        size    = read_le64(hdr_buf);
+        is_free = hdr_buf[8] & 1;
+
+        /* Malformed header: stop, best-effort. */
+        if (size < ALFF_MIN_PAYLOAD || size % 8 != 0
+            || size > UINT64_MAX - ALFF_BLOCK_OVERHEAD) {
+            break;
+        }
+        block_total = size + ALFF_BLOCK_OVERHEAD;
+        if (block_total > remaining) break;
+
+        if (is_free) {
+            free_blocks++;
+            free_bytes += block_total;
+        } else {
+            in_use_blocks++;
+            in_use_bytes += block_total;
+        }
+        pos += block_total;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_bytes;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * Mutex helpers shared by ghost_tree, slab, and checked_slab allocators.
  * Mirrors the pattern used by first_fit_bstack_allocator_t.
