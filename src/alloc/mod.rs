@@ -78,6 +78,17 @@
 //! `RefUnwindSafe` with it, and the only interior mutability is the
 //! [`BStack`](crate::BStack)'s own poisoning lock.
 //!
+//! * [`BStackAllocStats`] — the occupancy report an allocator's inherent
+//!   `stats` method returns: free and in-use block counts plus the bytes they
+//!   span, from a single scan of the arena. Each allocator defines what a
+//!   *block* is, which keeps `stats` inherent. [`FirstFitBStackAllocator`]
+//!   and [`GhostTreeBstackAllocator`] provide it in every build;
+//!   [`SlabBStackAllocator`] and [`CheckedSlabBStackAllocator`] scan through
+//!   [`BStack::get_batched_gen`], so theirs needs `atomic`.
+//!   [`LinearBStackAllocator`] has none, and [`DebugCheckingAllocator`] leaves
+//!   it on the wrapped allocator, reached through
+//!   [`inner`](DebugCheckingAllocator::inner).
+//!
 //! * [`BStackByteVec`] — a growable byte (`u8`) vector backed by a
 //!   [`BStack`] allocation (requires both `alloc` **and** `set`).  Mirrors the
 //!   core [`Vec<u8>`] API: `push`, `pop`, `get`, `read_bytes`, `as_slice`,

@@ -822,6 +822,22 @@ alloc.dealloc(slice)?;             // release (tail → O(1) discard)
 let stack = alloc.into_stack();    // reclaim the BStack
 ```
 
+### Occupancy reporting — `stats`
+
+Each allocator but `LinearBStackAllocator` has an inherent `stats` method that
+scans its arena once and returns a `BStackAllocStats`, carrying `free_blocks`,
+`free_bytes`, `in_use_blocks` and `in_use_bytes`. It is `#[non_exhaustive]`;
+construct it through `stats` or `Default`.
+
+Each allocator defines what a *block* is. The counts therefore describe that one
+allocator's arena, and every allocator section below documents its own unit and
+its own walk. Byte totals are physical everywhere, counting per-block overhead. A
+scan reads the arena itself, so a corrupt or un-recovered arena cuts the report
+short at the point the walk stops parsing.
+
+The C surface mirrors this as `<allocator>_bstack_allocator_stats`, taking the
+four counts as out-parameters, any of which may be NULL to skip it.
+
 ### `LinearBStackAllocator`
 
 The reference bump allocator.  Regions are appended sequentially to the tail.
@@ -940,6 +956,27 @@ Unlike `LinearBStackAllocator`, which uses optimistic `try_extend`/`try_discard`
 and reports a lost tail race as `Unsupported`, a contended `FirstFit` operation
 *blocks* on the mutex and proceeds once the lock is free.
 
+#### Occupancy scan (`stats`)
+
+Every block carries a header recording its size and an `is_free` flag, which lets
+a linear scan stride the arena classifying each block directly. It is the
+recovery walk in read-only form: a malformed header, or too little space left for
+one, stops the scan where the repairing walk would rewrite it, leaving the counts
+to describe the arena prefix that parsed cleanly. `new` runs the repairing walk
+when `recovery_needed` is set; reopening the stack first therefore gives an
+authoritative snapshot.
+
+`in_use_blocks` counts live blocks. Byte totals count the whole on-disk block:
+header, payload and footer. A first-fit reuse can leave a block wider than the
+request it serves, and that excess counts in full.
+
+With `atomic` the whole stride runs inside one `BStack::get_batched_gen` sequence
+held under the same internal `Mutex` that `alloc`/`dealloc` take, and a
+`stack_len <= ARENA_START` guard runs before the generator, because the closure
+subtracts `pos` from `stack_len` ahead of any bound check. Without `atomic` the
+allocator is `!Sync`, and the scan is a plain sequential loop whose
+`while pos < stack_len` condition is that same guard.
+
 #### Example
 
 ```rust
@@ -1034,6 +1071,25 @@ serialises all AVL tree mutations; tail operations use
 atomically under `BStack`'s own write lock without holding the allocator
 mutex.
 
+#### Occupancy scan (`stats`)
+
+Free blocks *are* AVL nodes: `free_blocks`/`free_bytes` come from an in-order
+walk of the tree. The collected `(ptr, size)` pairs are sorted by address and
+deduplicated by `ptr`, for the same reason the coalesce path does it: a crash
+mid-rotation can leave one node reachable from two parents, and the walk would
+otherwise count it twice. A cycle in a corrupt tree drives the traversal past the
+maximum AVL depth, which is reported as `InvalidData`.
+
+A live allocation carries no header, leaving adjacent allocations to read as one
+run on disk. `in_use_blocks` therefore counts maximal contiguous live spans: the
+gaps between free nodes. The walk over the sorted list keeps its cursor monotone
+with `cursor.max(ptr + size)`, which leaves each gap counted once even where a
+corrupt node overlaps. `in_use_bytes` is the whole arena minus `free_bytes`.
+
+With `atomic` the walk runs under the same internal lock `alloc` and `dealloc`
+take around their own tree access. Without it the allocator is `!Sync`, and the
+walk runs unlocked.
+
 #### Example
 
 ```rust
@@ -1112,6 +1168,23 @@ Each free-list mutation is two `BStack` calls: write the next-pointer into the b
 Without the `atomic` feature it is **not `Sync`**: free-list mutations require a read then a write of `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access that can result in two callers receiving the same block.
 
 With the `atomic` feature it **is `Sync`** with no allocator-level lock at all. Free-list pop drives a single `BStack::process_gen` sequence that holds `BStack`'s write lock across the read of `free_head`, the read of the popped block's `next` pointer, and the write that advances `free_head` — closing the ABA window a `get`/`cas` pair would leave open. Free-list push splices a single block (or a whole freed run) onto the head with one `BStack::cross_exchange`. Tail grow/shrink use `try_extend_zeros` / `try_discard`, which check-and-act atomically under `BStack`'s own write lock. Every concurrent `&self` operation is therefore safe through `BStack`'s interior mutability alone — no `Mutex`.
+
+#### Occupancy scan (`stats`, `atomic`)
+
+A plain slab block carries no per-block state; chasing the singly-linked free
+list from `free_head` is the only way to tell that a block is free. `stats` walks
+it in one `BStack::get_batched_gen` sequence, validating each node before
+following it: in bounds, and `block_size`-aligned. `in_use_blocks` is then
+`total_blocks - free_blocks`, for `total_blocks` the arena size divided by
+`block_size`.
+
+A list holds at most `total_blocks` nodes. That count alone bounds the walk and
+serves as the cycle check: a malformed pointer ends it where it is found, and a
+cycle ends it at `total_blocks`, reporting the whole arena free.
+
+`dealloc` truncates only the caller's own in-use blocks, so every free-list node
+stays inside the arena and the scan runs without a shrink retry. The batched read
+requires `atomic`, which is why `stats` appears only in that build.
 
 #### Constructors
 
@@ -1214,6 +1287,26 @@ Without the `atomic` feature it is **not `Sync`**: free-list mutations read then
 
 With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). The one retained `Mutex` is held only by `recover`, to keep recovery single-flight (two concurrent runs could otherwise reclaim the same leaked block twice); the recovery scan itself is serialised against alloc/dealloc/realloc by the `BStack` write lock it holds across one `process_gen` sequence, not by the `Mutex`.
 
+#### Occupancy scan (`stats`, `atomic`)
+
+Each block carries an 8-byte overhead prefix, making `stats` a linear stride that
+reads one word per block inside one `BStack::get_batched_gen` sequence.
+Classification is the recovery scan's, through the same `valid_in_use` predicate:
+`0` is free, a valid in-use word yields the block count `n` the allocation spans
+and advances the cursor by `n * block_size`, and a rejected word stops the scan.
+The walk reads block tags alone, which leaves a leaked block counted as free:
+`overhead == 0`, yet unreachable from `free_head`. `recover` reclaims those.
+
+The bound is clamped down to a whole number of blocks, letting a torn tail
+truncate the walk instead of shortening a read. `stack_len` is sampled outside
+the shared lock the generator holds. A concurrent tail discard can therefore
+leave it stale, with the scan reading past the new end; only a stale bound yields
+`InvalidInput` here, so `stats` retries on that kind up to four times and
+surfaces any other error as the read failure it is.
+
+`in_use_blocks` counts live allocations, each spanning one or more blocks. Byte
+totals count whole blocks, `block_size` each including the overhead.
+
 #### Constructors
 
 | Constructor | Stack | Effect |
@@ -1263,6 +1356,8 @@ The tracking state is **in-memory only** and is reset on process restart, so it
 complements but does not replace the allocator's own crash-safety guarantees.
 
 > **Warning:** Not for production use. The in-memory tracking state adds significant overhead, so this wrapper is intended only for debugging and testing. You should not rely on it to detect double-frees or overlapping allocations in production.
+
+`stats` lives on the wrapped allocator; reach it through `inner()`.
 
 ---
 

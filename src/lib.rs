@@ -375,6 +375,13 @@
 //!   [`BStackSlice`], implementing [`io::Read`] and [`io::Seek`] in the
 //!   slice's coordinate space.
 //!
+//! * [`BStackAllocStats`] — occupancy report from an allocator's inherent
+//!   `stats` method: `free_blocks`, `free_bytes`, `in_use_blocks`,
+//!   `in_use_bytes`. Available on the first-fit and ghost-tree allocators, and
+//!   on the slab and checked-slab allocators with `atomic`. Each allocator
+//!   defines what a *block* is; the counts describe that one allocator's
+//!   arena. Byte totals are physical, per-block overhead included.
+//!
 //! * [`LinearBStackAllocator`] — reference bump allocator that appends regions
 //!   sequentially.  `realloc` is O(1) for the tail allocation and returns
 //!   `Unsupported` for non-tail slices.  `dealloc` reclaims the tail via
