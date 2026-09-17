@@ -2470,7 +2470,8 @@ mod tests {
         // A `dealloc` of the tail block discards it; one landing between the
         // length sample and the read lock used to fail with `InvalidInput`.
         const CHURN: usize = 4;
-        const ROUNDS: usize = 4000;
+        const ROUNDS: usize = 200;
+        const MAX_OBSERVATIONS: u64 = 10_000;
 
         let (stack, path) = empty_stack();
         let _g = Guard(path);
@@ -2494,7 +2495,7 @@ mod tests {
             .collect();
 
         let mut runs = 0u64;
-        while done.load(Ordering::Acquire) < CHURN {
+        while done.load(Ordering::Acquire) < CHURN && runs < MAX_OBSERVATIONS {
             runs += 1;
             let stats = alloc
                 .stats()
@@ -2505,6 +2506,8 @@ mod tests {
                 "lost live blocks: {}",
                 stats.in_use_blocks
             );
+            // The walk holds the shared lock; let the writers in between calls.
+            std::thread::yield_now();
         }
         for h in churn {
             h.join().unwrap();

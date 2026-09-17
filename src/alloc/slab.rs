@@ -1360,8 +1360,16 @@ mod tests {
         // A multi-block `dealloc` discards the tail. `dealloc` only truncates
         // the caller's own in-use blocks, so a free-list node can never be left
         // past the arena end and this walk needs no shrink retry.
+        //
+        // A 2-block request is never served from the free list, which holds
+        // single blocks in address order, so each round appends to the tail and
+        // frees two blocks no later round can reuse: both the arena and the free
+        // list grow with `ROUNDS`, and `stats` walks the whole list every call.
+        // Keep the round count in line with the other concurrent tests here, and
+        // bound the observer so the walk cannot outrun the churn.
         const CHURN: usize = 4;
-        const ROUNDS: usize = 4000;
+        const ROUNDS: usize = 200;
+        const MAX_OBSERVATIONS: u64 = 10_000;
 
         let (stack, path) = empty_stack();
         let _g = Guard(path);
@@ -1384,7 +1392,9 @@ mod tests {
             })
             .collect();
 
-        while done.load(Ordering::Acquire) < CHURN {
+        let mut runs = 0u64;
+        while done.load(Ordering::Acquire) < CHURN && runs < MAX_OBSERVATIONS {
+            runs += 1;
             let stats = alloc
                 .stats()
                 .expect("stats must not fail under a concurrent tail discard");
@@ -1394,9 +1404,12 @@ mod tests {
                 stats.free_blocks,
                 stats.in_use_blocks
             );
+            // The walk holds the shared lock; let the writers in between calls.
+            std::thread::yield_now();
         }
         for h in churn {
             h.join().unwrap();
         }
+        assert!(runs > 0, "stats never ran alongside the churn");
     }
 }

@@ -1098,7 +1098,7 @@ static int test_stats_clamps_tail_that_is_not_a_whole_block(void)
 /* --- stats against a concurrent tail discard -------------------------- */
 
 #define CSL_STATS_CHURN_THREADS 4
-#define CSL_STATS_CHURN_ITERS   4000
+#define CSL_STATS_CHURN_ITERS   200
 
 typedef struct {
     bstack_allocator_t *a;
