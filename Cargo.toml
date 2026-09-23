@@ -79,7 +79,7 @@ required-features = ["set", "atomic"]
 
 [dev-dependencies]
 rand = "0.10.1"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "locked_region"
