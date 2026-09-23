@@ -827,7 +827,9 @@ let stack = alloc.into_stack();    // reclaim the BStack
 Each allocator but `LinearBStackAllocator` has an inherent `stats` method that
 scans its arena once and returns a `BStackAllocStats`, carrying `free_blocks`,
 `free_bytes`, `in_use_blocks` and `in_use_bytes`. It is `#[non_exhaustive]`;
-construct it through `stats` or `Default`.
+construct it through `stats` or `Default`. It derives `Debug`, `Clone`, `Copy`,
+`PartialEq`, `Eq`, `Hash`, and `Default`; two snapshots are equal (and hash
+equal) iff all four counts match.
 
 Each allocator defines what a *block* is. The counts therefore describe that one
 allocator's arena, and every allocator section below documents its own unit and

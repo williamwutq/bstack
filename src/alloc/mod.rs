@@ -261,7 +261,7 @@ pub use slice::{BStackSlice, BStackSliceReader};
 /// Byte totals are physical: they include each block's on-disk overhead, not
 /// just the length the caller asked for. `free_bytes + in_use_bytes` is
 /// therefore the arena size only when the whole arena parsed cleanly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub struct BStackAllocStats {
     /// Number of free blocks.
