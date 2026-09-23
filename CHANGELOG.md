@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`GhostTreeBstackAllocator::stats` (Rust) / `ghost_tree_bstack_allocator_stats` (C) (`alloc` + `set`; `atomic` additionally serialises the walk against concurrent `alloc`/`dealloc`).** Reports a `BStackAllocStats`, the C form as four out-parameters. A free block is exactly an AVL tree node, so `free_blocks`/`free_bytes` come from an in-order tree walk; a live allocation carries no header, so individual allocations sitting back to back cannot be told apart, and `in_use_blocks` instead counts the number of maximal contiguous live byte spans between the free nodes. `in_use_bytes` is the total arena size minus `free_bytes`.
 - **`FirstFitBStackAllocator::stats` (Rust) / `first_fit_bstack_allocator_stats` (C) (`alloc` + `set`; `atomic` additionally batches the walk under one `BStack::get_batched_gen`/`bstack_get_batched_gen` sequence and serialises it against concurrent `alloc`/`dealloc`).** Reports a `BStackAllocStats`, the C form as four out-parameters. Every block already carries a header recording its size and an `is_free` flag, so a linear scan strides through the arena classifying each block directly, running the same walk `recovery` does but without the repair. Byte totals count the whole on-disk block (header, payload, and footer).
 
+### Fixed
+
+- **32-bit targets (Rust): moving, copying, or repeat-filling 4 GiB or more hung forever, including in `open`'s recovery.** The remaining `u64` byte count was cast to `usize` before capping it at the chunk size, which could truncate the step to zero. The cap now applies in `u64` first. The C port was unaffected.
+- **32-bit glibc, uclibc, and Android: lock-free reads at offsets of 2 GiB or more failed or read the wrong bytes.** Rust now reads through `read_exact_at`, which uses `pread64`. C now defines `_FILE_OFFSET_BITS 64`, and its I/O wrappers fail with `EOVERFLOW` instead of truncating an offset.
+- **Windows: single reads of 4 GiB or more failed.** Rust and C now split them into `DWORD`-sized chunks, and C also does this for writes.
+- **Crash recovery now rolls back two kinds of corrupt journal instead of misbehaving (Rust and C).** A committed length near `u64::MAX` used to overflow and could truncate the file into its header; it is now clamped to the file size. A `Repeat` journal with a zero count skipped its range check, and on 32-bit C an oversized pattern length truncated.
+
 ## [0.4.5] - 2026-09-15
 
 ### Changed

@@ -114,25 +114,13 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
 /// concurrent writer can touch those bytes.
 #[cfg(unix)]
 pub(crate) fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[filled..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - filled,
-                (offset + filled as u64) as libc::off_t,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io_error!(UnexpectedEof, "locked pread: unexpected EOF"));
-        }
-        filled += n as usize;
-    }
-    Ok(())
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow the fd as a `File` (never closed) to reuse std's `read_exact_at`,
+    // which uses `pread64` where `off_t` is 32-bit (e.g. 32-bit glibc).
+    // SAFETY: `fd` stays open for the call; `ManuallyDrop` prevents closing it.
+    let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    file.read_exact_at(buf, offset)
 }
 
 /// Lock-free positional read using a raw Windows HANDLE.
@@ -155,7 +143,7 @@ pub(crate) fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8])
             ReadFile(
                 handle,
                 buf[filled..].as_mut_ptr(),
-                (len - filled) as u32,
+                (len - filled).min(u32::MAX as usize) as u32,
                 &mut bytes_read,
                 &mut overlapped,
             )
@@ -318,7 +306,8 @@ pub(crate) fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::R
     let mut buf = vec![0u8; cap];
     let mut done = 0u64;
     while done < n {
-        let take = ((n - done) as usize).min(cap);
+        // `min` in u64 first: casting the remainder could truncate to 0 on 32-bit.
+        let take = (n - done).min(cap as u64) as usize;
         read_at(file, src + done, &mut buf[..take])?;
         write_at(file, dst + done, &buf[..take])?;
         done += take as u64;
@@ -476,6 +465,8 @@ pub(crate) fn recover_wip(
     wip_aux: u64,
     raw_size: u64,
 ) -> io::Result<u64> {
+    // Clamp a corrupt on-disk length so `HEADER_SIZE + committed_len` cannot overflow.
+    let committed_len = committed_len.min(raw_size.saturating_sub(HEADER_SIZE));
     let tail_start = HEADER_SIZE + committed_len;
     let tail_len = raw_size.saturating_sub(tail_start);
     // Committed length after recovery; only a splice changes it.
@@ -502,6 +493,7 @@ pub(crate) fn recover_wip(
                 let s_len = tail_len - 8;
                 let total = k.saturating_mul(s_len);
                 if s_len > 0
+                    && k > 0
                     && wip_ptr >= HEADER_SIZE
                     && wip_ptr.saturating_add(total) <= tail_start
                     && let Ok(s_len_usize) = usize::try_from(s_len)
@@ -714,7 +706,7 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     }
     let mut done = 0u64;
     while done < total {
-        let take = ((total - done) as usize).min(buf.len());
+        let take = (total - done).min(buf.len() as u64) as usize;
         file.seek(SeekFrom::Start(phys + done))?;
         file.write_all(&buf[..take])?;
         done += take as u64;
@@ -1339,7 +1331,7 @@ fn write_pattern(file: &mut File, pattern: &[u8], phase: usize, len: u64) -> io:
     // is a valid prefix of it.
     let mut done = 0u64;
     while done < len {
-        let take = ((len - done) as usize).min(buf.len());
+        let take = (len - done).min(buf.len() as u64) as usize;
         file.write_all(&buf[..take])?;
         done += take as u64;
     }

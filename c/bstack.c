@@ -10,6 +10,8 @@
 #  define _DEFAULT_SOURCE
 #  define _POSIX_C_SOURCE 200809L
 #  define _XOPEN_SOURCE 700
+/* 64-bit off_t on 32-bit glibc/uclibc, so offsets past 2 GiB don't truncate. */
+#  define _FILE_OFFSET_BITS 64
 #endif
 
 #include "bstack.h"
@@ -192,15 +194,19 @@ static inline int plat_file_size(bstack_fd_t h, uint64_t *out)
 static inline int plat_pwrite(bstack_fd_t h, const void *buf, size_t count,
                        uint64_t offset)
 {
-    if (count == 0) return 0;
-    if (count > (size_t)MAXDWORD) { errno = EINVAL; return -1; }
-    OVERLAPPED ov;
-    memset(&ov, 0, sizeof ov);
-    ov.Offset     = (DWORD)(offset & 0xFFFFFFFFU);
-    ov.OffsetHigh = (DWORD)(offset >> 32);
-    DWORD nw = 0;
-    if (!WriteFile(h, buf, (DWORD)count, &nw, &ov)) { win_set_errno(); return -1; }
-    if (nw != (DWORD)count) { errno = EIO; return -1; }
+    const uint8_t *p = (const uint8_t *)buf;
+    /* WriteFile takes a DWORD length: split counts of 4 GiB or more. */
+    while (count > 0) {
+        DWORD chunk = (count > (size_t)MAXDWORD) ? MAXDWORD : (DWORD)count;
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
+        ov.Offset     = (DWORD)(offset & 0xFFFFFFFFU);
+        ov.OffsetHigh = (DWORD)(offset >> 32);
+        DWORD nw = 0;
+        if (!WriteFile(h, p, chunk, &nw, &ov)) { win_set_errno(); return -1; }
+        if (nw != chunk) { errno = EIO; return -1; }
+        p += chunk; offset += chunk; count -= chunk;
+    }
     return 0;
 }
 
@@ -208,21 +214,26 @@ static inline int plat_pwrite(bstack_fd_t h, const void *buf, size_t count,
 static inline int plat_pread(bstack_fd_t h, void *buf, size_t count,
                       uint64_t offset)
 {
-    if (count == 0) return 0;
-    if (count > (size_t)MAXDWORD) { errno = EINVAL; return -1; }
-    OVERLAPPED ov;
-    memset(&ov, 0, sizeof ov);
-    ov.Offset     = (DWORD)(offset & 0xFFFFFFFFU);
-    ov.OffsetHigh = (DWORD)(offset >> 32);
-    DWORD nr = 0;
-    if (!ReadFile(h, buf, (DWORD)count, &nr, &ov)) { win_set_errno(); return -1; }
-    if (nr != (DWORD)count) { errno = EIO; return -1; }
+    uint8_t *p = (uint8_t *)buf;
+    /* ReadFile takes a DWORD length: split counts of 4 GiB or more. */
+    while (count > 0) {
+        DWORD chunk = (count > (size_t)MAXDWORD) ? MAXDWORD : (DWORD)count;
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
+        ov.Offset     = (DWORD)(offset & 0xFFFFFFFFU);
+        ov.OffsetHigh = (DWORD)(offset >> 32);
+        DWORD nr = 0;
+        if (!ReadFile(h, p, chunk, &nr, &ov)) { win_set_errno(); return -1; }
+        if (nr != chunk) { errno = EIO; return -1; }
+        p += chunk; offset += chunk; count -= chunk;
+    }
     return 0;
 }
 
 /* Truncate (or extend) the file to exactly `size` bytes. */
 static inline int plat_ftruncate(bstack_fd_t h, uint64_t size)
 {
+    if (size > (uint64_t)INT64_MAX) { errno = EFBIG; return -1; }
     LARGE_INTEGER li;
     li.QuadPart = (LONGLONG)size;
     if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) { win_set_errno(); return -1; }
@@ -261,11 +272,23 @@ static inline int plat_file_size(bstack_fd_t fd, uint64_t *out)
     return 0;
 }
 
+/* Convert a file offset to off_t, failing (EOVERFLOW) instead of truncating
+ * where off_t is narrower (a 32-bit build without large-file support). */
+static inline int to_off_t(uint64_t v, off_t *out)
+{
+    off_t o = (off_t)v;
+    if (o < 0 || (uint64_t)o != v) { errno = EOVERFLOW; return -1; }
+    *out = o;
+    return 0;
+}
+
 static inline int plat_pwrite(bstack_fd_t fd, const void *buf, size_t count,
                        uint64_t offset)
 {
     if (count == 0) return 0;
-    ssize_t r = pwrite(fd, buf, count, (off_t)offset);
+    off_t off;
+    if (to_off_t(offset, &off) != 0) return -1;
+    ssize_t r = pwrite(fd, buf, count, off);
     if (r < 0) return -1;
     if ((size_t)r != count) { errno = EIO; return -1; }
     return 0;
@@ -275,7 +298,9 @@ static inline int plat_pread(bstack_fd_t fd, void *buf, size_t count,
                       uint64_t offset)
 {
     if (count == 0) return 0;
-    ssize_t r = pread(fd, buf, count, (off_t)offset);
+    off_t off;
+    if (to_off_t(offset, &off) != 0) return -1;
+    ssize_t r = pread(fd, buf, count, off);
     if (r < 0) return -1;
     if ((size_t)r != count) { errno = EIO; return -1; }
     return 0;
@@ -283,7 +308,9 @@ static inline int plat_pread(bstack_fd_t fd, void *buf, size_t count,
 
 static inline int plat_ftruncate(bstack_fd_t fd, uint64_t size)
 {
-    return ftruncate(fd, (off_t)size);
+    off_t off;
+    if (to_off_t(size, &off) != 0) return -1;
+    return ftruncate(fd, off);
 }
 
 #endif /* _WIN32 */
@@ -528,6 +555,10 @@ static int recover_wip(bstack_fd_t fd, uint64_t committed_len,
                        uint64_t wip_ptr, uint64_t wip_aux,
                        uint64_t raw_size, uint64_t *out_clen)
 {
+    /* Clamp a corrupt on-disk length so HEADER_SIZE + committed_len cannot wrap. */
+    uint64_t actual_len = (raw_size >= HEADER_SIZE) ? (raw_size - HEADER_SIZE) : 0;
+    if (committed_len > actual_len)
+        committed_len = actual_len;
     uint64_t tail_start = HEADER_SIZE + committed_len;
     uint64_t tail_len   = (raw_size > tail_start) ? (raw_size - tail_start) : 0;
     uint64_t final_clen = committed_len; /* only a splice changes it */
@@ -552,7 +583,9 @@ static int recover_wip(bstack_fd_t fd, uint64_t committed_len,
                 return -1;
             uint64_t k = decode_le64(kbuf);
             uint64_t s_len = tail_len - 8;
-            if (s_len > 0 && k <= UINT64_MAX / s_len) {
+            /* k == 0 would skip the range check; s_len must fit size_t. */
+            if (s_len > 0 && s_len <= SIZE_MAX && k > 0 &&
+                k <= UINT64_MAX / s_len) {
                 uint64_t total = k * s_len;
                 if (wip_ptr >= HEADER_SIZE &&
                     committed_len >= total &&
