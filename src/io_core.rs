@@ -66,14 +66,6 @@ const MA_REPEAT: u64 = 1;
 /// *Multi-atrunc journal* Cycle blocks in `algos/WIP.md`.
 const MA_CYCLE: u64 = 2;
 
-/// Round `n` up to the next multiple of 8. Multi-atrunc blocks are 8-aligned so a
-/// [`MA_CYCLE`] counter update is a non-tearing 8-byte write (an 8-aligned `u64`
-/// lies within one [`ATOMIC_BLOCK`], since `8` divides `256`).
-#[inline]
-const fn align8(n: u64) -> u64 {
-    (n + 7) & !7
-}
-
 // ------------------------------------------- OS Primitives -------------------------------------------
 
 /// Read `len` bytes from absolute file position `offset` without modifying
@@ -406,18 +398,14 @@ pub(crate) enum WipAux {
     /// `[s, e)`. See [`journaled_multi_set`] and [`recover_multi_write`].
     MultiWrite = u64::MAX - 5,
     /// Multi-region, length-changing commit: several non-overlapping in-place
-    /// writes that together also change the payload length (allocate-then-link,
-    /// the batched analogue of `atrunc`/`splice`). Unlike [`MultiWrite`](WipAux::MultiWrite)
-    /// it is armed with `wip_ptr == HEADER_SIZE + clen'` (**non-zero**, carrying
-    /// the new committed length, which recovery cannot derive from the file size
-    /// once more than one region is staged). The staged tail runs from
-    /// `HEADER_SIZE + max(clen, clen')` to `file_size` as a back-to-back sequence
-    /// of tagged blocks — a literal `[s | e | 0 | data]` or a compact repeat
-    /// `[s | e | 1 | phase | plen | pattern]` that stages `O(pattern)` bytes
-    /// rather than the `e - s` expansion; recovery replays each into `[s, e)`
-    /// (`e <= clen'`) and commits `clen'`. Destructive before its commit point, so
-    /// it is gated behind the format magic (WIP.md Rule 2). See
-    /// [`journaled_multi_atrunc`] and [`recover_multi_atrunc`].
+    /// edits that together also change the payload length (the batched analogue of
+    /// `atrunc`/`splice`). Armed with `wip_ptr == HEADER_SIZE + clen'` (**non-zero**,
+    /// carrying the new length, which recovery cannot derive from the file size
+    /// once more than one region is staged). The staged tail is a sequence of
+    /// tagged blocks (literal, repeat, or cycle; see the *Multi-atrunc journal* in
+    /// `algos/WIP.md`). Destructive before its commit point, so it is gated behind
+    /// the format magic (WIP.md Rule 2). See [`journaled_multi_atrunc`] and
+    /// [`recover_multi_atrunc`].
     MultiAtrunc = u64::MAX - 6,
 }
 
@@ -1300,15 +1288,21 @@ pub(crate) enum MaSpec<'a> {
 /// 24-byte `[a | b | kind]` header plus the kind's payload: the `e - s` literal
 /// bytes, the `16 + pattern.len()` repeat descriptor, or `8 + 8k + n` for a cycle
 /// (counter, `k` offsets, and the one-region snapshot).
+///
+/// `None` if the (padded) length would overflow `u64` — the caller aborts staging.
 #[cfg(all(feature = "set", feature = "atomic"))]
 #[inline]
-fn ma_block_len(spec: &MaSpec) -> u64 {
+fn ma_block_len(spec: &MaSpec) -> Option<u64> {
     let raw = match spec {
-        MaSpec::Write(_, OverlayData::Literal(x)) => 24 + x.len() as u64,
-        MaSpec::Write(_, OverlayData::Repeat { pattern, .. }) => 24 + 16 + pattern.len() as u64,
-        MaSpec::Cycle { offsets, n } => 24 + 8 + 8 * offsets.len() as u64 + n,
+        MaSpec::Write(_, OverlayData::Literal(x)) => 24u64.checked_add(x.len() as u64)?,
+        MaSpec::Write(_, OverlayData::Repeat { pattern, .. }) => {
+            40u64.checked_add(pattern.len() as u64)?
+        }
+        MaSpec::Cycle { offsets, n } => 32u64
+            .checked_add((offsets.len() as u64).checked_mul(8)?)?
+            .checked_add(*n)?,
     };
-    align8(raw)
+    raw.checked_next_multiple_of(8)
 }
 
 /// Run (or resume) a cyclic rotation's ordered steps, persisting progress after
@@ -1378,25 +1372,34 @@ pub(crate) fn journaled_multi_atrunc(
     clen_new: u64,
     specs: &[MaSpec],
 ) -> io::Result<()> {
+    let overflow = || io_error!(InvalidData, "journaled_multi_atrunc: staging overflow");
     let old_clen = *clen;
     // Staging base, rounded up to 8 so `32 + s_base` — and thus every 8-padded
     // block start — is 8-aligned (a `Cycle` counter write must not tear).
-    let s_base = align8(old_clen.max(clen_new));
-    // Total staged bytes (each block padded to 8), guarding against a (practically
-    // impossible) overflow.
+    let s_base = old_clen
+        .max(clen_new)
+        .checked_next_multiple_of(8)
+        .ok_or_else(overflow)?;
+    // Per-block padded lengths (each overflow-checked); reused for staging and
+    // replay. Their running sum is the staged tail size.
+    let mut block_lens = Vec::with_capacity(specs.len());
     let mut staged_len = 0u64;
     for spec in specs {
-        staged_len = staged_len
-            .checked_add(ma_block_len(spec))
-            .ok_or_else(|| io_error!(InvalidData, "journaled_multi_atrunc: staging overflow"))?;
+        let blen = ma_block_len(spec).ok_or_else(overflow)?;
+        staged_len = staged_len.checked_add(blen).ok_or_else(overflow)?;
+        block_lens.push(blen);
     }
     // 1. Extend to hold the new payload and the staged tail. `set_len` realises the
     //    grow region and every inter-block padding byte as sparse zero. Stage each
     //    block 8-aligned at `[32 + s_base, ...)`; a cycle snapshots its overwritten
     //    region file→file from the (still-original) payload.
-    file.set_len(HEADER_SIZE + s_base + staged_len)?;
+    let raw_size = HEADER_SIZE
+        .checked_add(s_base)
+        .and_then(|x| x.checked_add(staged_len))
+        .ok_or_else(overflow)?;
+    file.set_len(raw_size)?;
     let mut pos = HEADER_SIZE + s_base;
-    for spec in specs {
+    for (spec, &blen) in specs.iter().zip(&block_lens) {
         file.seek(SeekFrom::Start(pos))?;
         match spec {
             MaSpec::Write(offset, d) => {
@@ -1440,7 +1443,7 @@ pub(crate) fn journaled_multi_atrunc(
                 move_chunked(file, offsets[offsets.len() - 1], snap_logical, *n)?;
             }
         }
-        pos += ma_block_len(spec);
+        pos += blen;
     }
     durable_sync(file)?;
     // 2. Arm, carrying `clen_new` in `wip_ptr` (non-zero — recovery reads the new
@@ -1452,7 +1455,7 @@ pub(crate) fn journaled_multi_atrunc(
     //    literal/repeat replay is idempotent from the immutable backup; a cycle
     //    runs its ordered, resumable steps (each internally syncs).
     let mut pos = HEADER_SIZE + s_base;
-    for spec in specs {
+    for (spec, &blen) in specs.iter().zip(&block_lens) {
         match spec {
             MaSpec::Write(offset, OverlayData::Literal(x)) => write_at(file, *offset, x)?,
             MaSpec::Write(
@@ -1473,7 +1476,7 @@ pub(crate) fn journaled_multi_atrunc(
                 replay_cycle(file, offsets, *n, counter_logical, snap_logical, k)?;
             }
         }
-        pos += ma_block_len(spec);
+        pos += blen;
     }
     durable_sync(file)?;
     // 4. Commit the new length while disarming, in one atomic header write.
@@ -1568,7 +1571,7 @@ fn walk_multi_atrunc_blocks(
                         len: fill,
                     },
                 )?;
-                cursor = align8(payload_phys + fill);
+                cursor = (payload_phys + fill).next_multiple_of(8);
             }
             MA_REPEAT => {
                 if e < s || e > clen_new {
@@ -1602,7 +1605,7 @@ fn walk_multi_atrunc_blocks(
                         len: fill,
                     },
                 )?;
-                cursor = align8(pattern_phys + plen);
+                cursor = (pattern_phys + plen).next_multiple_of(8);
             }
             MA_CYCLE => {
                 // Header slots carry `a = n` (region length), `b = k` (cycle length).
@@ -1659,7 +1662,7 @@ fn walk_multi_atrunc_blocks(
                         snap_logical: (offsets_phys + 8 * k) - HEADER_SIZE,
                     },
                 )?;
-                cursor = align8(offsets_phys + 8 * k + n);
+                cursor = (offsets_phys + 8 * k + n).next_multiple_of(8);
             }
             _ => return Ok(false),
         }
@@ -1692,9 +1695,15 @@ pub(crate) fn recover_multi_atrunc(
     clen_new: u64,
     raw_size: u64,
 ) -> io::Result<bool> {
-    // Matches the writer's 8-aligned staging base.
-    let s_base = align8(committed_len.max(clen_new));
-    let tail_start = HEADER_SIZE + s_base;
+    // Matches the writer's 8-aligned staging base; a length so large it overflows
+    // is a corrupt header — treat it as malformed (roll back).
+    let Some(tail_start) = committed_len
+        .max(clen_new)
+        .checked_next_multiple_of(8)
+        .and_then(|s_base| HEADER_SIZE.checked_add(s_base))
+    else {
+        return Ok(false);
+    };
     // Pass 1: validate without touching the payload.
     let valid = walk_multi_atrunc_blocks(file, clen_new, tail_start, raw_size, |_, _| Ok(()))?;
     if valid {
