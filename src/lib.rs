@@ -750,14 +750,6 @@ use std::os::unix::io::RawFd;
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, ReadFile,
-};
-#[cfg(windows)]
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// On-disk **format** version encoded in the magic header. This is independent
 /// of the crate version: it bumps only when the file format changes in a way an
