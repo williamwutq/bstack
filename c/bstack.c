@@ -1349,7 +1349,60 @@ bstack_t *bstack_open_locked_up_to_cached(const char *path, uint64_t n)
  * bstack_set  (only compiled with -DBSTACK_FEATURE_SET)
  * ---------------------------------------------------------------------- */
 
+/* Cap, in bytes, on the buffer the streaming fill/copy helpers use, so a large
+ * bstack_repeat/bstack_zero/bstack_copy stays O(min(chunk, region)) in memory
+ * instead of materialising the whole region.  Matches the 0.4.x line's
+ * MOVE_CHUNK. */
+#define BSTACK_IO_CHUNK 4096u
+
 #ifdef BSTACK_FEATURE_SET
+/* Fill [phys, phys + count*pattern_len) with count back-to-back copies of
+ * pattern, streaming through a buffer of whole copies bounded by
+ * BSTACK_IO_CHUNK.  phys is an absolute file offset; pattern_len >= 1 and
+ * count >= 1; total = count*pattern_len does not overflow (caller-checked).
+ * Returns 0 on success, -1 (errno set) on failure.
+ *
+ * Because the buffer is an exact number of copies of pattern and the total is
+ * count*pattern_len, every chunk boundary lands on a copy boundary, so the
+ * tiling stays aligned even on the final short write. */
+static int write_repeated_at(bstack_fd_t fd, uint64_t phys,
+                             const uint8_t *pattern, size_t pattern_len,
+                             uint64_t count)
+{
+    uint64_t total = (uint64_t)pattern_len * count;
+    /* Pack as many whole copies of pattern as fit under the chunk cap (at
+     * least one), capped at count. */
+    uint64_t copies = BSTACK_IO_CHUNK / (uint64_t)pattern_len;
+    if (copies == 0)
+        copies = 1;
+    if (copies > count)
+        copies = count;
+    size_t buf_len = (size_t)(copies * (uint64_t)pattern_len);
+    uint8_t *buf = (uint8_t *)malloc(buf_len);
+    if (!buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    for (size_t i = 0; i < buf_len; i += pattern_len)
+        memcpy(buf + i, pattern, pattern_len);
+
+    uint64_t done = 0;
+    while (done < total) {
+        size_t take = buf_len;
+        if (total - done < (uint64_t)take)
+            take = (size_t)(total - done);
+        if (plat_pwrite(fd, buf, take, phys + done) != 0) {
+            int sv = errno;
+            free(buf);
+            errno = sv;
+            return -1;
+        }
+        done += take;
+    }
+    free(buf);
+    return 0;
+}
+
 int bstack_set(bstack_t *bs, uint64_t offset,
                const uint8_t *data, size_t len)
 {
@@ -1437,20 +1490,12 @@ int bstack_zero(bstack_t *bs, uint64_t offset, size_t n)
         return -1;
     }
 
-    /* Allocate a buffer of zeros and write it. */
-    uint8_t *zeros = calloc(n, 1);
-    if (!zeros) {
-        BS_WRUNLOCK(bs);
-        errno = ENOMEM;
-        return -1;
+    /* Stream the zero-fill through a bounded buffer (no journal). */
+    {
+        uint8_t z = 0;
+        if (write_repeated_at(bs->fd, HEADER_SIZE + offset, &z, 1, (uint64_t)n) != 0)
+            goto fail_unlock;
     }
-
-    if (plat_pwrite(bs->fd, zeros, n, HEADER_SIZE + offset) != 0) {
-        free(zeros);
-        goto fail_unlock;
-    }
-
-    free(zeros);
 
     if (plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
@@ -1488,13 +1533,6 @@ int bstack_repeat(bstack_t *bs, uint64_t offset,
         return -1;
     }
     uint64_t end = offset + total;
-#if UINT64_MAX > SIZE_MAX
-    if (total > (uint64_t)SIZE_MAX) {
-        errno = EINVAL;
-        return -1;
-    }
-#endif
-    size_t total_sz = (size_t)total;
 
     BS_WRLOCK(bs);
 
@@ -1517,21 +1555,9 @@ int bstack_repeat(bstack_t *bs, uint64_t offset,
         return -1;
     }
 
-    /* Stage the whole expanded region (no journal) and write it in one pass. */
-    uint8_t *buf = (uint8_t *)malloc(total_sz);
-    if (!buf) {
-        BS_WRUNLOCK(bs);
-        errno = ENOMEM;
-        return -1;
-    }
-    for (size_t i = 0; i < total_sz; i += pattern_len)
-        memcpy(buf + i, pattern, pattern_len);
-
-    if (plat_pwrite(bs->fd, buf, total_sz, HEADER_SIZE + offset) != 0) {
-        free(buf);
+    /* Stream the fill through a bounded buffer (no journal). */
+    if (write_repeated_at(bs->fd, HEADER_SIZE + offset, pattern, pattern_len, count) != 0)
         goto fail_unlock;
-    }
-    free(buf);
 
     if (plat_durable_sync(bs->fd) != 0)
         goto fail_unlock;
@@ -2656,6 +2682,45 @@ fail_unlock:
     return -1;
 }
 
+/* Copy n bytes from absolute file offset src to dst, streaming through a stack
+ * buffer bounded by BSTACK_IO_CHUNK (O(1) memory).  Overlap-safe with memmove
+ * semantics: runs backwards when dst > src, forwards otherwise, so a source
+ * byte is never clobbered before it is read.  n >= 1.  Caller holds the write
+ * lock.  Returns 0 on success, -1 (errno set) on failure. */
+static int move_chunked(bstack_fd_t fd, uint64_t src, uint64_t dst, uint64_t n)
+{
+    uint8_t buf[BSTACK_IO_CHUNK];
+    if (dst <= src) {
+        /* Forward: reads run ahead of the writes, so overlap is safe. */
+        uint64_t done = 0;
+        while (done < n) {
+            size_t take = sizeof buf;
+            if (n - done < (uint64_t)take)
+                take = (size_t)(n - done);
+            if (plat_pread(fd, buf, take, src + done) != 0)
+                return -1;
+            if (plat_pwrite(fd, buf, take, dst + done) != 0)
+                return -1;
+            done += take;
+        }
+    } else {
+        /* Backward: dst > src, so copy the tail chunk first to avoid
+         * clobbering source bytes not yet read. */
+        uint64_t done = n;
+        while (done > 0) {
+            size_t take = sizeof buf;
+            if (done < (uint64_t)take)
+                take = (size_t)done;
+            done -= take;
+            if (plat_pread(fd, buf, take, src + done) != 0)
+                return -1;
+            if (plat_pwrite(fd, buf, take, dst + done) != 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
 int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n)
 {
     if (n > UINT64_MAX - from) { errno = EINVAL; return -1; }
@@ -2681,20 +2746,12 @@ int bstack_copy(bstack_t *bs, uint64_t from, uint64_t to, uint64_t n)
         return 0;
     }
 
-#if UINT64_MAX > SIZE_MAX
-    if (n > (uint64_t)SIZE_MAX) { BS_WRUNLOCK(bs); errno = EINVAL; return -1; }
-#endif
-    uint8_t *buf = (uint8_t *)malloc((size_t)n);
-    if (!buf) goto fail_unlock;
-
-    if (plat_pread(bs->fd,  buf, (size_t)n, HEADER_SIZE + from) != 0 ||
-        plat_pwrite(bs->fd, buf, (size_t)n, HEADER_SIZE + to)   != 0 ||
-        plat_durable_sync(bs->fd) != 0)
-    {
-        free(buf);
+    /* Stream the copy through a bounded buffer (no journal), running in the
+     * overlap-safe direction. */
+    if (move_chunked(bs->fd, HEADER_SIZE + from, HEADER_SIZE + to, n) != 0)
         goto fail_unlock;
-    }
-    free(buf);
+    if (plat_durable_sync(bs->fd) != 0)
+        goto fail_unlock;
 
     BS_WRUNLOCK(bs);
     return 0;

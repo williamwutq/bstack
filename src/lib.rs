@@ -627,6 +627,85 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
+/// Cap, in bytes, on the in-memory buffer the streaming fill and copy helpers
+/// use, so a large `repeat`/`zero`/`copy` stays O(min(chunk, region)) in memory
+/// instead of materialising the whole region. Matches the 0.4.x line's
+/// `MOVE_CHUNK`.
+const IO_CHUNK: u64 = 4 * 1024;
+
+/// Fill `[phys, phys + count * pattern.len())` with `count` back-to-back copies
+/// of `pattern`, streaming through a buffer of whole copies bounded by
+/// [`IO_CHUNK`] (O(min(IO_CHUNK, total)) memory beyond `pattern`). `phys` is an
+/// absolute file offset; `pattern` is non-empty and `count >= 1`.
+///
+/// Because the buffer is an exact number of copies of `pattern` and the total is
+/// `count * pattern.len()`, every chunk boundary lands on a copy boundary, so the
+/// tiling stays aligned even on the final short write.
+fn write_repeated(file: &mut File, phys: u64, pattern: &[u8], count: u64) -> io::Result<()> {
+    let unit = pattern.len() as u64;
+    let total = count.checked_mul(unit).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "write_repeated: length overflow",
+        )
+    })?;
+    // Pack as many whole copies of `pattern` as fit under IO_CHUNK (at least
+    // one), capped at `count`.
+    let copies = (IO_CHUNK / unit).max(1).min(count);
+    let mut buf = Vec::with_capacity((copies * unit) as usize);
+    for _ in 0..copies {
+        buf.extend_from_slice(pattern);
+    }
+    let mut done = 0u64;
+    while done < total {
+        let take = ((total - done) as usize).min(buf.len());
+        file.seek(SeekFrom::Start(phys + done))?;
+        file.write_all(&buf[..take])?;
+        done += take as u64;
+    }
+    Ok(())
+}
+
+/// Copy `n` bytes from absolute file offset `src` to `dst`, streaming through a
+/// buffer bounded by [`IO_CHUNK`] (O(min(IO_CHUNK, n)) memory). Overlap-safe with
+/// memmove semantics: the copy runs backwards when `dst > src` and forwards
+/// otherwise, so a source byte is never clobbered before it is read. `n > 0`.
+///
+/// The caller holds the write lock, so no other thread can observe or touch the
+/// region between chunks — the chunking is purely an in-memory detail.
+///
+/// Gated with `copy`, its only caller.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
+    let cap = n.min(IO_CHUNK) as usize;
+    let mut buf = vec![0u8; cap];
+    if dst <= src {
+        // Forward: reads run ahead of the writes, so overlap is safe.
+        let mut done = 0u64;
+        while done < n {
+            let take = ((n - done) as usize).min(cap);
+            file.seek(SeekFrom::Start(src + done))?;
+            file.read_exact(&mut buf[..take])?;
+            file.seek(SeekFrom::Start(dst + done))?;
+            file.write_all(&buf[..take])?;
+            done += take as u64;
+        }
+    } else {
+        // Backward: dst > src, so copy the tail chunk first to avoid clobbering
+        // source bytes not yet read.
+        let mut done = n;
+        while done > 0 {
+            let take = (done as usize).min(cap);
+            done -= take as u64;
+            file.seek(SeekFrom::Start(src + done))?;
+            file.read_exact(&mut buf[..take])?;
+            file.seek(SeekFrom::Start(dst + done))?;
+            file.write_all(&buf[..take])?;
+        }
+    }
+    Ok(())
+}
+
 /// Validate a batch of sparse-extend writes against a declared extension of
 /// `length` bytes.
 ///
@@ -1901,9 +1980,7 @@ impl BStack {
                 format!("zero: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        let zeros = vec![0u8; n as usize];
-        file.write_all(&zeros)?;
+        write_repeated(file, HEADER_SIZE + offset, &[0u8], n)?;
         durable_sync(file)
     }
 
@@ -1924,9 +2001,9 @@ impl BStack {
     /// Equivalent to [`set`](Self::set): the whole region is written and durably
     /// synced before returning. Unlike the write-in-progress-journal
     /// implementation on the 0.4.x line — which journals only the pattern and
-    /// count — this version has no such journal and writes the full
-    /// `count * pattern.len()` bytes directly, so a crash-safe fill of a large
-    /// region is slower and stages the expanded buffer in memory.
+    /// count — this version has no such journal, so it is not crash-atomic (a
+    /// crash mid-fill can leave a torn region). The fill is streamed through a
+    /// small bounded buffer, so memory stays O(chunk) regardless of region size.
     pub fn repeat(&self, offset: u64, pattern: impl AsRef<[u8]>, count: u64) -> io::Result<()> {
         let pattern = pattern.as_ref();
         if pattern.is_empty() || count == 0 {
@@ -1942,12 +2019,6 @@ impl BStack {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "repeat: offset + count*pattern.len() overflows u64",
-            )
-        })?;
-        let total = usize::try_from(total).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "repeat: total length exceeds platform pointer size",
             )
         })?;
         let mut guard = self.lock.write().unwrap();
@@ -1967,13 +2038,8 @@ impl BStack {
                 format!("repeat: write end ({end}) exceeds payload size ({data_size})"),
             ));
         }
-        // Stage the whole expanded region and write it in one pass (no journal).
-        let mut buf = Vec::with_capacity(total);
-        while buf.len() < total {
-            buf.extend_from_slice(pattern);
-        }
-        file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-        file.write_all(&buf)?;
+        // Stream the fill through a bounded buffer (no journal, not crash-atomic).
+        write_repeated(file, HEADER_SIZE + offset, pattern, count)?;
         durable_sync(file)
     }
 }
@@ -3221,9 +3287,11 @@ impl BStack {
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
     ///
-    /// The source is read into a temporary buffer before writing, so overlapping
-    /// regions are handled correctly.  `n = 0` is a valid no-op (bounds are
-    /// still checked).  The file size is never changed.
+    /// Overlapping regions are handled correctly — the copy runs in the safe
+    /// direction (backwards when `to > from`) — and the bytes are streamed
+    /// through a small bounded buffer, so memory stays O(chunk) regardless of
+    /// `n`.  `n = 0` is a valid no-op (bounds are still checked).  The file size
+    /// is never changed.
     ///
     /// # Feature flags
     ///
@@ -3270,11 +3338,7 @@ impl BStack {
         if n == 0 {
             return Ok(());
         }
-        file.seek(SeekFrom::Start(HEADER_SIZE + from))?;
-        let mut buf = vec![0u8; n as usize];
-        file.read_exact(&mut buf)?;
-        file.seek(SeekFrom::Start(HEADER_SIZE + to))?;
-        file.write_all(&buf)?;
+        move_chunked(file, HEADER_SIZE + from, HEADER_SIZE + to, n)?;
         durable_sync(file)
     }
 
