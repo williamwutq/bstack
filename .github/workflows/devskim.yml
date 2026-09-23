@@ -14,7 +14,39 @@ on:
     paths-ignore: ['**.md', '**/Makefile', '.gitignore', '.gitattributes', '**.toml', '**.lock', 'benches/**', 'src/test.rs', 'src/alloc_fuzz/**', 'c/test_*.c']
 
 jobs:
+  # Manual path filter: the trigger-level `paths-ignore:` above is kept, but
+  # GitHub does not evaluate it reliably, so this job is the authoritative gate.
+  # `some-with-excludes` inverts the ignore list: `scan` is true when at least
+  # one changed file is NOT in the ignore set.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      scan: ${{ steps.filter.outputs.scan }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        predicate-quantifier: 'some-with-excludes'
+        filters: |
+          scan:
+            - '**'
+            - '!**/*.md'
+            - '!**/Makefile'
+            - '!.gitignore'
+            - '!.gitattributes'
+            - '!**/*.toml'
+            - '!**/*.lock'
+            - '!benches/**'
+            - '!src/test.rs'
+            - '!src/alloc_fuzz/**'
+            - '!c/test_*.c'
+
   lint:
+    needs: changes
+    if: needs.changes.outputs.scan == 'true'
     name: DevSkim
     runs-on: ubuntu-latest
     permissions:

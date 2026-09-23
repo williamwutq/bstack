@@ -12,7 +12,29 @@ permissions:
   contents: read
 
 jobs:
+  # Manual path filter: the trigger-level `paths:` above is kept, but GitHub
+  # does not evaluate it reliably, so this job is the authoritative gate.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          code:
+            - 'src/**'
+            - 'benches/**'
+            - 'examples/**'
+            - 'Cargo.toml'
+            - 'Cargo.lock'
+            - '.github/workflows/check.yml'
+
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4

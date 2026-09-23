@@ -12,7 +12,24 @@ permissions:
   contents: read
 
 jobs:
+  # Manual path filter: the trigger-level `paths:` above is kept, but GitHub
+  # does not evaluate it reliably, so this job is the authoritative gate.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      src: ${{ steps.filter.outputs.src }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          src:
+            - 'src/**'
+
   test:
+    needs: changes
+    if: needs.changes.outputs.src == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
