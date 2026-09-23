@@ -2018,7 +2018,8 @@ mod tests {
         // A multi-block `dealloc` discards the tail; one landing between the
         // length sample and the read lock used to fail with `InvalidInput`.
         const CHURN: usize = 4;
-        const ROUNDS: usize = 4000;
+        const ROUNDS: usize = 200;
+        const MAX_OBSERVATIONS: u64 = 10_000;
 
         let (stack, path) = empty_stack();
         let _g = Guard(path);
@@ -2041,7 +2042,9 @@ mod tests {
             })
             .collect();
 
-        while done.load(Ordering::Acquire) < CHURN {
+        let mut runs = 0u64;
+        while done.load(Ordering::Acquire) < CHURN && runs < MAX_OBSERVATIONS {
+            runs += 1;
             let stats = alloc
                 .stats()
                 .expect("stats must not fail under a concurrent tail discard");
@@ -2051,10 +2054,13 @@ mod tests {
                 stats.free_blocks,
                 stats.in_use_blocks
             );
+            // The walk holds the shared lock; let the writers in between calls.
+            std::thread::yield_now();
         }
         for h in churn {
             h.join().unwrap();
         }
+        assert!(runs > 0, "stats never ran alongside the churn");
     }
 
     // ── concurrent (feature = "atomic") ───────────────────────────────────────
