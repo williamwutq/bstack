@@ -1247,7 +1247,9 @@ consistency guarantees, and thread safety analysis for each allocator, see
 Five of the six allocators have an inherent `stats` method that scans the arena
 once and returns a `BStackAllocStats`, carrying `free_blocks`, `free_bytes`,
 `in_use_blocks` and `in_use_bytes`. It is `#[non_exhaustive]`; construct it
-through `stats` or `Default`.
+through `stats` or `Default`. It derives `Debug`, `Clone`, `Copy`, `PartialEq`,
+`Eq`, `Hash`, and `Default`; two snapshots are equal (and hash equal) iff all
+four counts match.
 
 Each allocator defines what a *block* is. The counts therefore describe that
 one allocator's arena. Every allocator section below states its own unit. Byte
