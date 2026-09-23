@@ -26,7 +26,7 @@ jobs:
       scan: ${{ steps.filter.outputs.scan }}
     steps:
     - uses: actions/checkout@v4
-    - uses: dorny/paths-filter@v3
+    - uses: dorny/paths-filter@v4
       id: filter
       with:
         predicate-quantifier: 'some-with-excludes'
