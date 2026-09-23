@@ -1369,37 +1369,39 @@ static int write_repeated_at(bstack_fd_t fd, uint64_t phys,
                              const uint8_t *pattern, size_t pattern_len,
                              uint64_t count)
 {
-    uint64_t total = (uint64_t)pattern_len * count;
-    /* Pack as many whole copies of pattern as fit under the chunk cap (at
-     * least one), capped at count. */
-    uint64_t copies = BSTACK_IO_CHUNK / (uint64_t)pattern_len;
-    if (copies == 0)
-        copies = 1;
-    if (copies > count)
-        copies = count;
-    size_t buf_len = (size_t)(copies * (uint64_t)pattern_len);
-    uint8_t *buf = (uint8_t *)malloc(buf_len);
-    if (!buf) {
-        errno = ENOMEM;
-        return -1;
+    if (pattern_len == 0 || count == 0)
+        return 0;
+    /* Caller has validated count*pattern_len against the payload, so no overflow
+     * can originate here. */
+    if (pattern_len > BSTACK_IO_CHUNK) {
+        /* pattern is larger than the buffer: write it directly, count times. */
+        uint64_t off = phys;
+        for (uint64_t i = 0; i < count; i++) {
+            if (plat_pwrite(fd, pattern, pattern_len, off) != 0)
+                return -1;
+            off += (uint64_t)pattern_len;
+        }
+        return 0;
     }
-    for (size_t i = 0; i < buf_len; i += pattern_len)
-        memcpy(buf + i, pattern, pattern_len);
-
+    /* Tile a whole number of copies into the stack buffer; every write is then a
+     * whole number of copies, so the tiling stays phase-aligned across chunks. */
+    uint8_t buf[BSTACK_IO_CHUNK];
+    size_t copies = BSTACK_IO_CHUNK / pattern_len;   /* >= 1 */
+    size_t chunk = copies * pattern_len;             /* <= BSTACK_IO_CHUNK */
+    for (size_t i = 0; i < copies; i++)
+        memcpy(buf + i * pattern_len, pattern, pattern_len);
+    uint64_t total = (uint64_t)pattern_len * count;
     uint64_t done = 0;
+    uint64_t off = phys;
     while (done < total) {
-        size_t take = buf_len;
+        size_t take = chunk;
         if (total - done < (uint64_t)take)
             take = (size_t)(total - done);
-        if (plat_pwrite(fd, buf, take, phys + done) != 0) {
-            int sv = errno;
-            free(buf);
-            errno = sv;
+        if (plat_pwrite(fd, buf, take, off) != 0)
             return -1;
-        }
         done += take;
+        off += take;
     }
-    free(buf);
     return 0;
 }
 

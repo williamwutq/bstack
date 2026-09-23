@@ -627,49 +627,67 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
-/// Cap, in bytes, on the in-memory buffer the streaming fill and copy helpers
-/// use, so a large `repeat`/`zero`/`copy` stays O(min(chunk, region)) in memory
-/// instead of materialising the whole region. Matches the 0.4.x line's
-/// `MOVE_CHUNK`.
-const IO_CHUNK: u64 = 4 * 1024;
+/// Size, in bytes, of the fixed stack buffer the streaming fill and copy helpers
+/// use, so a large `repeat`/`zero`/`copy` runs in O(1) memory instead of
+/// materialising the whole region. Only one such op runs at a time (each holds
+/// the write lock), and the buffer lives on the stack for that call. Matches the
+/// 0.4.x line's `MOVE_CHUNK`.
+const IO_CHUNK: usize = 4 * 1024;
 
 /// Fill `[phys, phys + count * pattern.len())` with `count` back-to-back copies
-/// of `pattern`, streaming through a buffer of whole copies bounded by
-/// [`IO_CHUNK`] (O(min(IO_CHUNK, total)) memory beyond `pattern`). `phys` is an
-/// absolute file offset; `pattern` is non-empty and `count >= 1`.
+/// of `pattern`, streaming through a fixed [`IO_CHUNK`]-sized stack buffer (no
+/// heap allocation; O(1) beyond `pattern`). `phys` is an absolute file offset.
 ///
-/// Because the buffer is an exact number of copies of `pattern` and the total is
-/// `count * pattern.len()`, every chunk boundary lands on a copy boundary, so the
-/// tiling stays aligned even on the final short write.
+/// The caller ([`BStack::repeat`]/[`BStack::zero`]) has already validated the
+/// region against the payload, so `count * pattern.len()` cannot overflow here
+/// and this raises no error of its own. When `pattern` alone exceeds the buffer
+/// it is written directly; otherwise a whole number of copies is tiled into the
+/// buffer, so every chunk boundary lands on a copy boundary and the tiling stays
+/// aligned even on the final short write.
 fn write_repeated(file: &mut File, phys: u64, pattern: &[u8], count: u64) -> io::Result<()> {
-    let unit = pattern.len() as u64;
-    let total = count.checked_mul(unit).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "write_repeated: length overflow",
-        )
-    })?;
-    // Pack as many whole copies of `pattern` as fit under IO_CHUNK (at least
-    // one), capped at `count`.
-    let copies = (IO_CHUNK / unit).max(1).min(count);
-    let mut buf = Vec::with_capacity((copies * unit) as usize);
-    for _ in 0..copies {
-        buf.extend_from_slice(pattern);
+    let unit = pattern.len();
+    if unit == 0 || count == 0 {
+        return Ok(());
     }
+    debug_assert!(
+        count.checked_mul(unit as u64).is_some(),
+        "write_repeated: caller must validate count * pattern.len()"
+    );
+    let copies = IO_CHUNK / unit;
+    if copies == 0 {
+        // `pattern` is larger than the buffer: write it directly, `count` times.
+        let mut off = phys;
+        for _ in 0..count {
+            file.seek(SeekFrom::Start(off))?;
+            file.write_all(pattern)?;
+            off += unit as u64;
+        }
+        return Ok(());
+    }
+    // Tile a whole number of copies into the stack buffer; every write is then a
+    // whole number of copies, so the tiling stays phase-aligned across chunks.
+    let mut buf = [0u8; IO_CHUNK];
+    let chunk = copies * unit; // <= IO_CHUNK
+    for i in 0..copies {
+        buf[i * unit..(i + 1) * unit].copy_from_slice(pattern);
+    }
+    let total = count * unit as u64;
     let mut done = 0u64;
+    let mut off = phys;
     while done < total {
-        let take = ((total - done) as usize).min(buf.len());
-        file.seek(SeekFrom::Start(phys + done))?;
+        let take = ((total - done) as usize).min(chunk);
+        file.seek(SeekFrom::Start(off))?;
         file.write_all(&buf[..take])?;
         done += take as u64;
+        off += take as u64;
     }
     Ok(())
 }
 
 /// Copy `n` bytes from absolute file offset `src` to `dst`, streaming through a
-/// buffer bounded by [`IO_CHUNK`] (O(min(IO_CHUNK, n)) memory). Overlap-safe with
-/// memmove semantics: the copy runs backwards when `dst > src` and forwards
-/// otherwise, so a source byte is never clobbered before it is read. `n > 0`.
+/// fixed [`IO_CHUNK`]-sized stack buffer (no heap allocation; O(1) memory).
+/// Overlap-safe with memmove semantics: the copy runs backwards when `dst > src`
+/// and forwards otherwise, so a source byte is never clobbered before it is read.
 ///
 /// The caller holds the write lock, so no other thread can observe or touch the
 /// region between chunks — the chunking is purely an in-memory detail.
@@ -677,13 +695,12 @@ fn write_repeated(file: &mut File, phys: u64, pattern: &[u8], count: u64) -> io:
 /// Gated with `copy`, its only caller.
 #[cfg(all(feature = "set", feature = "atomic"))]
 fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
-    let cap = n.min(IO_CHUNK) as usize;
-    let mut buf = vec![0u8; cap];
+    let mut buf = [0u8; IO_CHUNK];
     if dst <= src {
         // Forward: reads run ahead of the writes, so overlap is safe.
         let mut done = 0u64;
         while done < n {
-            let take = ((n - done) as usize).min(cap);
+            let take = ((n - done) as usize).min(buf.len());
             file.seek(SeekFrom::Start(src + done))?;
             file.read_exact(&mut buf[..take])?;
             file.seek(SeekFrom::Start(dst + done))?;
@@ -695,7 +712,7 @@ fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
         // source bytes not yet read.
         let mut done = n;
         while done > 0 {
-            let take = (done as usize).min(cap);
+            let take = (done as usize).min(buf.len());
             done -= take as u64;
             file.seek(SeekFrom::Start(src + done))?;
             file.read_exact(&mut buf[..take])?;
