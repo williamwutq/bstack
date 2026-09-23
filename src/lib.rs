@@ -2851,7 +2851,11 @@ impl BStack {
 ///   payload, and ending the sequence.
 /// - `Pop { buf }` — remove the last `buf.len()` bytes from the end of the
 ///   file into `buf`, shrinking the payload, and ending the sequence.
+/// - `Discard { len }` — remove the last `len` bytes from the end of the file
+///   without reading them back, shrinking the payload, and ending the sequence.
 /// - `Len { out }` — write the current logical payload size into `out`.
+/// - `Abort { source }` — end the sequence without applying anything,
+///   returning `Err(source)` if `Some` and `Ok(())` otherwise.
 /// - `#[non_exhaustive]` — later versions may add further variants, for
 ///   richer write ownership or multi-write protocols, for instance, without
 ///   a breaking change.
@@ -2929,6 +2933,14 @@ pub enum BStackGenOp<'a> {
     Len {
         /// Destination for the current payload size.
         out: &'a mut u64,
+    },
+    /// End the sequence **without applying anything it accumulated** — the
+    /// counterpart of `None`, which ends it committing everything. `source`
+    /// sets the outcome independently: `Some(e)` returns `Err(e)`, `None`
+    /// returns `Ok(())`.
+    Abort {
+        /// The error the call fails with, or `None` to end successfully.
+        source: Option<io::Error>,
     },
 }
 
@@ -3365,6 +3377,11 @@ impl BStack {
     /// - `None` ends the sequence without writing anything — useful when the
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
+    /// - `Some(BStackGenOp::Abort { source })` ends the sequence without
+    ///   writing, like `None`, but returns `Err(source)` when `source` is
+    ///   `Some` and `Ok(())` otherwise — the way to end a sequence with a
+    ///   caller-chosen error, which `f`'s `Option` return cannot express on
+    ///   its own.
     ///
     /// `Write`, `Swap`, `Push`, `Pop`, and `Discard` are the only mutating
     /// operations, exactly one is permitted per call, and any one of them ends
@@ -3398,7 +3415,8 @@ impl BStack {
     /// removes more bytes than the current payload size, or if a `Pop` or
     /// `Discard` would shrink the payload below the locked length.  Propagates
     /// any I/O error from `read_exact`, `write_all`, `set_len`, or
-    /// `durable_sync`.
+    /// `durable_sync`.  An `Abort { source: Some(e) }` returns `e` after
+    /// leaving the file unchanged.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, mut f: F) -> io::Result<()>
     where
@@ -3653,6 +3671,11 @@ impl BStack {
                 }
                 Some(BStackGenOp::Len { out }) => {
                     *out = data_size;
+                }
+                Some(BStackGenOp::Abort { source }) => {
+                    // Nothing has been mutated: every mutating op ends the
+                    // sequence, so reaching here means only reads have run.
+                    return source.map_or(Ok(()), Err);
                 }
                 None => return Ok(()),
             }

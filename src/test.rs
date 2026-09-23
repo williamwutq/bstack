@@ -5546,6 +5546,52 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_abort_with_source_returns_err_and_leaves_file_unchanged() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        let mut buf = [0u8; 5];
+        let mut calls = 0usize;
+        let err = s
+            .process_gen(|| {
+                calls += 1;
+                match calls {
+                    // SAFETY: `buf` outlives this whole `process_gen` call.
+                    1 => Some(BStackGenOp::Read {
+                        offset: 0,
+                        buf: unsafe { core::mem::transmute::<&mut [u8], &mut [u8]>(&mut buf[..]) },
+                    }),
+                    _ => Some(BStackGenOp::Abort {
+                        source: Some(std::io::Error::other("stop")),
+                    }),
+                }
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(err.to_string(), "stop");
+        // The read ran before the abort.
+        assert_eq!(&buf, b"hello");
+        // Nothing was written.
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_abort_without_source_ends_ok() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"hello").unwrap();
+        s.process_gen(|| Some(BStackGenOp::Abort { source: None }))
+            .unwrap();
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"hello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_write_ends_sequence() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();

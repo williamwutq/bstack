@@ -2568,6 +2568,17 @@ int bstack_process_gen(bstack_t *bs,
             *op.u.len.out = data_size;
             break;
         }
+        case BSTACK_GEN_ABORT: {
+            /* Nothing has been mutated: every mutating kind returns out of this
+             * loop, so reaching here means only reads have run.  A zero status
+             * ends the sequence successfully. */
+            int sv = op.u.abort.status;
+            BS_WRUNLOCK(bs);
+            if (sv == 0)
+                return 0;
+            errno = sv;
+            return -1;
+        }
         default:
             BS_WRUNLOCK(bs);
             errno = EINVAL;

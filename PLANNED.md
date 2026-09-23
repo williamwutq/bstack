@@ -209,25 +209,6 @@ It expands to the lifetime-only reborrow (via `transmute`, or `ptr::from_mut` + 
 
 ---
 
-## `BStackGenOp::Abort` — end a `process_gen` sequence with an error
-
-**Feature flag:** `set` + `atomic`.
-**Breaking change:** No — `BStackGenOp` is `#[non_exhaustive]`.
-
-### Motivation
-
-`process_gen`'s only ways to end a sequence are a mutating op or `None`, and `None` returns `Ok(())`. A generator that decides, after seeing earlier reads, that it must not proceed can only end with `None` — it cannot signal *why* it stopped. An `Abort { source: io::Error }` op would end the sequence without writing (like `None`) but return that error, letting a generator propagate a decision-driven failure.
-
-On this line `process_gen`'s per-op validation errors are **returned** directly (unlike the 0.4.x `inplace_gen`, whose rejected ops are *reported* to the next callback and silently swallowed on `None`), so `Abort`'s role here is narrower than in 0.4.x: it is an early-exit-with-error, not a batch-discard. It still closes the "end early and fail" gap and keeps parity with the 0.4.x `BStackGenOp::Abort`.
-
-*(Adapted from the 0.4.x line's planned entry, whose motivation centred on `inplace_gen`'s in-memory overlay — absent on the 0.2 line.)*
-
-### Open questions
-
-- Whether the value over returning the error from the code surrounding the closure is worth a new variant on this line, given `process_gen` already returns op errors. It is cheap and forward-compatible, but the 0.4.x-specific motivation (silent overlay commit) does not apply here.
-
----
-
 ## `fault-injection` module for deterministic I/O-failure testing
 
 **Feature flag:** dedicated (`fault-injection`), test/dev-oriented; active only with `debug_assertions`.

@@ -576,6 +576,9 @@ typedef enum {
     /* Write the current logical payload size into *u.len.out, then call gen
      * again — does not end the sequence. */
     BSTACK_GEN_LEN,
+    /* End the sequence without applying anything it accumulated.  Fails the
+     * call with errno = u.abort.status, or succeeds if status is 0. */
+    BSTACK_GEN_ABORT,
 } bstack_gen_op_kind_t;
 
 /*
@@ -602,6 +605,10 @@ typedef enum {
  * - BSTACK_GEN_LEN: write the current logical payload size into
  *   *u.len.out and call gen again — the in-sequence equivalent of
  *   bstack_len.  Does not end the sequence.
+ * - BSTACK_GEN_ABORT: end the sequence without applying anything it
+ *   accumulated — the counterpart of returning 0 from gen, which ends it
+ *   committing everything.  u.abort.status sets the outcome independently:
+ *   non-zero fails the call with errno = u.abort.status, 0 returns 0.
  *
  * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, and BSTACK_GEN_POP are
  * the only mutating kinds — exactly one is permitted per bstack_process_gen
@@ -639,6 +646,9 @@ typedef struct {
         struct {
             uint64_t *out;
         } len;
+        struct {
+            int status;  /* errno to fail the call with; 0 succeeds instead */
+        } abort;
     } u;
 } bstack_gen_op_t;
 
@@ -731,6 +741,10 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  *   last element").
  * - Returning 0 ends the sequence without writing anything — useful when the
  *   reads alone inform a decision, including the decision to change nothing.
+ * - Returning 1 with *out_op set to BSTACK_GEN_ABORT ends the sequence
+ *   without writing, like returning 0, but fails the call with
+ *   errno = u.abort.status when that status is non-zero (0 returns 0) — the
+ *   way to end a sequence with a caller-chosen error.
  * - Returning -1 aborts the operation; errno must be set by gen.
  *
  * Holding the write lock across every read and the final mutation means no
@@ -752,8 +766,8 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * overlap, if a write or swap range overlaps the locked region
  * [0, bstack_locked_len()), if a pop removes more bytes than the current
  * payload size, or if a pop would shrink the payload below
- * bstack_locked_len().  Returns -1 (errno set) if gen returns -1, or if
- * an I/O error occurs.
+ * bstack_locked_len().  Returns -1 (errno set) on a BSTACK_GEN_ABORT with a
+ * non-zero status, if gen returns -1, or if an I/O error occurs.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.

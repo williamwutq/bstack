@@ -3188,6 +3188,77 @@ static int test_process_gen_write_ends_sequence(void)
     return 0;
 }
 
+struct pg_abort_ctx { int calls; uint8_t buf[5]; };
+
+static int pg_abort_with_status_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_abort_ctx *c = userctx;
+    c->calls++;
+    if (c->calls == 1) {
+        /* A read runs before the abort. */
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = c->buf;
+        out_op->u.read.len    = 5;
+    } else {
+        out_op->kind           = BSTACK_GEN_ABORT;
+        out_op->u.abort.status = EIO;
+    }
+    return 1;
+}
+
+static int test_process_gen_abort_with_status_fails_and_leaves_file_unchanged(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    struct pg_abort_ctx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    errno = 0;
+    CHECK(bstack_process_gen(bs, pg_abort_with_status_gen, &ctx) == -1);
+    CHECK(errno == EIO);
+    CHECK(ctx.calls == 2);
+    /* The read ran before the abort. */
+    CHECK(memcmp(ctx.buf, "hello", 5) == 0);
+
+    /* Nothing was written. */
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int pg_abort_zero_status_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    (void)userctx;
+    out_op->kind           = BSTACK_GEN_ABORT;
+    out_op->u.abort.status = 0;
+    return 1;
+}
+
+static int test_process_gen_abort_zero_status_ends_ok(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"hello", 5, NULL) == 0);
+    CHECK(bstack_process_gen(bs, pg_abort_zero_status_gen, NULL) == 0);
+
+    uint64_t len; CHECK(bstack_len(bs, &len) == 0); CHECK(len == 5);
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int pg_swap_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
 {
     int *calls = userctx;
@@ -4837,6 +4908,8 @@ int main(void)
     T(test_process_gen_dependent_reads_inform_next_offset);
     T(test_process_gen_immediate_none_is_noop);
     T(test_process_gen_write_ends_sequence);
+    T(test_process_gen_abort_with_status_fails_and_leaves_file_unchanged);
+    T(test_process_gen_abort_zero_status_ends_ok);
     T(test_process_gen_swap_exchanges_two_regions_and_ends_sequence);
     T(test_process_gen_swap_target_informed_by_prior_read);
     T(test_process_gen_swap_overlapping_regions_returns_error);
