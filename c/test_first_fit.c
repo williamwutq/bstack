@@ -1414,6 +1414,157 @@ static int test_slice_process_transforms_in_place(void)
 /* A slice issued by one allocator instance must be refused by another: the
  * language cannot catch it, so the allocator does, at run time, before
  * touching any metadata.  See "Foreign slices" in bstack_alloc.h. */
+/* ---- stats ----------------------------------------------------------- */
+
+/* Mirrors the private layout in bstack_alloc.c: 16 offset bytes + 32 header
+ * bytes, then blocks of 16-byte header + payload + 8-byte footer. */
+#define FF_ARENA_START     48
+#define FF_BLOCK_OVERHEAD  24
+
+static int test_stats_empty_arena_is_all_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_stats_accepts_null_out_pointers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+
+    CHECK(first_fit_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+    uint64_t uy = 0;
+    CHECK(first_fit_bstack_allocator_stats(a, NULL, NULL, NULL, &uy) == 0);
+    CHECK(uy == 64 + FF_BLOCK_OVERHEAD);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_stats_single_allocation_is_one_in_use_block(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    /* payload 64 + overhead 24 = 88. */
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 88);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_stats_counts_free_and_in_use_through_coalescing(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    /* payload 16 + overhead 24 = 40 per block. */
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 16, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 16, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 16, &z) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* y has no free neighbour: one free block, two still in use. */
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 40 && ub == 2 && uy == 80);
+
+    /* x's right neighbour (y) is free, so dealloc coalesces them into one
+     * free block spanning both: same total bytes, fewer free blocks. */
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 80 && ub == 1 && uy == 40);
+
+    /* z's left neighbour (the merged x+y block) is free and the merge now
+     * reaches the tail, so dealloc discards the whole arena. */
+    CHECK(bstack_allocator_dealloc(al, z) == 0);
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_stats_stops_at_a_malformed_block_header(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y;
+    CHECK(bstack_allocator_alloc(al, 16, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 16, &y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 2 && uy == 80);
+
+    /* Corrupt y's header size to a non-multiple of 8: the scan must stop
+     * there and report only the prefix that parsed cleanly. */
+    uint8_t bad[8];
+    int i;
+    for (i = 0; i < 8; i++) bad[i] = 0;
+    bad[0] = 21;
+    CHECK(bstack_set(bs, y.offset - 16, bad, 8) == 0); /* header = offset - 16 */
+
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 40);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+static int test_stats_on_a_stack_truncated_under_the_header(void)
+{
+    /* A stack cut below ALFF_ARENA_START must report nothing rather than
+     * underflow the scan's stack_len - pos. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == FF_ARENA_START);
+    CHECK(bstack_discard(bs, 8) == 0);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(first_fit_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 static int test_foreign_slice_is_rejected(void)
 {
     char t1[64], t2[64];
@@ -1579,6 +1730,14 @@ int main(void)
     T(test_slice_cas_on_masked_no_match_returns_none);
     T(test_slice_process_transforms_in_place);
 #endif
+
+    /* stats */
+    T(test_stats_empty_arena_is_all_zero);
+    T(test_stats_accepts_null_out_pointers);
+    T(test_stats_single_allocation_is_one_in_use_block);
+    T(test_stats_counts_free_and_in_use_through_coalescing);
+    T(test_stats_stops_at_a_malformed_block_header);
+    T(test_stats_on_a_stack_truncated_under_the_header);
 
     T(test_foreign_slice_is_rejected);
 

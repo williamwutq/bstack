@@ -3925,6 +3925,134 @@ bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *al
     return bs;
 }
 
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Every header in the scan is read inside one bstack_get_batched_gen
+ * sequence -- a single lock acquisition for the whole walk rather than one
+ * bstack_get per block -- in addition to the allocator's own MUTEX_LOCK,
+ * which serialises the walk against concurrent alloc/dealloc. */
+struct alff_stats_ctx {
+    uint8_t  hdr_buf[16];
+    uint64_t stack_len;
+    uint64_t pos;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* hdr_buf holds an unprocessed read from the last call */
+};
+
+static int alff_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alff_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t size, block_total, remaining;
+        int is_free;
+        c->pending = 0;
+        size    = read_le64(c->hdr_buf);
+        is_free = c->hdr_buf[8] & 1;
+        /* pos <= stack_len is a loop invariant, so this cannot underflow. */
+        remaining = c->stack_len - c->pos;
+
+        /* Malformed header: stop, best-effort. */
+        if (size < ALFF_MIN_PAYLOAD || size % 8 != 0
+            || size > UINT64_MAX - ALFF_BLOCK_OVERHEAD) {
+            return 0;
+        }
+        block_total = size + ALFF_BLOCK_OVERHEAD;
+        if (block_total > remaining) return 0;
+
+        if (is_free) {
+            c->free_blocks++;
+            c->free_bytes += block_total;
+        } else {
+            c->in_use_blocks++;
+            c->in_use_bytes += block_total;
+        }
+        c->pos += block_total;
+    }
+    /* Partial tail from a crashed write, or arena exhausted: stop. */
+    if (c->stack_len - c->pos < ALFF_BLOCK_OVERHEAD) return 0;
+    c->pending  = 1;
+    *out_offset = c->pos;
+    *out_buf    = c->hdr_buf;
+    *out_len    = 16;
+    return 1;
+}
+
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alff_stats_ctx c;
+
+    MUTEX_LOCK(alloc);
+    memset(&c, 0, sizeof c);
+    if (bstack_len(alloc->bs, &c.stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    c.pos = ALFF_ARENA_START;
+
+    /* A stack truncated below the header would underflow stack_len - pos. */
+    if (c.stack_len > ALFF_ARENA_START
+        && bstack_get_batched_gen(alloc->bs, alff_stats_gen, &c) != 0) {
+        MUTEX_UNLOCK(alloc); return -1;
+    }
+    MUTEX_UNLOCK(alloc);
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
+    return 0;
+}
+#else /* !BSTACK_FEATURE_ATOMIC */
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    uint64_t stack_len, pos;
+    uint64_t free_blocks = 0, free_bytes = 0, in_use_blocks = 0, in_use_bytes = 0;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+
+    pos = ALFF_ARENA_START;
+    while (pos < stack_len) {
+        uint64_t remaining = stack_len - pos;
+        uint8_t  hdr_buf[16];
+        uint64_t size, block_total;
+        int      is_free;
+
+        /* Partial tail from a crashed write: stop, best-effort. */
+        if (remaining < ALFF_BLOCK_OVERHEAD) break;
+
+        if (bstack_get(alloc->bs, pos, pos + 16, hdr_buf) != 0) return -1;
+        size    = read_le64(hdr_buf);
+        is_free = hdr_buf[8] & 1;
+
+        /* Malformed header: stop, best-effort. */
+        if (size < ALFF_MIN_PAYLOAD || size % 8 != 0
+            || size > UINT64_MAX - ALFF_BLOCK_OVERHEAD) {
+            break;
+        }
+        block_total = size + ALFF_BLOCK_OVERHEAD;
+        if (block_total > remaining) break;
+
+        if (is_free) {
+            free_blocks++;
+            free_bytes += block_total;
+        } else {
+            in_use_blocks++;
+            in_use_bytes += block_total;
+        }
+        pos += block_total;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_bytes;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * Mutex helpers shared by ghost_tree, slab, and checked_slab allocators.
  * Mirrors the pattern used by first_fit_bstack_allocator_t.
@@ -5468,6 +5596,66 @@ bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *
     return bs;
 }
 
+int ghost_tree_bstack_allocator_stats(
+    ghost_tree_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    uint64_t stack_len, root;
+    struct algt_walk_ctx ctx;
+    uint64_t free_bytes = 0, in_use_blocks = 0, cursor, arena_bytes, in_use_bytes;
+    size_t i;
+
+    memset(&ctx, 0, sizeof ctx);
+
+    MUTEX_LOCK(alloc);
+    if (bstack_len(alloc->bs, &stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    if (algt_read_root(alloc->bs, &root) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    errno = 0; /* the walk reports depth-exceeded without setting errno */
+    algt_avl_walk_inorder(alloc->bs, root, &ctx);
+    MUTEX_UNLOCK(alloc);
+    if (ctx.err) {
+        if (errno == 0) errno = EINVAL; /* depth exceeded: a corrupted tree */
+        free(ctx.blocks);
+        return -1;
+    }
+
+    /* Dedup for the same reason algt_coalesce_and_rebalance does: a partial
+     * rotation crash can leave a node reachable from two parents, and the
+     * in-order walk would then count it twice. */
+    qsort(ctx.blocks, ctx.count, sizeof *ctx.blocks, algt_cmp_by_ptr);
+    {
+        size_t j = 0, k;
+        for (k = 0; k < ctx.count; k++) {
+            if (j == 0 || ctx.blocks[k].ptr != ctx.blocks[j - 1].ptr)
+                ctx.blocks[j++] = ctx.blocks[k];
+        }
+        ctx.count = j;
+    }
+
+    /* cursor only ever moves forward, so a corrupt overlapping node cannot
+     * rewind it and double-count the gap it already covered. */
+    cursor = ALGT_ARENA_START;
+    for (i = 0; i < ctx.count; i++) {
+        uint64_t ptr = ctx.blocks[i].ptr, size = ctx.blocks[i].size, end;
+        free_bytes = (size > UINT64_MAX - free_bytes) ? UINT64_MAX : free_bytes + size;
+        if (ptr > cursor) in_use_blocks++;
+        end = (size > UINT64_MAX - ptr) ? UINT64_MAX : ptr + size;
+        if (end > cursor) cursor = end;
+    }
+    if (cursor < stack_len) in_use_blocks++;
+    arena_bytes = (stack_len > ALGT_ARENA_START) ? stack_len - ALGT_ARENA_START : 0;
+    in_use_bytes = (arena_bytes > free_bytes) ? arena_bytes - free_bytes : 0;
+
+    if (out_free_blocks)   *out_free_blocks   = (uint64_t)ctx.count;
+    if (out_free_bytes)    *out_free_bytes    = free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_bytes;
+
+    free(ctx.blocks);
+    return 0;
+}
+
 /* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set and bstack_zero).
@@ -6642,6 +6830,91 @@ uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc)
 {
     return alloc->block_size;
 }
+
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Unlike checked_slab/segregated, a plain slab block carries no per-block
+ * state, so free blocks are only known by chasing the singly-linked free
+ * list.  A list holds at most total_blocks nodes, so the count doubles as the
+ * cycle bound and no visited set is needed. */
+struct slab_stats_ctx {
+    uint8_t  buf[8];
+    uint64_t arena_start;
+    uint64_t block_size;
+    uint64_t scan_end;
+    uint64_t total_blocks;
+    uint64_t next_read;   /* offset the next READ should target */
+    uint64_t free_blocks;
+    int      pending;     /* buf holds an unprocessed read from the last call */
+    int      done;
+};
+
+static int slab_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct slab_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t val = read_le64(c->buf);
+        c->pending = 0;
+        if (val == SLAB_SENTINEL
+            || val < c->arena_start
+            || (val - c->arena_start) % c->block_size != 0
+            || val >= c->scan_end
+            || c->free_blocks == c->total_blocks) {
+            /* End of list, or a malformed/cyclic free list: stop, reporting
+             * the best-effort count so far. */
+            c->done = 1;
+        } else {
+            c->free_blocks++;
+            c->next_read = val;
+        }
+    }
+    if (c->done) return 0;
+    c->pending  = 1;
+    *out_offset = c->next_read;
+    *out_buf    = c->buf;
+    *out_len    = 8;
+    return 1;
+}
+
+int slab_bstack_allocator_stats(
+    const slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct slab_stats_ctx c;
+    uint64_t stack_len, total_blocks, in_use_blocks;
+
+    if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+    if (stack_len <= SLAB_ARENA_START) {
+        if (out_free_blocks)   *out_free_blocks   = 0;
+        if (out_free_bytes)    *out_free_bytes    = 0;
+        if (out_in_use_blocks) *out_in_use_blocks = 0;
+        if (out_in_use_bytes)  *out_in_use_bytes  = 0;
+        return 0;
+    }
+    /* The constructor enforces a whole number of blocks; clamp rather than
+     * assume, so a torn tail truncates the walk instead of shortening a read. */
+    total_blocks = (stack_len - SLAB_ARENA_START) / alloc->block_size;
+
+    memset(&c, 0, sizeof c);
+    c.arena_start  = SLAB_ARENA_START;
+    c.block_size   = alloc->block_size;
+    c.total_blocks = total_blocks;
+    c.scan_end     = SLAB_ARENA_START + total_blocks * alloc->block_size;
+    c.next_read    = SLAB_FREE_HEAD_OFFSET;
+
+    if (bstack_get_batched_gen(alloc->bs, slab_stats_gen, &c) != 0) return -1;
+
+    in_use_blocks = total_blocks - c.free_blocks; /* the bound proves free <= total */
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_blocks * alloc->block_size;
+    if (out_in_use_blocks) *out_in_use_blocks = in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = in_use_blocks * alloc->block_size;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
@@ -8761,6 +9034,105 @@ uint64_t checked_slab_bstack_allocator_data_size(
     return alloc->block_size - ALCK_OVERHEAD;
 }
 
+/* ---- stats -------------------------------------------------------------- */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Retries of the stats scan after a concurrent tail discard invalidates the
+ * arena length it sampled. */
+#define ALCK_STATS_SHRINK_RETRIES 4
+
+struct alck_stats_ctx {
+    uint8_t  word_buf[8];
+    uint64_t block_size;
+    uint64_t scan_end;
+    uint64_t p;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* word_buf holds an unprocessed read from the last call */
+};
+
+static int alck_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alck_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t overhead = read_le64(c->word_buf);
+        c->pending = 0;
+        if (overhead == 0) {
+            /* Free, or leaked: indistinguishable without the free list. */
+            c->free_blocks++;
+            c->free_bytes += c->block_size;
+            c->p += c->block_size;
+        } else {
+            /* Same test recovery applies; the engulf check wants the free
+             * list, which this walk lacks, so it gets an empty one. */
+            uint64_t n = alck_valid_in_use(overhead, c->p, c->scan_end,
+                                           c->block_size, NULL, 0);
+            if (n == 0) {
+                c->p = c->scan_end; /* suspicious: stop at the clean prefix */
+                return 0;
+            }
+            c->in_use_blocks++;
+            c->in_use_bytes += n * c->block_size; /* proved to fit above */
+            c->p += n * c->block_size;
+        }
+    }
+    if (c->p >= c->scan_end) return 0;
+    c->pending  = 1;
+    *out_offset = c->p;
+    *out_buf    = c->word_buf;
+    *out_len    = 8;
+    return 1;
+}
+
+/*
+ * One linear arena scan, bounded by stack_len.  The constructor enforces a
+ * whole number of blocks; clamp rather than assume, so a torn tail truncates
+ * the walk instead of shortening a read.
+ */
+static int alck_stats_scan(const checked_slab_bstack_allocator_t *alloc,
+                           uint64_t stack_len, struct alck_stats_ctx *c)
+{
+    memset(c, 0, sizeof *c);
+    c->block_size = alloc->block_size;
+    c->p          = ALCK_ARENA_START;
+    if (stack_len <= ALCK_ARENA_START) {
+        c->scan_end = ALCK_ARENA_START;
+        return 0;
+    }
+    c->scan_end = ALCK_ARENA_START
+                + (stack_len - ALCK_ARENA_START) / alloc->block_size
+                      * alloc->block_size;
+    if (c->p >= c->scan_end) return 0;
+    return bstack_get_batched_gen(alloc->bs, alck_stats_gen, c);
+}
+
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alck_stats_ctx c;
+    uint64_t stack_len;
+    int      attempts = ALCK_STATS_SHRINK_RETRIES;
+
+    for (;;) {
+        if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+        if (alck_stats_scan(alloc, stack_len, &c) == 0) break;
+        /* The length is sampled outside the lock bstack_get_batched_gen holds,
+         * so a concurrent tail discard can leave the scan reading past the new
+         * end.  Only a stale bound can raise EINVAL here, so retry on it and
+         * surface anything else as the read failure it is. */
+        if (errno != EINVAL || attempts-- <= 0) return -1;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
+    return 0;
+}
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
  * Requires -DBSTACK_FEATURE_SET (depends on bstack_set / bstack_zero and, under
@@ -9657,6 +10029,105 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
     free(c.writes);
     if (r) return -1;
     if (out_fused) *out_fused = c.fused;
+    return 0;
+}
+
+/* ---- stats -------------------------------------------------------------- */
+
+/* Retries of the stats scan after a concurrent tail discard invalidates the
+ * arena length it sampled. */
+#define ALSG_STATS_SHRINK_RETRIES 4
+
+struct alsg_stats_ctx {
+    uint64_t scan_end;
+    uint64_t p;
+    uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
+    int      pending; /* word_buf holds an unprocessed read from the last call */
+    uint8_t  word_buf[8];
+};
+
+static int alsg_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
+                          size_t *out_len, void *ctxp)
+{
+    struct alsg_stats_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t word = read_le64(c->word_buf);
+        uint64_t size;
+        c->pending = 0;
+        if (word == 0) {
+            /* Zeroed tail from a crashed extend: stop (recover and coalesce
+             * both discard/skip this the same way). */
+            c->p = c->scan_end; return 0;
+        }
+        /* size comes off disk and may be arbitrary, so the fit test is
+         * `size > scan_end - p` (no underflow: p < scan_end here) rather than
+         * `p + size`, which could overflow.  << 4 makes it a multiple of
+         * ALSG_QUANTUM, so only the lower bound is left. */
+        size = (word & ~ALSG_IN_USE_BIT) << 4;
+        if (size < ALSG_QUANTUM || size > c->scan_end - c->p) {
+            c->p = c->scan_end; return 0; /* malformed: stop the scan here */
+        }
+        if (word & ALSG_IN_USE_BIT) {
+            c->in_use_blocks++;
+            c->in_use_bytes += size;
+        } else {
+            c->free_blocks++;
+            c->free_bytes += size;
+        }
+        c->p += size;
+    }
+    if (c->p >= c->scan_end) return 0;
+    c->pending  = 1;
+    *out_offset = c->p;
+    *out_buf    = c->word_buf;
+    *out_len    = 8;
+    return 1;
+}
+
+/*
+ * One linear arena scan, bounded by stack_len.  The constructor enforces a
+ * whole number of quanta; clamp rather than assume, so a torn tail truncates
+ * the walk instead of shortening a read.  Every offset below scan_end then has
+ * ALSG_QUANTUM (16) >= ALSG_OVERHEAD (8) bytes.
+ */
+static int alsg_stats_scan(const segregated_bstack_allocator_t *alloc,
+                           uint64_t stack_len, struct alsg_stats_ctx *c)
+{
+    memset(c, 0, sizeof *c);
+    c->p = ALSG_ARENA_START;
+    if (stack_len <= ALSG_ARENA_START) {
+        c->scan_end = ALSG_ARENA_START;
+        return 0;
+    }
+    c->scan_end = ALSG_ARENA_START
+                + ((stack_len - ALSG_ARENA_START) & ~(uint64_t)(ALSG_QUANTUM - 1));
+    if (c->p >= c->scan_end) return 0;
+    return bstack_get_batched_gen(alloc->bs, alsg_stats_gen, c);
+}
+
+int segregated_bstack_allocator_stats(
+    const segregated_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes)
+{
+    struct alsg_stats_ctx c;
+    uint64_t stack_len;
+    int      attempts = ALSG_STATS_SHRINK_RETRIES;
+
+    for (;;) {
+        if (bstack_len(alloc->bs, &stack_len) != 0) return -1;
+        if (alsg_stats_scan(alloc, stack_len, &c) == 0) break;
+        /* The length is sampled outside the lock bstack_get_batched_gen holds,
+         * so a concurrent discard of an oversized tail block can leave the scan
+         * reading past the new end.  Only a stale bound can raise EINVAL here,
+         * so retry on it and surface anything else as the read failure it is. */
+        if (errno != EINVAL || attempts-- <= 0) return -1;
+    }
+
+    if (out_free_blocks)   *out_free_blocks   = c.free_blocks;
+    if (out_free_bytes)    *out_free_bytes    = c.free_bytes;
+    if (out_in_use_blocks) *out_in_use_blocks = c.in_use_blocks;
+    if (out_in_use_bytes)  *out_in_use_bytes  = c.in_use_bytes;
     return 0;
 }
 #endif /* BSTACK_FEATURE_ATOMIC */

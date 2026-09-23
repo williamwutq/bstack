@@ -468,3 +468,87 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 - **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
 - **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
 - **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
+
+---
+
+## `coalescible()` — a cheap query for pending coalesce work on `SegregatedBStackAllocator`
+
+### Motivation
+
+`SegregatedBStackAllocator::coalesce` always strides the entire arena, so its cost is linear in the number of live blocks and reaches roughly 13 ms at 20,000 blocks on real filesystem I/O. In realistic interleaved workloads, however, freed blocks rarely come to rest physically adjacent to another free block, so the scan finds nothing to merge on the overwhelming majority of calls. There is currently no way to determine whether a scan would find any mergeable run without performing that scan in full. Because the answer depends on the physical adjacency of free blocks, which only the allocator can observe, it should be surfaced by the allocator rather than approximated by caller-side scheduling policy.
+
+### Design
+
+The value to expose is the number of merges `coalesce` would perform, which equals the count of free-to-free physical adjacencies, `(free blocks) − (free runs)`. A caller skips `coalesce` whenever it is zero.
+
+The default reported quantity is an adjacency **count**, because it is the minimal surface with a clean, testable invariant: `coalescible()` must equal what `coalesce()` would return if it ran without writing. A coalescible-*bytes* figure is recoverable in the same walk at no extra cost (see open questions) and can be offered alongside it.
+
+A dedicated method walks the arena once, reusing the `stats_scan`/`recover` walk and tracks only whether the previous physical block was free:
+
+```rust
+#[cfg(feature = "atomic")]
+pub fn coalescible(&self) -> io::Result<u64> {
+    let stack_len = self.stack.len()?; // retry on InvalidInput as stats() does
+    if stack_len <= Self::ARENA_START {
+        return Ok(0);
+    }
+    let scan_end =
+        Self::ARENA_START + ((stack_len - Self::ARENA_START) & !(Self::QUANTUM - 1));
+    let mut adjacencies = 0u64;
+    let mut prev_free = false;
+    let mut p = Self::ARENA_START;
+    let mut word_buf = [0u8; 8];
+    let mut pending = false;
+    self.stack.get_batched_gen(|| {
+        if pending {
+            pending = false;
+            let word = u64::from_le_bytes(word_buf);
+            let size = (word & !Self::IN_USE_BIT) << 4;
+            if word == 0 || size < Self::QUANTUM || size > scan_end - p {
+                p = scan_end; // zeroed tail or malformed: stop the scan here
+                return None;
+            }
+            let is_free = word & Self::IN_USE_BIT == 0;
+            if is_free && prev_free {
+                adjacencies += 1; // one more merge within this run
+            }
+            prev_free = is_free;
+            p += size;
+        }
+        if p >= scan_end {
+            return None;
+        }
+        pending = true;
+        Some((p, bstack_unsafe_reborrow_mut!(&mut word_buf[..])))
+    })?;
+    Ok(adjacencies)
+}
+```
+
+`adjacencies` counts each free block that immediately follows a free block, so it sums `(run_len − 1)` over every maximal free run, which is the merge count. The walk is linear in live blocks, which is the same cost profile as the `recover` scan that `new` already runs on every non-empty reopen and as the scan `coalesce` itself performs, so the query stays consistent with the allocator's existing costs rather than introducing a new one. It is a standalone query rather than a `BStackAllocStats` field, because a field would tie the value to the snapshot scan and defeat the purpose.
+
+The value is still meaningfully cheaper than `coalesce` in the common case it targets, because it reads the arena but never writes and so avoids the journalled `inplace_gen` commit. A caller that scans, finds `0`, and skips the merge pays one read pass instead of a read pass plus a durable write.
+
+Because the `recover` walk already strides every overhead word in exactly this order, the same `is_free && prev_free` accumulation can be folded into it, so that `recover` returns the coalescible count alongside its repair result rather than requiring a second scan. A caller that has just reopened the arena — where `new` runs `recover` before the handle escapes — then already holds the count without calling `coalescible()` at all. The standalone `coalescible()` above and this `recover`-side accumulation share the per-block body; whether to factor that body into one visitor both call, or to inline it in each, is left to implementation.
+
+### Open questions
+
+- **Naming.** Whether to name the method `coalescible`, reporting the adjacency (merge) count. The count alone is the minimal, invariant-checkable surface, since `coalescible()` must equal what `coalesce()` returns without writing.
+- **Whether to also expose a byte figure.** Whether to additionally return a coalescible-*bytes* value. Bytes are recoverable in the same walk at no extra cost and let a caller weigh reclamation value rather than just its existence, at the cost of a second returned quantity.
+
+---
+
+## Derive logical size from the cached committed length, not the file end
+
+**Feature flag:** None (internal change; no API or on-disk format change).
+**Breaking change:** No.
+
+### Motivation
+
+The committed length `clen` already holds the authoritative logical payload size at every operation boundary — `len`/`is_empty` answer from it with no syscall. Yet the read and in-place-mutation hot paths still ask the operating system for that same size on every call, so each read and each in-place write pays a redundant size syscall to learn what the stack already knows.
+
+### Design
+
+Reads — `peek`, `get`, `peek_into`, `get_into`, and the `get_batched`/`get_batched_into`/`get_batched_gen` family — bound-check against `guard.1` instead of `File::metadata().len()` (and, on the non-Unix/Windows fallback, instead of `lseek(SEEK_END)`). The in-place mutators — `set`, `zero`, `repeat`, `swap`/`swap_into`, `cas`, `copy`, `cross_exchange`, `process`, `process_gen`, the `*_crds` family (`eq_crds`/`ne_crds`/`masked_eq_crds`/`masked_ne_crds`), and `set_batched`/`inplace_gen` — bound-check against `guard.1` instead of `lseek(SEEK_END)`. `clen` is authoritative wherever these paths run: `read_lock`/`write_lock_read` already return `InterruptedWrite` while a replay is pending, so a read only proceeds once `clen` equals the physical payload size, and `write_lock` runs `replay_pending` — which reconciles and adopts `clen` — before a mutator's body, so a mutator reads `guard.1` after that point. The journals' staging and append offsets move to `clen` for the same reason: the WIP and multi-write journals stage scratch *past* `clen`, so a bounds check on `clen` while a staging point still used `seek(END)` could diverge mid-op — they agree today only because replay reconciles them at entry, and converting both removes that latent divergence. Only these steady-state read and mutator paths change; the recovery, replay, `open`, and `migrate` paths (`replay_pending`, `recover_file`, and the two entry points) must keep reading the physical file length.
+
+Because the change moves where size and journal offsets come from, it needs fuzzing, including crash and replay schedules, and a safety review of every converted call site before it lands. The expected payoff is the read-path `fstat` drop, since reads never journal; the in-place-write `lseek` drop is minor next to the journal's per-op `durable_sync` barriers. A mutator that derives its size from `clen` rather than the file end also cannot be misled by a stale tail past `clen` — the hazard `write_lock`'s contract currently calls out.

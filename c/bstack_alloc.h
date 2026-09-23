@@ -1068,6 +1068,37 @@ void first_fit_bstack_allocator_free(first_fit_bstack_allocator_t *alloc);
  */
 bstack_t *first_fit_bstack_allocator_into_stack(first_fit_bstack_allocator_t *alloc);
 
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Every block carries a header recording its size and an is_free flag, so a
+ * linear scan strides through the arena classifying each block directly,
+ * running the same walk the recovery scan does but without the repair: a
+ * malformed header, or too little space left for one, ends the scan there
+ * rather than being fixed, so the counts cover only the arena prefix that
+ * parsed cleanly. first_fit_bstack_allocator_new runs the repairing walk when
+ * the header's recovery_needed flag is set, so reopening the stack first gives
+ * an authoritative snapshot.
+ * Byte totals count the whole on-disk block (header, payload, and footer),
+ * not just the caller's requested length, since a block may be larger than
+ * its live request from a first-fit reuse.
+ *
+ * Under -DBSTACK_FEATURE_ATOMIC, every header in the scan is read inside one
+ * bstack_get_batched_gen sequence, held under the same internal lock the
+ * alloc/dealloc vtable functions take around their free-list access, so the
+ * snapshot is consistent even under concurrent mutation. Without it, plain
+ * sequential bstack_get calls are used.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set). A malformed block header
+ * is not an error; it truncates the scan.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int first_fit_bstack_allocator_stats(
+    first_fit_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+
 /* =========================================================================
  * ghost_tree_bstack_allocator_t — best-fit AVL tree allocator
  *
@@ -1128,6 +1159,32 @@ void ghost_tree_bstack_allocator_free(ghost_tree_bstack_allocator_t *alloc);
  * The returned bstack_t * must eventually be passed to bstack_close.
  */
 bstack_t *ghost_tree_bstack_allocator_into_stack(ghost_tree_bstack_allocator_t *alloc);
+
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * A free block is exactly an AVL tree node, so free_blocks/free_bytes come
+ * from an in-order walk of the tree, summing node sizes. A live allocation
+ * carries no header, so individual allocations cannot be told apart when
+ * they sit back to back; in_use_blocks instead counts the number of maximal
+ * contiguous live byte spans between the free nodes. in_use_bytes is the
+ * total arena size minus free_bytes.
+ *
+ * Under -DBSTACK_FEATURE_ATOMIC the walk runs under the same internal lock the
+ * alloc/dealloc vtable functions take around their own tree access, so the
+ * snapshot is consistent even under concurrent mutation. Without it the
+ * allocator is single-threaded, so no lock is needed.
+ *
+ * Returns 0 on success, -1 on error (errno set): the errno of the failing
+ * bstack read or allocation, or EINVAL if the tree traversal exceeds the
+ * maximum AVL depth (a cycle from a corrupted tree).
+ */
+BSTACK_WARN_UNUSED_RESULT
+int ghost_tree_bstack_allocator_stats(
+    ghost_tree_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
 
 /* =========================================================================
  * slab_bstack_allocator_t — fixed-block slab allocator
@@ -1227,6 +1284,37 @@ bstack_t *slab_bstack_allocator_into_stack(slab_bstack_allocator_t *alloc);
  * Return the block_size this allocator was created with.
  */
 uint64_t slab_bstack_allocator_block_size(const slab_bstack_allocator_t *alloc);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * A plain slab block carries no per-block state — free blocks are only known by
+ * chasing the singly-linked free list from free_head. This walks that list in
+ * one bstack_get_batched_gen sequence, validating each node (in-bounds,
+ * block_size-aligned) as it goes. in_use_blocks is then
+ * (total_blocks - free_blocks), where total_blocks is the arena size divided by
+ * block_size.
+ *
+ * A list can hold at most total_blocks nodes, so the count doubles as the cycle
+ * bound and no visited set is needed. A malformed pointer ends the walk there;
+ * a cycle ends it at total_blocks, which reports the whole arena free rather
+ * than looping.
+ *
+ * Reads happen under one held shared lock, so the counts are a consistent
+ * snapshot despite concurrent alloc/dealloc. This allocator carries no
+ * allocator-level lock at all.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int slab_bstack_allocator_stats(
+    const slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * checked_slab_bstack_allocator_t — crash-recoverable fixed-block slab allocator
@@ -1358,6 +1446,40 @@ bstack_t *checked_slab_bstack_allocator_into_stack(
  */
 uint64_t checked_slab_bstack_allocator_data_size(
     const checked_slab_bstack_allocator_t *alloc);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Byte totals count whole blocks (block_size each, including the 8-byte
+ * overhead), not caller-requested length. The checked-slab format only
+ * records how many block_size blocks a live allocation spans, not the
+ * length the caller asked for.
+ *
+ * Blocks are classified as the recovery scan classifies them, except that
+ * this walk does not read the free list, so a leaked block (overhead == 0 but
+ * unreachable from free_head) counts as free.
+ * checked_slab_bstack_allocator_recover reclaims those.
+ *
+ * Reads the whole arena in one bstack_get_batched_gen sequence under one
+ * held shared lock, so the counts are a consistent snapshot despite
+ * concurrent alloc/dealloc. No allocator-level lock is taken.
+ *
+ * A malformed overhead word (left by an un-recovered crash) ends the scan at
+ * that point; the returned counts cover only the arena prefix that parsed
+ * cleanly — call checked_slab_bstack_allocator_recover first for an
+ * authoritative snapshot.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int checked_slab_bstack_allocator_stats(
+    const checked_slab_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
+#endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
  * segregated_bstack_allocator_t — segregated (binned) free-list allocator
@@ -1519,6 +1641,35 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
 BSTACK_WARN_UNUSED_RESULT
 int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
                                          uint64_t *out_fused);
+
+/*
+ * Snapshot block occupancy: writes the free/in-use block counts and byte
+ * totals into the four out-pointers (any may be NULL to skip it).
+ *
+ * Byte totals count each block's recorded physical size (including the
+ * 8-byte overhead), not the caller's requested length. The segregated
+ * format never persists the requested length, so any retained excess above
+ * a request is counted as in-use bytes, not fragmentation.
+ *
+ * Reads the whole arena in one bstack_get_batched_gen sequence, so the counts
+ * are a consistent snapshot despite concurrent alloc/dealloc. Unlike
+ * segregated_bstack_allocator_coalesce, which rewrites what it reads and so
+ * scans under a bstack_process_gen, this walk needs only the shared lock. No
+ * allocator-level lock is taken.
+ *
+ * A malformed overhead word, or a zeroed tail left by a crashed extend, ends
+ * the scan at that point; the returned counts cover only the arena prefix
+ * that parsed cleanly — run segregated_bstack_allocator_coalesce (or
+ * segregated_bstack_allocator_recover) first for an authoritative snapshot.
+ *
+ * Returns 0 on success, -1 on I/O error (errno set).
+ * Requires -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int segregated_bstack_allocator_stats(
+    const segregated_bstack_allocator_t *alloc,
+    uint64_t *out_free_blocks, uint64_t *out_free_bytes,
+    uint64_t *out_in_use_blocks, uint64_t *out_in_use_bytes);
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /*

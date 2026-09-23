@@ -1027,6 +1027,162 @@ static int test_bulk_alloc_rejects_overflow_count(void)
 /* A slice issued by one allocator instance must be refused by another: the
  * language cannot catch it, so the allocator does, at run time, before
  * touching any metadata.  See "Foreign slices" in bstack_alloc.h. */
+#ifdef BSTACK_FEATURE_ATOMIC
+/* ---- stats ----------------------------------------------------------- */
+
+/* Header layout: 16 offset bytes + 32 header bytes; free_head sits at +16. */
+#define SL_FREE_HEAD_OFFSET 32
+
+static void sl_put_le64(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+static int test_stats_empty_arena_is_all_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_stats_accepts_null_out_pointers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 8, &s) == 0);
+
+    CHECK(slab_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+    uint64_t uy = 0;
+    CHECK(slab_bstack_allocator_stats(a, NULL, NULL, NULL, &uy) == 0);
+    CHECK(uy == 16);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_stats_counts_free_and_in_use_blocks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 8, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 8, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 8, &z) == 0);
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* A single-block dealloc always goes to the free list, tail or not. */
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 16 && ub == 2 && uy == 32);
+
+    CHECK(bstack_allocator_dealloc(al, z) == 0);
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 3 && fy == 48 && ub == 0 && uy == 0);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_stats_multi_block_allocation_counts_each_block(void)
+{
+    /* block_size 16; a 30-byte request spans 2 blocks and is always served by
+     * a tail extend, so with no per-block state both blocks read as in-use. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 30, &s) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 2 && uy == 32);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_stats_bounds_a_cyclic_free_list(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t w, x, y, z;
+    CHECK(bstack_allocator_alloc(al, 8, &w) == 0);
+    CHECK(bstack_allocator_alloc(al, 8, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 8, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 8, &z) == 0);
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* Free list is y -> x -> SENTINEL; w and z stay live. */
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 32 && ub == 2 && uy == 32);
+
+    /* Point x's next back at y, so the list cycles y -> x -> y. */
+    uint8_t nxt[8]; sl_put_le64(nxt, y.offset);
+    CHECK(bstack_set(bs, x.offset, nxt, 8) == 0);
+    /* The walk stops once it has counted total_blocks nodes rather than
+     * spinning, which reports the whole arena free. */
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 4 && fy == 64 && ub == 0 && uy == 0);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+static int test_stats_clamps_tail_that_is_not_a_whole_block(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    slab_bstack_allocator_t *a = slab_bstack_allocator_new(bs, 16);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 8, &s) == 0);
+    uint64_t torn;
+    CHECK(bstack_len(bs, &torn) == 0);
+    /* A crashed extend can leave a partial block on the tail. A free-list node
+     * pointing into it is in bounds but has no whole block to read. */
+    CHECK(bstack_extend(bs, 5, NULL) == 0);
+    uint8_t head[8]; sl_put_le64(head, torn);
+    CHECK(bstack_set(bs, SL_FREE_HEAD_OFFSET, head, 8) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 16);
+
+    bstack_close(slab_bstack_allocator_into_stack(a));
+    sl_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 static int test_foreign_slice_is_rejected(void)
 {
     char t1[64], t2[64];
@@ -1111,6 +1267,14 @@ int main(void)
     T(test_bulk_dealloc_rejects_foreign);
     T(test_bulk_alloc_detects_cycle);
     T(test_bulk_alloc_rejects_overflow_count);
+
+    /* stats */
+    T(test_stats_empty_arena_is_all_zero);
+    T(test_stats_accepts_null_out_pointers);
+    T(test_stats_counts_free_and_in_use_blocks);
+    T(test_stats_multi_block_allocation_counts_each_block);
+    T(test_stats_bounds_a_cyclic_free_list);
+    T(test_stats_clamps_tail_that_is_not_a_whole_block);
 #endif
 
     T(test_foreign_slice_is_rejected);

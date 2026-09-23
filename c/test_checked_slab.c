@@ -1255,6 +1255,224 @@ static int test_bulk_alloc_rejects_overflow_count(void)
 /* A slice issued by one allocator instance must be refused by another: the
  * language cannot catch it, so the allocator does, at run time, before
  * touching any metadata.  See "Foreign slices" in bstack_alloc.h. */
+/* =========================================================================
+ * stats (requires -DBSTACK_FEATURE_ATOMIC)
+ * ====================================================================== */
+
+#ifdef BSTACK_FEATURE_ATOMIC
+
+static int test_stats_empty_arena_is_all_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+static int test_stats_accepts_null_out_pointers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 24, &s) == 0);
+
+    CHECK(checked_slab_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+    uint64_t uy = 0;
+    CHECK(checked_slab_bstack_allocator_stats(a, NULL, NULL, NULL, &uy) == 0);
+    CHECK(uy == 32); /* one block of block_size 32 */
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+static int test_stats_counts_free_and_in_use_blocks(void)
+{
+    /* data_size = 24 -> block_size = 32. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 24, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 24, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 24, &z) == 0);
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    /* x, z in use (32 B each); y free (32 B). */
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 32 && ub == 2 && uy == 64);
+
+    /* z is the tail block, so freeing it truncates the arena rather than
+     * adding a third free block; only x and y remain free. */
+    CHECK(bstack_allocator_dealloc(al, z) == 0);
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 2 && fy == 64 && ub == 0 && uy == 0);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+static int test_stats_multi_block_allocation_spans_several(void)
+{
+    /* data_size = 8 -> block_size = 16; a 30-byte request spans 3 blocks
+     * (2 blocks give only 2*16 - 8 = 24 usable bytes < 30). */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 8);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 30, &s) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 48);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+static int test_stats_stops_at_suspicious_overhead_word(void)
+{
+    /* A non-zero overhead word without the in-use bit is what the recovery
+     * scan calls Suspicious; stats must stop rather than read it as free. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 24, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 24, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 24, &z) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 3 && uy == 96);
+
+    uint8_t bad[8];
+    memset(bad, 0, sizeof bad);
+    bad[0] = 0x34; bad[1] = 0x12;                   /* 0x1234, in-use bit clear */
+    CHECK(bstack_set(bs, y.offset - 8, bad, 8) == 0); /* block_start = offset - OVERHEAD */
+
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 32);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+static int test_stats_clamps_tail_that_is_not_a_whole_block(void)
+{
+    /* A crashed extend can leave a partial block on the tail. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 24, &s) == 0);
+    CHECK(bstack_extend(bs, 5, NULL) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(checked_slab_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 32);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+/* --- stats against a concurrent tail discard -------------------------- */
+
+#define CSL_STATS_CHURN_THREADS 4
+#define CSL_STATS_CHURN_ITERS   4000
+
+typedef struct {
+    bstack_allocator_t *a;
+    volatile int       *done;
+} csl_stats_churn_arg_t;
+
+static void *csl_stats_churn_worker(void *argp)
+{
+    csl_stats_churn_arg_t *arg = argp;
+    for (int i = 0; i < CSL_STATS_CHURN_ITERS; i++) {
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(arg->a, 24, &s) == 0)
+            (void)bstack_allocator_dealloc(arg->a, s);
+    }
+    __atomic_fetch_add((int *)arg->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static int test_stats_survives_concurrent_tail_discard(void)
+{
+    /* A dealloc of the tail block discards it; one landing between the length
+     * sample and the read lock used to fail with EINVAL. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t keep[8];
+    for (int i = 0; i < 8; i++)
+        CHECK(bstack_allocator_alloc(al, 24, &keep[i]) == 0);
+
+    volatile int done = 0;
+    pthread_t             threads[CSL_STATS_CHURN_THREADS];
+    csl_stats_churn_arg_t args[CSL_STATS_CHURN_THREADS];
+    for (int i = 0; i < CSL_STATS_CHURN_THREADS; i++) {
+        args[i].a = al; args[i].done = &done;
+        pthread_create(&threads[i], NULL, csl_stats_churn_worker, &args[i]);
+    }
+
+    int ok = 1;
+    while (__atomic_load_n((int *)&done, __ATOMIC_ACQUIRE)
+           < CSL_STATS_CHURN_THREADS) {
+        uint64_t ub = 0;
+        if (checked_slab_bstack_allocator_stats(a, NULL, NULL, &ub, NULL) != 0
+            || ub < 8) {
+            ok = 0; break;
+        }
+    }
+    for (int i = 0; i < CSL_STATS_CHURN_THREADS; i++)
+        pthread_join(threads[i], NULL);
+    CHECK(ok);
+
+    for (int i = 0; i < 8; i++)
+        CHECK(bstack_allocator_dealloc(al, keep[i]) == 0);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+#endif /* BSTACK_FEATURE_ATOMIC */
+
 static int test_foreign_slice_is_rejected(void)
 {
     char t1[64], t2[64];
@@ -1354,6 +1572,15 @@ int main(void)
     T(test_bulk_dealloc_rejects_foreign);
     T(test_bulk_alloc_detects_cycle);
     T(test_bulk_alloc_rejects_overflow_count);
+
+    /* ── stats ────────────────────────────────────────────────────────── */
+    T(test_stats_empty_arena_is_all_zero);
+    T(test_stats_accepts_null_out_pointers);
+    T(test_stats_counts_free_and_in_use_blocks);
+    T(test_stats_multi_block_allocation_spans_several);
+    T(test_stats_stops_at_suspicious_overhead_word);
+    T(test_stats_clamps_tail_that_is_not_a_whole_block);
+    T(test_stats_survives_concurrent_tail_discard);
 #endif
 
     T(test_foreign_slice_is_rejected);

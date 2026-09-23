@@ -1141,6 +1141,182 @@ static int test_coalesce_partial_run(void)
     sg_unlink(tmp); return 0;
 }
 
+/* ---- stats ----------------------------------------------------------- */
+
+static int test_stats_empty_arena_is_all_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+
+    uint64_t fb = 9, fy = 9, ub = 9, uy = 9;
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 0 && uy == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_stats_accepts_null_out_pointers(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 100, &s) == 0);
+
+    CHECK(segregated_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+    uint64_t uy = 0;
+    CHECK(segregated_bstack_allocator_stats(a, NULL, NULL, NULL, &uy) == 0);
+    CHECK(uy == 112); /* len 100 -> physical 112 */
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_stats_counts_free_and_in_use_blocks(void)
+{
+    /* len = 100 -> physical size 112 (linear class, passes through). */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y, z;
+    CHECK(bstack_allocator_alloc(al, 100, &x) == 0);
+    CHECK(bstack_allocator_alloc(al, 100, &y) == 0);
+    CHECK(bstack_allocator_alloc(al, 100, &z) == 0);
+    CHECK(bstack_allocator_dealloc(al, y) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 1 && fy == 112 && ub == 2 && uy == 224);
+
+    /* Unlike the checked slab, a classed (non-oversized) block always goes to
+     * its free list on dealloc, tail or not. */
+    CHECK(bstack_allocator_dealloc(al, x) == 0);
+    CHECK(bstack_allocator_dealloc(al, z) == 0);
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 3 && fy == 336 && ub == 0 && uy == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_stats_oversized_block_counts_physical_size(void)
+{
+    /* len = 5000 -> need = round_up(5000 + 8, 16) = 5008 > MAX_CLASS (4096),
+     * so it lands in the oversized bucket at its raw rounded size. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 5000, &s) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 5008);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+static int test_stats_clamps_tail_that_is_not_a_whole_quantum(void)
+{
+    /* A crashed extend can leave the arena a non-multiple of the quantum. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s;
+    CHECK(bstack_allocator_alloc(al, 100, &s) == 0);
+    CHECK(bstack_extend(bs, 4, NULL) == 0);
+
+    uint64_t fb, fy, ub, uy;
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(fb == 0 && fy == 0 && ub == 1 && uy == 112);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* --- stats against a concurrent tail discard -------------------------- */
+
+#include <pthread.h>
+
+#define SG_STATS_CHURN_THREADS 4
+#define SG_STATS_CHURN_ITERS   2000
+#define SG_STATS_OVERSIZED     5000 /* > MAX_CLASS: dealloc discards the tail */
+
+typedef struct {
+    bstack_allocator_t *a;
+    volatile int       *done;
+} sg_stats_churn_arg_t;
+
+static void *sg_stats_churn_worker(void *argp)
+{
+    sg_stats_churn_arg_t *arg = argp;
+    for (int i = 0; i < SG_STATS_CHURN_ITERS; i++) {
+        bstack_slice_t s;
+        if (bstack_allocator_alloc(arg->a, SG_STATS_OVERSIZED, &s) == 0)
+            (void)bstack_allocator_dealloc(arg->a, s);
+    }
+    __atomic_fetch_add((int *)arg->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static int test_stats_survives_concurrent_tail_discard(void)
+{
+    /* Freeing an oversized tail block discards it; one landing between the
+     * length sample and the read lock used to fail with EINVAL. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t keep[8];
+    for (int i = 0; i < 8; i++)
+        CHECK(bstack_allocator_alloc(al, SG_STATS_OVERSIZED, &keep[i]) == 0);
+
+    volatile int done = 0;
+    pthread_t            threads[SG_STATS_CHURN_THREADS];
+    sg_stats_churn_arg_t args[SG_STATS_CHURN_THREADS];
+    for (int i = 0; i < SG_STATS_CHURN_THREADS; i++) {
+        args[i].a = al; args[i].done = &done;
+        pthread_create(&threads[i], NULL, sg_stats_churn_worker, &args[i]);
+    }
+
+    int ok = 1;
+    while (__atomic_load_n((int *)&done, __ATOMIC_ACQUIRE)
+           < SG_STATS_CHURN_THREADS) {
+        uint64_t ub = 0;
+        if (segregated_bstack_allocator_stats(a, NULL, NULL, &ub, NULL) != 0
+            || ub < 8) {
+            ok = 0; break;
+        }
+    }
+    for (int i = 0; i < SG_STATS_CHURN_THREADS; i++)
+        pthread_join(threads[i], NULL);
+    CHECK(ok);
+
+    for (int i = 0; i < 8; i++)
+        CHECK(bstack_allocator_dealloc(al, keep[i]) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1180,6 +1356,13 @@ int main(void)
     T(test_coalesce_noop_without_adjacency);
     T(test_coalesce_empty_arena);
     T(test_coalesce_partial_run);
+
+    T(test_stats_empty_arena_is_all_zero);
+    T(test_stats_accepts_null_out_pointers);
+    T(test_stats_counts_free_and_in_use_blocks);
+    T(test_stats_oversized_block_counts_physical_size);
+    T(test_stats_clamps_tail_that_is_not_a_whole_quantum);
+    T(test_stats_survives_concurrent_tail_discard);
 #endif
 
     printf("\n%d/%d tests passed\n", g_passed, g_total);
