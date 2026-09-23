@@ -12,7 +12,25 @@ permissions:
   contents: read
 
 jobs:
+  # Manual path filter: the trigger-level `paths:` above is kept, but GitHub
+  # does not evaluate it reliably, so this job is the authoritative gate.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      alloc: ${{ steps.filter.outputs.alloc }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v4
+      id: filter
+      with:
+        filters: |
+          alloc:
+            - 'src/alloc/**'
+            - 'src/alloc_fuzz_tests.rs'
+
   fuzz:
+    needs: changes
+    if: needs.changes.outputs.alloc == 'true'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
