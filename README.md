@@ -3,10 +3,19 @@
 A persistent, fsync-durable binary stack backed by a single file.
 
 Every write — `push`, `pop`, and the optional `set`/`atomic` operations —
-performs a *durable sync* before returning, so data survives a process crash
-or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used instead of
-`fdatasync` to flush the drive's hardware write cache, which plain
-`fdatasync` does not guarantee.
+performs a *durable sync* before returning, so a completed write survives a
+process crash or unclean shutdown.  Size-changing operations (`push`, `pop`,
+`extend`, `discard`, and friends) are additionally **crash-atomic**: a crash
+part-way through rolls back cleanly on the next `open`.  In-place overwrites of
+already-committed bytes (`set`, `swap`, `copy`, and the length-changing
+`atrunc`/`splice`/`replace`, …) are durable once the call returns but are
+**not** crash-atomic on this release — a crash *during* the write can leave a
+torn region (see [Durability](#durability)).  **The 0.4.x line adds a
+write-in-progress journal that makes every in-place operation crash-atomic; an
+existing 0.2 file can be upgraded in place — see [Migrating to the 0.4.x
+line](#migrating-to-the-04x-line).**  On **macOS**,
+`fcntl(F_FULLFSYNC)` is used instead of `fdatasync` to flush the drive's
+hardware write cache, which plain `fdatasync` does not guarantee.
 
 [![Crates.io](https://img.shields.io/crates/v/bstack)](https://crates.io/crates/bstack)
 [![Docs.rs](https://img.shields.io/docsrs/bstack)](https://docs.rs/bstack)
@@ -42,6 +51,17 @@ slab, etc.) over the payload.
 > the behaviour of the crate — including freedom from data loss or logical
 > corruption — when the file has been accessed outside of this crate's
 > controlled interface.**
+
+> **In-place writes are not crash-atomic on the 0.2 line.** `push`/`pop` and the
+> other size-changing operations are crash-atomic, but the in-place operations
+> (`set`, `zero`, `repeat`, `swap`, `cas`, `copy`, `cross_exchange`, `process`,
+> the `*_crds` family, and the length-changing `atrunc`/`splice`/`replace`) are
+> durably synced once the call returns yet can be left **torn** — part old, part
+> new — by a crash *during* the write, because this line keeps the original
+> 16-byte format with no write-in-progress journal.  **If you need crash-atomic
+> in-place mutation, migrate to the 0.4.x line**, which journals every in-place
+> operation and can upgrade an existing 0.2 file in place — see [Migrating to the
+> 0.4.x line](#migrating-to-the-04x-line).
 
 ---
 
@@ -553,8 +573,8 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
 | `zero` *(feature)*                     | `lseek(offset)` → `write(zeros)` → sync                                                   |
-| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)`                  |
-| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)`                  |
+| `atrunc` *(atomic, net extension)*     | `set_len(new_end)` → `lseek(tail)` → `write(buf)` → sync → `write(clen)` → sync           |
+| `atrunc` *(atomic, net truncation)*    | `lseek(tail)` → `write(buf)` → `set_len(new_end)` → sync → `write(clen)` → sync           |
 | `splice`, `splice_into` *(atomic)*     | `lseek(tail)` → `read(n)` → *(then as `atrunc`)*                                          |
 | `try_extend` *(atomic)*                | size check → conditional `push` sequence                                                  |
 | `try_discard` *(atomic)*               | size check → conditional `discard` sequence                                               |
@@ -584,6 +604,24 @@ the drive to acknowledge, providing equivalent durability to `fdatasync`.
 **Push rollback:** if the write or sync fails, a best-effort `ftruncate` and
 header reset restore the pre-push state.
 
+**Crash atomicity of in-place writes.** The size-changing operations above
+(`push`/`pop`/`extend`/`discard`/`resize`/`ensure`/`extend_sparse*` and the
+`try_*` forms) are crash-atomic: they only ever grow the file past `clen`
+(rolled back by truncation on the next `open`) or truncate it (committed at the
+smaller size), so a crash leaves either the old state or the new one. The
+in-place operations that overwrite already-committed bytes — `set`, `zero`,
+`repeat`, `swap`, `swap_into`, `cas`, `copy`, `cross_exchange`, `process`, the
+`*_crds` family, and the length-changing `atrunc`/`splice`/`splice_into`/`replace`
+— are durably synced once the call returns, but are **not** crash-atomic on this
+release: a crash *during* the write can leave a torn region (some bytes new, some
+old), because there is no write-in-progress journal to replay or roll back the
+overwrite. The recovery table below only reconciles the file size against `clen`,
+so it cannot detect or repair a torn in-place overwrite. **The 0.4.x line adds a
+write-in-progress journal that makes all of these operations crash-atomic**; the
+0.2 line stays on the current format for compatibility, so callers that need
+crash-atomic in-place mutation should upgrade — see [Migrating to the 0.4.x
+line](#migrating-to-the-04x-line).
+
 ---
 
 ## Crash recovery
@@ -597,6 +635,24 @@ next `open`:
 | `file_size − 16 < clen` | partial truncation (crashed before header update) | set `clen = file_size − 16`, durable-sync |
 
 No caller action is required; recovery is transparent.
+
+---
+
+## Migrating to the 0.4.x line
+
+The 0.2 line keeps the original 16-byte on-disk format and does **not** journal
+in-place writes, so `set`, `swap`, `copy`, `cross_exchange`, `process`, the
+`*_crds` family, and the length-changing `atrunc`/`splice`/`replace` are durable
+but not crash-atomic (see [Durability](#durability)).  This line stays on that
+format for backward compatibility; the write-in-progress journal that makes those
+operations crash-atomic lives on the **0.4.x line**, which uses a 32-byte header.
+
+If you need crash-atomic in-place mutation, move to the 0.4.x line.  It can
+upgrade an existing 0.2 file in place: `BStack::open` rejects the older format,
+and `BStack::migrate` (C: `bstack_migrate`) rewrites the file to the 0.4.0 layout
+via a temporary sibling file and an atomic rename.  See the 0.4.x migration guide
+(`docs/MIGRATION_0.4.0.md`) for the full procedure.  Pure `push`/`pop`/`extend`
+workloads are already crash-atomic on the 0.2 line and do not need to migrate.
 
 ---
 
@@ -670,6 +726,14 @@ one indivisible step.
   many bytes each logical record occupies.
 - **Push rollback is best-effort.** A failure during rollback is silently
   swallowed; crash recovery on the next `open` will repair the state.
+- **In-place overwrites are not crash-atomic.** `set`, `zero`, `repeat`,
+  `swap`, `cas`, `copy`, `cross_exchange`, `process`, the `*_crds` family, and
+  the length-changing `atrunc`/`splice`/`splice_into`/`replace` are durable once
+  they return, but a crash *mid-write* can leave a torn (partly-old, partly-new)
+  region — there is no write-in-progress journal on the 0.2 line to repair it.
+  The 0.4.x line adds one; callers on this line that need crash-atomic mutation
+  should stay with append/truncate (`push`/`pop`) or move to the 0.4.x line (see
+  [Migrating to the 0.4.x line](#migrating-to-the-04x-line)).
 - **No `O_DIRECT`.** Writes go through the page cache; durability relies on
   `durable_sync`, not cache bypass.
 - **Single file only.** There is no WAL, manifest, or secondary index.
