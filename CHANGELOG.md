@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Reads and in-place writes now bound-check against the cached committed length (Rust and C).** This covers `peek`, `get`, the `get_batched` family, `lock_up_to`, and every in-place mutator (`set`, `swap`, `cas`, `copy`, `process_gen`, `inplace_gen`, the `*_crds` family, …), saving an `fstat`/`lseek` per call. Appends, truncations, and recovery still read the physical size.
 - **Moves, copies, and repeat-fills no longer heap-allocate (Rust).** They stream through a reused per-thread 4 KiB buffer, and a fill whose pattern exceeds it writes the pattern directly. The C port already used a stack buffer.
 
 ### Fixed
