@@ -54,6 +54,13 @@ pub(crate) const ATOMIC_BLOCK: u64 = 256;
 /// feature-gated: recovery's repeat-fill replay ([`write_repeated`]) uses it.
 const MOVE_CHUNK: u64 = 4 * 1024;
 
+thread_local! {
+    /// Per-thread [`MOVE_CHUNK`] scratch for streaming moves and fills, reused to
+    /// avoid a heap allocation per call.
+    static CHUNK_BUF: std::cell::RefCell<[u8; MOVE_CHUNK as usize]> =
+        const { std::cell::RefCell::new([0; MOVE_CHUNK as usize]) };
+}
+
 // ------------------------------------------- OS Primitives -------------------------------------------
 
 /// Read `len` bytes from absolute file position `offset` without modifying
@@ -302,17 +309,17 @@ pub(crate) fn write_at(file: &mut File, offset: u64, data: &[u8]) -> io::Result<
 /// other writer — and, on the rwlock-guarded paths, no reader — can observe or
 /// touch the region between chunks. The chunking is purely an in-memory detail.
 pub(crate) fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
-    let cap = n.min(MOVE_CHUNK) as usize;
-    let mut buf = vec![0u8; cap];
-    let mut done = 0u64;
-    while done < n {
-        // `min` in u64 first: casting the remainder could truncate to 0 on 32-bit.
-        let take = (n - done).min(cap as u64) as usize;
-        read_at(file, src + done, &mut buf[..take])?;
-        write_at(file, dst + done, &buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let mut done = 0u64;
+        while done < n {
+            // `min` in u64 first: casting the remainder could truncate to 0 on 32-bit.
+            let take = (n - done).min(MOVE_CHUNK) as usize;
+            read_at(file, src + done, &mut buf[..take])?;
+            write_at(file, dst + done, &buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Overwrite the committed-length field at file offset 8 and update the
@@ -682,8 +689,8 @@ pub(crate) fn journaled_repeat(
 }
 
 /// Fill `[phys .. phys + k*s.len())` with `k` back-to-back copies of `s`, writing
-/// through a buffer of whole copies of `s` bounded by [`MOVE_CHUNK`] (so O(1)
-/// memory beyond `s` itself). `phys` is a physical file offset.
+/// through a per-thread buffer of whole copies of `s` bounded by [`MOVE_CHUNK`]
+/// (no allocation). `phys` is a physical file offset.
 ///
 /// Because the buffer is an exact number of copies of `s` and the total is
 /// `k*s.len()`, every chunk boundary lands on a copy boundary, so the pattern
@@ -697,21 +704,30 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     let total = k
         .checked_mul(unit)
         .ok_or_else(|| io_error!(InvalidData, "write_repeated: length overflow"))?;
-    // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK
-    // (at least one), capped at `k`.
-    let copies = (MOVE_CHUNK / unit).max(1).min(k);
-    let mut buf = Vec::with_capacity((copies * unit) as usize);
-    for _ in 0..copies {
-        buf.extend_from_slice(s);
+    file.seek(SeekFrom::Start(phys))?;
+    if unit > MOVE_CHUNK {
+        // One copy already exceeds the buffer: write `s` itself.
+        for _ in 0..k {
+            file.write_all(s)?;
+        }
+        return Ok(());
     }
-    let mut done = 0u64;
-    while done < total {
-        let take = (total - done).min(buf.len() as u64) as usize;
-        file.seek(SeekFrom::Start(phys + done))?;
-        file.write_all(&buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK,
+    // capped at `k`.
+    let blen = ((MOVE_CHUNK / unit).min(k) * unit) as usize;
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let buf = &mut buf[..blen];
+        for c in buf.chunks_exact_mut(s.len()) {
+            c.copy_from_slice(s);
+        }
+        let mut done = 0u64;
+        while done < total {
+            let take = (total - done).min(blen as u64) as usize;
+            file.write_all(&buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Fill `[offset, offset + k*s.len())` with `k` copies of `s`, crash-atomically,
@@ -1296,7 +1312,7 @@ impl<'a> OverlayData<'a> {
 
     /// Write the edit's `len()` bytes at the file's current position, advancing the
     /// cursor. A literal is one `write_all`; a repeat streams through a bounded
-    /// buffer (`O(pattern.len())` memory, capped near [`MOVE_CHUNK`]).
+    /// per-thread buffer (no allocation).
     fn write_seq(&self, file: &mut File) -> io::Result<()> {
         match self {
             OverlayData::Literal(d) => file.write_all(d),
@@ -1312,30 +1328,47 @@ impl<'a> OverlayData<'a> {
 /// Stream `len` bytes of `pattern`, rotated to start at `phase`, at the file's
 /// current position (no seek; the cursor advances). The scratch buffer is a whole
 /// number of pattern periods (so each refill continues the rotation seamlessly)
-/// bounded near [`MOVE_CHUNK`], keeping memory `O(pattern.len())`. `pattern` is
-/// non-empty; `phase < pattern.len()`.
+/// within [`MOVE_CHUNK`]; a pattern longer than that is written directly.
+/// `pattern` is non-empty; `phase < pattern.len()`.
 #[cfg(all(feature = "set", feature = "atomic"))]
 fn write_pattern(file: &mut File, pattern: &[u8], phase: usize, len: u64) -> io::Result<()> {
     if len == 0 {
         return Ok(());
     }
     let plen = pattern.len();
-    let copies = (MOVE_CHUNK / plen as u64).max(1) as usize;
-    let cap = copies * plen;
-    let mut buf = Vec::with_capacity(cap);
-    for j in 0..cap {
-        buf.push(pattern[(phase + j) % plen]);
+    // `phase == plen` would make the direct loop's first `take` 0 and spin forever.
+    debug_assert!(phase < plen);
+    if plen as u64 > MOVE_CHUNK {
+        // One period already exceeds the buffer: write `pattern` itself, starting
+        // at `phase` and wrapping to 0 thereafter.
+        let mut pos = phase;
+        let mut done = 0u64;
+        while done < len {
+            let take = ((plen - pos) as u64).min(len - done) as usize;
+            file.write_all(&pattern[pos..pos + take])?;
+            done += take as u64;
+            pos = 0;
+        }
+        return Ok(());
     }
-    // `cap` is a multiple of `plen`, so `buf[cap]` would wrap to `buf[0]` — writing
-    // the buffer repeatedly continues the same rotation, and any short final write
-    // is a valid prefix of it.
-    let mut done = 0u64;
-    while done < len {
-        let take = (len - done).min(buf.len() as u64) as usize;
-        file.write_all(&buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    let cap = (MOVE_CHUNK as usize / plen) * plen;
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let buf = &mut buf[..cap];
+        for c in buf.chunks_exact_mut(plen) {
+            c[..plen - phase].copy_from_slice(&pattern[phase..]);
+            c[plen - phase..].copy_from_slice(&pattern[..phase]);
+        }
+        // `cap` is a multiple of `plen`, so `buf[cap]` would wrap to `buf[0]` —
+        // writing the buffer repeatedly continues the same rotation, and any short
+        // final write is a valid prefix of it.
+        let mut done = 0u64;
+        while done < len {
+            let take = (len - done).min(cap as u64) as usize;
+            file.write_all(&buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Insert an in-place write `[off, off + data.len())` into an `inplace_gen`

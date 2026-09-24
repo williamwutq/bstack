@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`GhostTreeBstackAllocator::stats` (Rust) / `ghost_tree_bstack_allocator_stats` (C) (`alloc` + `set`; `atomic` additionally serialises the walk against concurrent `alloc`/`dealloc`).** Reports a `BStackAllocStats`, the C form as four out-parameters. A free block is exactly an AVL tree node, so `free_blocks`/`free_bytes` come from an in-order tree walk; a live allocation carries no header, so individual allocations sitting back to back cannot be told apart, and `in_use_blocks` instead counts the number of maximal contiguous live byte spans between the free nodes. `in_use_bytes` is the total arena size minus `free_bytes`.
 - **`FirstFitBStackAllocator::stats` (Rust) / `first_fit_bstack_allocator_stats` (C) (`alloc` + `set`; `atomic` additionally batches the walk under one `BStack::get_batched_gen`/`bstack_get_batched_gen` sequence and serialises it against concurrent `alloc`/`dealloc`).** Reports a `BStackAllocStats`, the C form as four out-parameters. Every block already carries a header recording its size and an `is_free` flag, so a linear scan strides through the arena classifying each block directly, running the same walk `recovery` does but without the repair. Byte totals count the whole on-disk block (header, payload, and footer).
 
+### Changed
+
+- **Moves, copies, and repeat-fills no longer heap-allocate (Rust).** They stream through a reused per-thread 4 KiB buffer, and a fill whose pattern exceeds it writes the pattern directly. The C port already used a stack buffer.
+
 ### Fixed
 
 - **32-bit targets (Rust): moving, copying, or repeat-filling 4 GiB or more hung forever, including in `open`'s recovery.** The remaining `u64` byte count was cast to `usize` before capping it at the chunk size, which could truncate the step to zero. The cap now applies in `u64` first. The C port was unaffected.
