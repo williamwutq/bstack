@@ -897,28 +897,13 @@ fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> 
 /// concurrent writer can touch those bytes.
 #[cfg(unix)]
 fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[filled..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - filled,
-                (offset + filled as u64) as libc::off_t,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "locked pread: unexpected EOF",
-            ));
-        }
-        filled += n as usize;
-    }
-    Ok(())
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow the fd as a `File` (never closed) to reuse std's `read_exact_at`,
+    // which uses `pread64` where `off_t` is 32-bit (e.g. 32-bit glibc).
+    // SAFETY: `fd` stays open for the call; `ManuallyDrop` prevents closing it.
+    let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    file.read_exact_at(buf, offset)
 }
 
 /// Lock-free positional read using a raw Windows HANDLE.
@@ -941,7 +926,7 @@ fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8]) -> io::Res
             ReadFile(
                 handle,
                 buf[filled..].as_mut_ptr(),
-                (len - filled) as u32,
+                (len - filled).min(u32::MAX as usize) as u32,
                 &mut bytes_read,
                 &mut overlapped,
             )

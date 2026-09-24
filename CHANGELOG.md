@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`repeat`/`zero`/`copy` (Rust: `set` / `set`+`atomic`; C: `bstack_repeat`/`bstack_zero`/`bstack_copy`) now stream through a bounded buffer instead of materialising the whole region.** A large fill or copy previously allocated the entire `count * pattern.len()` (or `n`) bytes up front; it now uses a fixed ~4 KiB buffer, so peak memory is O(chunk) regardless of region size. Results and durability are unchanged (still not crash-atomic on this line — a crash mid-write can still tear the region); `copy` runs in the overlap-safe direction (memmove semantics) rather than relying on full buffering, and it gains its first C-side tests. No API or on-disk change.
 
+### Fixed
+
+- **32-bit glibc, uclibc, and Android: lock-free reads at offsets of 2 GiB or more failed or read the wrong bytes.** Rust now reads through `read_exact_at`, which uses `pread64`. C now defines `_FILE_OFFSET_BITS 64`, and its I/O wrappers fail with `EOVERFLOW` instead of truncating an offset.
+- **Windows: single reads of 4 GiB or more failed.** Rust and C now split them into `DWORD`-sized chunks, and C also does this for writes.
+
 ## [0.2.8] - 2026-09-13
 
 ### Added
