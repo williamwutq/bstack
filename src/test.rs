@@ -764,7 +764,7 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
 
-        // n exceeds MOVE_CHUNK (64 KiB), so the on-disk copy streams over several
+        // n exceeds MOVE_CHUNK (4 KiB), so the on-disk copy streams over several
         // buffer-sized iterations rather than buffering the whole region.
         let n = 200 * 1024usize;
         let mut payload = vec![0u8; 2 * n];
@@ -835,6 +835,18 @@ mod tests {
         assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    // A pattern longer than MOVE_CHUNK bypasses the chunk buffer.
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_pattern_larger_than_move_chunk() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        let pat: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        s.push(vec![b'.'; 3 * pat.len()]).unwrap();
+        s.repeat(0, &pat, 3).unwrap();
+        assert_eq!(s.peek(0).unwrap(), pat.repeat(3));
     }
 
     #[cfg(feature = "set")]
@@ -9694,6 +9706,46 @@ mod atomic_tests {
         // [0,6)="abcabc", [6,10)="ZZZZ", [10,18) is the repeat resumed at phase
         // (0+10)%3=1 -> "bcabcabc", [18,20)="..".
         assert_eq!(s.peek(0).unwrap(), b"abcabcZZZZbcabcabc..");
+    }
+
+    // Sliced repeats resume at a nonzero phase, both through the chunk buffer
+    // (small pattern, multi-chunk) and directly (pattern > MOVE_CHUNK).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_sliced_across_chunks() {
+        use crate::BStackGenOp;
+        for pat in [
+            b"abc".to_vec(),
+            (0..5000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        ] {
+            let (s, p) = mk_stack();
+            let _g = Guard(p);
+            let count = 12_000 / pat.len() + 2;
+            let n = count * pat.len();
+            s.push(vec![b'.'; n]).unwrap();
+            let z = [b'Z'; 7];
+            let mut step = 0usize;
+            s.inplace_gen(|_res| {
+                let r = match step {
+                    0 => Some(BStackGenOp::Repeat {
+                        offset: 0,
+                        pattern: bstack_unsafe_reborrow!(&pat[..]),
+                        count: count as u64,
+                    }),
+                    1 => Some(BStackGenOp::Write {
+                        offset: 1,
+                        data: bstack_unsafe_reborrow!(&z[..]),
+                    }),
+                    _ => None,
+                };
+                step += 1;
+                r
+            })
+            .unwrap();
+            let mut expect = pat.repeat(count);
+            expect[1..8].copy_from_slice(&z);
+            assert_eq!(s.peek(0).unwrap(), expect);
+        }
     }
 
     // A later Repeat overrides the middle of an earlier Write.
