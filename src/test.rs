@@ -1036,6 +1036,33 @@ mod tests {
 
     #[cfg(feature = "set")]
     #[test]
+    fn repeat_fills_large_region_across_chunks() {
+        // Region far larger than the internal streaming chunk, with a pattern
+        // whose length does not divide the chunk — exercises phase alignment
+        // across chunk boundaries.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let count = 5000u64; // 3 * 5000 = 15000 bytes, well over the 4 KiB chunk
+        let total = 3 * count as usize;
+        s.push(vec![b'.'; total]).unwrap();
+        s.repeat(0, b"abc", count).unwrap();
+        let expected: Vec<u8> = b"abc".iter().copied().cycle().take(total).collect();
+        assert_eq!(s.peek(0).unwrap(), expected);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_fills_large_region_across_chunks() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let n = 10_000usize; // over the 4 KiB chunk
+        s.push(vec![b'X'; n]).unwrap();
+        s.zero(0, n as u64).unwrap();
+        assert_eq!(s.peek(0).unwrap(), vec![0u8; n]);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
     fn repeat_at_offset_leaves_neighbours() {
         let (s, p) = mk_stack();
         let _g = Guard(p);
@@ -7041,6 +7068,37 @@ mod atomic_tests {
         // Copy [0,3) → [1,4): source read before write, so result is "aabcde"[0..5] = "aabcd"
         s.copy(0, 1, 3).unwrap();
         assert_eq!(s.peek(0).unwrap(), b"aabce");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_large_overlapping_backward_across_chunks() {
+        // dst > src overlap over a region larger than the streaming chunk: the
+        // copy must run backwards (memmove) to stay correct across boundaries.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let n = 10_000u64;
+        let init: Vec<u8> = (0..=n).map(|i| (i % 251) as u8).collect(); // n + 1 bytes
+        s.push(&init).unwrap();
+        s.copy(0, 1, n).unwrap(); // [0, n) → [1, n+1)
+        let got = s.peek(0).unwrap();
+        assert_eq!(got[0], init[0]);
+        assert_eq!(&got[1..=n as usize], &init[0..n as usize]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn copy_large_overlapping_forward_across_chunks() {
+        // dst < src overlap over a region larger than the streaming chunk:
+        // forward copy is correct.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let n = 10_000u64;
+        let init: Vec<u8> = (0..=n).map(|i| (i % 251) as u8).collect(); // n + 1 bytes
+        s.push(&init).unwrap();
+        s.copy(1, 0, n).unwrap(); // [1, n+1) → [0, n)
+        let got = s.peek(0).unwrap();
+        assert_eq!(&got[0..n as usize], &init[1..=n as usize]);
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]

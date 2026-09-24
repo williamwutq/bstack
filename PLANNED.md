@@ -133,28 +133,6 @@ This removes one syscall from every read and every in-place write **and** closes
 
 ---
 
-## Bounded-memory in-place fills and copies
-
-**Feature flag:** None (internal change)
-**Breaking change:** No
-
-### Motivation
-
-`repeat` materialises the whole `count * pattern.len()` region in a heap `Vec` before a single `write_all`; `zero` allocates `vec![0u8; n]`; `copy` reads all `n` bytes into a `Vec` before writing. Each is O(region) memory for what can be a large region (e.g. an allocator block move). None of this changes crash behaviour — these ops are not crash-atomic on the 0.2 line either way — so it is purely a memory-footprint concern.
-
-### Design (sketch)
-
-- **`zero` / `repeat`:** a shared streaming-fill helper stages one bounded chunk (a whole number of patterns, capped at ~64 KiB), fills it once with the repeated pattern, then writes it at successive offsets until the region is covered, ending in one `durable_sync`. Because the region length and every write length are multiples of `pattern.len()`, the tiling stays phase-aligned across chunks. `zero` becomes `repeat` of the single byte `0x00` (or shares the helper). Memory drops to O(chunk); regions below the chunk size keep today's single-write path. Master's `repeat`/`write_repeated` already streams this way.
-- **`copy`:** for a disjoint source and destination, stream through a bounded buffer (read chunk → write chunk), O(chunk) memory. For overlapping regions, either keep the current full-buffer read (simplest — full buffering is what makes today's overlap handling correct) or add a direction-aware chunked move (copy backwards when `dest > src`). Master splits these into disjoint vs. overlapping paths.
-
-### Open questions
-
-- **Study item.** Chunk size (64 KiB? 1 MiB?) and the small-region threshold below which the single-allocation path is kept — needs a quick benchmark against realistic allocator block sizes.
-- For `copy`, is the added overlap-detection branch worth it, or keep overlap on the full-buffer path? (`copy` currently handles overlap only by virtue of full buffering; it does not detect it.)
-- `zero` on Linux could alternatively use `fallocate(FALLOC_FL_ZERO_RANGE)`, but that is platform-specific and out of step with the portable-core design; the bounded-buffer loop is the recommended form.
-
----
-
 ## Debug feature flag to skip durable sync for faster fault-injection testing
 
 **Feature flag:** new debug-only flag (`debug-no-sync`), off by default and not for production use.

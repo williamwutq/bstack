@@ -1687,6 +1687,59 @@ static int test_repeat_fills_with_pattern_copies(void)
     return 0;
 }
 
+static int test_repeat_fills_large_region_across_chunks(void)
+{
+    /* Region far larger than the streaming chunk, with a pattern whose length
+     * does not divide the chunk — exercises phase alignment across boundaries. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    const uint64_t count = 5000;          /* 3 * 5000 = 15000 bytes */
+    const size_t total = 3 * (size_t)count;
+    uint8_t *fill = (uint8_t *)malloc(total);
+    CHECK(fill != NULL);
+    memset(fill, '.', total);
+    CHECK(bstack_push(bs, fill, total, NULL) == 0);
+    CHECK(bstack_repeat(bs, 0, (uint8_t *)"abc", 3, count) == 0);
+    uint8_t *got = (uint8_t *)malloc(total);
+    CHECK(got != NULL);
+    size_t w;
+    CHECK(bstack_peek(bs, 0, got, &w) == 0);
+    CHECK(w == total);
+    int ok = 1;
+    for (size_t i = 0; i < total; i++)
+        if (got[i] != (uint8_t)"abc"[i % 3]) { ok = 0; break; }
+    CHECK(ok);
+    free(fill); free(got);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_zero_fills_large_region_across_chunks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    const size_t n = 10000;               /* over the 4 KiB chunk */
+    uint8_t *fill = (uint8_t *)malloc(n);
+    CHECK(fill != NULL);
+    memset(fill, 'X', n);
+    CHECK(bstack_push(bs, fill, n, NULL) == 0);
+    CHECK(bstack_zero(bs, 0, n) == 0);
+    uint8_t *got = (uint8_t *)malloc(n);
+    CHECK(got != NULL);
+    size_t w;
+    CHECK(bstack_peek(bs, 0, got, &w) == 0);
+    CHECK(w == n);
+    int ok = 1;
+    for (size_t i = 0; i < n; i++)
+        if (got[i] != 0) { ok = 0; break; }
+    CHECK(ok);
+    free(fill); free(got);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int test_repeat_at_offset_leaves_neighbours(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -2601,6 +2654,84 @@ static int test_replace_persists_across_reopen(void)
  * ====================================================================== */
 
 #if defined(BSTACK_FEATURE_ATOMIC) && defined(BSTACK_FEATURE_SET)
+
+static int test_copy_copies_bytes(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    CHECK(bstack_copy(bs, 0, 5, 5) == 0);
+    uint8_t buf[10]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "hellohello", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_copy_overlapping_backward(void)
+{
+    /* dst > src overlap: memmove backward. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    CHECK(bstack_copy(bs, 0, 1, 3) == 0);  /* [0,3) -> [1,4) */
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "aabce", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_copy_overlapping_forward(void)
+{
+    /* dst < src overlap: memmove forward. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"abcde", 5, NULL) == 0);
+    CHECK(bstack_copy(bs, 1, 0, 3) == 0);  /* [1,4) -> [0,3) */
+    uint8_t buf[5]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(memcmp(buf, "bcdde", 5) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_copy_large_overlapping_across_chunks(void)
+{
+    /* Regions larger than the streaming chunk, both overlap directions. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    const uint64_t n = 10000;
+    uint8_t *init = (uint8_t *)malloc((size_t)n + 1);
+    CHECK(init != NULL);
+    for (uint64_t i = 0; i <= n; i++)
+        init[i] = (uint8_t)(i % 251);
+    CHECK(bstack_push(bs, init, (size_t)n + 1, NULL) == 0);
+    uint8_t *got = (uint8_t *)malloc((size_t)n + 1);
+    CHECK(got != NULL);
+    size_t w;
+
+    /* Backward: [0, n) -> [1, n+1). */
+    CHECK(bstack_copy(bs, 0, 1, n) == 0);
+    CHECK(bstack_peek(bs, 0, got, &w) == 0);
+    CHECK(w == (size_t)n + 1);
+    CHECK(got[0] == init[0]);
+    CHECK(memcmp(got + 1, init, (size_t)n) == 0);
+
+    /* Reset, then forward: [1, n+1) -> [0, n). */
+    CHECK(bstack_set(bs, 0, init, (size_t)n + 1) == 0);
+    CHECK(bstack_copy(bs, 1, 0, n) == 0);
+    CHECK(bstack_peek(bs, 0, got, &w) == 0);
+    CHECK(memcmp(got, init + 1, (size_t)n) == 0);
+
+    free(init); free(got);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
 
 static int test_swap_returns_old_stores_new(void)
 {
@@ -4803,6 +4934,8 @@ int main(void)
 
     /* bstack_repeat */
     T(test_repeat_fills_with_pattern_copies);
+    T(test_repeat_fills_large_region_across_chunks);
+    T(test_zero_fills_large_region_across_chunks);
     T(test_repeat_at_offset_leaves_neighbours);
     T(test_repeat_empty_or_zero_count_is_noop);
     T(test_repeat_rejects_write_past_end);
@@ -4887,6 +5020,12 @@ int main(void)
     T(test_cas_does_not_change_file_size);
     T(test_cas_exceeds_size_returns_error);
     T(test_cas_persists_across_reopen);
+
+    /* bstack_copy */
+    T(test_copy_copies_bytes);
+    T(test_copy_overlapping_backward);
+    T(test_copy_overlapping_forward);
+    T(test_copy_large_overlapping_across_chunks);
 
     /* bstack_process */
     T(test_process_mutates_range);
