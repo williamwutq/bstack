@@ -144,8 +144,8 @@
 //!
 //! | Operation | Syscall sequence |
 //! |-----------|-----------------|
-//! | `push` | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → `durable_sync` |
-//! | `extend` | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `push` | `pwrite(data)` at `HEADER_SIZE + clen` → `lseek(8)` → `write(clen)` → `durable_sync` |
+//! | `extend` | `set_len(new_end)` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `pop`, `pop_into` | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
 //! | `discard` | `ftruncate` → `lseek(8)` → `write(clen)` → `durable_sync` |
@@ -153,10 +153,10 @@
 //! | `zero`, `repeat` *(feature)* | *commit* the repeated pattern (the journal stages only `[count \| pattern]`) |
 //! | `atrunc` *(feature: atomic)* | dispatch on the tail-replace shape: pure truncation → `ftruncate` → *commit* `clen`; pure append → `set_len(new_end)` → `write(buf)` → `durable_sync` → *commit* `clen`; same-length → *commit* `buf` in place; length change → **splice journal** (stage the new tail past the payload → arm `SpliceGrow`/`SpliceShrink` → replay into place → atomically commit `clen'` + disarm → truncate, a `durable_sync` at each barrier) |
 //! | `splice`, `splice_into` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(then as `atrunc`)* |
-//! | `try_extend` *(feature: atomic)* | `lseek(END)` — conditional `push` sequence if size matches |
-//! | `try_discard` *(feature: atomic)* | `lseek(END)` — conditional `discard` sequence if size matches |
-//! | `try_extend_zeros` *(feature: atomic)* | `lseek(END)` — conditional `extend(n)` sequence if size matches |
-//! | `try_extend_sparse`, `try_extend_sparse_batched` *(feature: atomic)* | `lseek(END)` — conditional `extend_sparse` / `extend_sparse_batched` sequence if size matches |
+//! | `try_extend` *(feature: atomic)* | size check — conditional `push` sequence if size matches |
+//! | `try_discard` *(feature: atomic)* | size check — conditional `discard` sequence if size matches |
+//! | `try_extend_zeros` *(feature: atomic)* | size check — conditional `extend(n)` sequence if size matches |
+//! | `try_extend_sparse`, `try_extend_sparse_batched` *(feature: atomic)* | size check — conditional `extend_sparse` / `extend_sparse_batched` sequence if size matches |
 //! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
@@ -914,10 +914,11 @@ pub struct BStack {
     /// `clen` (the `.1` field) is seeded from the validated header at
     /// construction time (after recovery) and kept in sync by every
     /// write-lock-held operation that commits a new `clen` to the header, via
-    /// `write_committed_len`. [`BStack::len`], [`BStack::is_empty`], and every
-    /// read and in-place mutator's bounds check read it under the same lock used
-    /// for the on-disk state, so no extra synchronisation is needed. It equals
-    /// the physical payload size whenever the replay flag is clear.
+    /// `write_committed_len`. It is the sole source of truth for the payload
+    /// size: [`BStack::len`], every bounds check, and every append and truncation
+    /// read it under the same lock used for the on-disk state, never the physical
+    /// file size. That is sound because it equals the physical payload size
+    /// whenever the replay flag is clear, and every write replays first.
     lock: RwLock<(File, u64, bool)>,
     /// Monotonically growing partition boundary.  Bytes in `[0, locked)` are
     /// immutable and can be read without the rwlock on supported platforms.
@@ -1289,15 +1290,15 @@ impl BStack {
         let data = data.as_ref();
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if data.is_empty() {
             return Ok(logical_offset);
         }
 
         fault_point!(self, "push");
-        if let Err(e) = file.write_all(data) {
+        if let Err(e) = pwrite_all(file, file_end, data) {
             // A failed rollback leaves a stale tail past the committed length:
             // defer it to the next write's replay.
             if file.set_len(file_end).is_err() {
@@ -1333,8 +1334,8 @@ impl BStack {
     pub fn extend(&self, n: u64) -> io::Result<u64> {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if n == 0 {
             return Ok(logical_offset);
@@ -1394,8 +1395,8 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if length == 0 {
             return Ok(logical_offset);
@@ -1465,8 +1466,8 @@ impl BStack {
 
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if length == 0 {
             // Every block was validated to fit within `[0, 0)`, so `blocks` is empty.
@@ -1508,8 +1509,8 @@ impl BStack {
     pub fn resize(&self, target: u64) -> io::Result<u64> {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target == data_size {
             return Ok(data_size);
@@ -1551,8 +1552,8 @@ impl BStack {
     pub fn ensure(&self, target: u64) -> io::Result<u64> {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target <= data_size {
             return Ok(data_size);
@@ -1603,8 +1604,8 @@ impl BStack {
     {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target <= data_size {
             return Ok(data_size);
@@ -1624,7 +1625,7 @@ impl BStack {
         let mut buf = vec![0u8; growth as usize];
         f(&mut buf);
         fault_point!(self, "ensure_with");
-        if let Err(e) = file.write_all(&buf) {
+        if let Err(e) = pwrite_all(file, file_end, &buf) {
             // A failed rollback leaves a stale tail past the committed length:
             // defer it to the next write's replay.
             if file.set_len(file_end).is_err() {
@@ -1654,8 +1655,7 @@ impl BStack {
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -1989,8 +1989,7 @@ impl BStack {
         let n = buf.len() as u64;
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -2031,8 +2030,7 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -2256,8 +2254,8 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -2306,8 +2304,8 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -2362,8 +2360,8 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -2407,8 +2405,8 @@ impl BStack {
         let buf = buf.as_ref();
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2416,7 +2414,7 @@ impl BStack {
             return Ok(true);
         }
         fault_point!(self, "try_extend");
-        if let Err(e) = file.write_all(buf) {
+        if let Err(e) = pwrite_all(file, file_end, buf) {
             // A failed rollback leaves a stale tail past the committed length:
             // defer it to the next write's replay.
             if file.set_len(file_end).is_err() {
@@ -2451,8 +2449,8 @@ impl BStack {
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool> {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2512,8 +2510,8 @@ impl BStack {
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2580,8 +2578,8 @@ impl BStack {
 
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2621,15 +2619,11 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool> {
         if n == 0 {
-            let guard = self.read_lock()?;
-            let file = &guard.0;
-            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
-            return Ok(data_size == s);
+            return Ok(self.read_lock()?.1 == s);
         }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if data_size != s {
             return Ok(false);
         }
@@ -2928,8 +2922,8 @@ impl BStack {
     {
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io_error!(
                 InvalidInput,
@@ -3835,9 +3829,9 @@ impl BStack {
                 }
                 Some(BStackGenOp::Push { data }) => {
                     if !data.is_empty() {
-                        let file_end = file.seek(SeekFrom::End(0))?;
-                        let logical_offset = file_end - HEADER_SIZE;
-                        if let Err(e) = file.write_all(data) {
+                        let logical_offset = data_size;
+                        let file_end = HEADER_SIZE + logical_offset;
+                        if let Err(e) = pwrite_all(file, file_end, data) {
                             // A failed rollback leaves a stale tail past the committed length:
                             // defer it to the next write's replay.
                             if file.set_len(file_end).is_err() {

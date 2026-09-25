@@ -115,11 +115,12 @@ struct bstack {
     /* Cached copy of the on-disk header's committed payload length (clen).
      * Seeded from the validated header at construction time (after recovery)
      * and kept in sync by every write-lock-held operation that commits a new
-     * clen to the header, via write_committed_len. bstack_len,
-     * bstack_is_empty, and every read and in-place mutator's bounds check
-     * read it under the same lock used for the on-disk state, so no extra
-     * synchronisation is needed. It equals the physical payload size whenever
-     * the replay flag is clear. */
+     * clen to the header, via write_committed_len. It is the sole source of
+     * truth for the payload size: bstack_len, every bounds check, and every
+     * append and truncation read it under the same lock used for the on-disk
+     * state, never the physical file size. That is sound because it equals the
+     * physical payload size whenever the replay flag is clear, and every write
+     * replays first. */
     uint64_t clen;
     /* Monotonically growing partition boundary. Bytes in [0, locked) are
      * immutable and can be read without the rwlock on supported platforms.
@@ -1270,9 +1271,7 @@ int bstack_push(bstack_t *bs, const uint8_t *data, size_t len,
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t logical_offset = raw_size - HEADER_SIZE;
 
@@ -1328,9 +1327,7 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t logical_offset = raw_size - HEADER_SIZE;
 
@@ -1386,9 +1383,7 @@ int bstack_extend_sparse(bstack_t *bs, const uint8_t *buf, size_t buf_len,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t logical_offset = raw_size - HEADER_SIZE;
 
@@ -1455,9 +1450,7 @@ int bstack_extend_sparse_batched(bstack_t *bs,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t logical_offset = raw_size - HEADER_SIZE;
 
@@ -1501,9 +1494,7 @@ int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
 
@@ -1573,9 +1564,7 @@ int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
 
@@ -1621,9 +1610,7 @@ int bstack_pop(bstack_t *bs, size_t n,
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if ((uint64_t)n > data_size) {
@@ -1781,9 +1768,7 @@ int bstack_discard(bstack_t *bs, size_t n)
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if ((uint64_t)n > data_size) {
@@ -2420,9 +2405,7 @@ int bstack_atrunc(bstack_t *bs, size_t n,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if ((uint64_t)n > data_size) {
@@ -2460,9 +2443,7 @@ int bstack_splice(bstack_t *bs,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if ((uint64_t)n > data_size) {
@@ -2504,9 +2485,7 @@ int bstack_try_extend(bstack_t *bs, uint64_t s,
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if (data_size != s) {
@@ -2552,23 +2531,15 @@ int bstack_try_discard(bstack_t *bs, uint64_t s, size_t n, int *ok)
     if (n == 0) {
         /* Read-only path: just check the size. */
         BS_RDLOCK_INTACT(bs);
-        uint64_t raw_size;
-        if (file_size(bs->fd, &raw_size) != 0) {
-            int saved = errno;
-            BS_RDUNLOCK(bs);
-            errno = saved;
-            return -1;
-        }
+        uint64_t data_size = bs->clen;
         BS_RDUNLOCK(bs);
-        if (ok) *ok = ((raw_size - HEADER_SIZE) == s) ? 1 : 0;
+        if (ok) *ok = (data_size == s) ? 1 : 0;
         return 0;
     }
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if (data_size != s) {
@@ -2619,9 +2590,7 @@ int bstack_replace(bstack_t *bs, size_t n,
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if ((uint64_t)n > data_size) {
@@ -2687,9 +2656,7 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if (data_size != s) {
@@ -2736,9 +2703,7 @@ int bstack_try_extend_sparse(bstack_t *bs, uint64_t s,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if (data_size != s) {
@@ -2798,9 +2763,7 @@ int bstack_try_extend_sparse_batched(bstack_t *bs, uint64_t s,
 
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
     if (data_size != s) {
@@ -2841,9 +2804,7 @@ int bstack_ensure_with(bstack_t *bs, uint64_t target,
 {
     BS_WRLOCK_REPLAY(bs);
 
-    uint64_t raw_size;
-    if (file_size(bs->fd, &raw_size) != 0)
-        goto fail_unlock;
+    uint64_t raw_size = HEADER_SIZE + bs->clen;
 
     uint64_t data_size = raw_size - HEADER_SIZE;
 
