@@ -114,6 +114,37 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
     Ok(())
 }
 
+/// Write all of `data` at absolute file position `offset`, with one positional
+/// write where the platform has it instead of a seek plus a write. Unix uses
+/// `pwrite(2)` via `write_all_at`; Windows uses `WriteFile` with an
+/// `OVERLAPPED` offset via `seek_write`. The cursor is left unspecified.
+#[cfg(unix)]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.write_all_at(data, offset)
+}
+
+/// Windows counterpart of `pwrite_all`.
+#[cfg(windows)]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < data.len() {
+        match file.seek_write(&data[done..], offset + done as u64) {
+            Ok(0) => return Err(io_error!(WriteZero, "pwrite_all: wrote zero bytes")),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fallback `pwrite_all` for platforms without a positional write.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)
+}
+
 /// Lock-free positional read using a raw file descriptor (Unix).
 ///
 /// Calls `pread(2)` directly, bypassing the `RwLock<File>`.  Safe only when

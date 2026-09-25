@@ -668,8 +668,8 @@ before it is read/compare/callback work under the lock.
 
 | Operation                              | Sequence                                                                                  |
 |----------------------------------------|-------------------------------------------------------------------------------------------|
-| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
-| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `push`                                 | `pwrite(data)` at `32 + clen` → `lseek(8)` → `write(clen)` → sync                          |
+| `extend`                               | `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                                    |
 | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
