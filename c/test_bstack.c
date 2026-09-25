@@ -780,15 +780,26 @@ static int test_recovery_repairs_header_after_partial_pop(void)
  * Orphaned tail past clen (failed-rollback simulation)
  * ====================================================================== */
 
-/* Append junk past the committed length through a second fd, as a failed
- * rollback would leave it. The header is left alone. */
-static int plant_orphan(const char *path, const char *junk, size_t n)
+/* Append junk past the committed length through the stack's own handle, as a
+ * failed rollback would leave it; the header and cached clen are left alone.
+ * The handle is struct bstack's first member, so a pointer to the struct
+ * converts to a pointer to it (C11 6.7.2.1p15). Tests are single-threaded, so
+ * nothing races the write. */
+static int plant_orphan(bstack_t *bs, const char *junk, size_t n)
 {
-    int fd = open(path, O_WRONLY | O_APPEND);
-    if (fd < 0) return -1;
+#ifdef _WIN32
+    HANDLE h = *(HANDLE *)bs;
+    LARGE_INTEGER zero = {0};
+    DWORD w = 0;
+    if (!SetFilePointerEx(h, zero, NULL, FILE_END)) return -1;
+    if (!WriteFile(h, junk, (DWORD)n, &w, NULL)) return -1;
+    return w == (DWORD)n ? 0 : -1;
+#else
+    int fd = *(int *)bs;
+    if (lseek(fd, 0, SEEK_END) < 0) return -1;
     ssize_t w = write(fd, junk, n);
-    close(fd);
     return w == (ssize_t)n ? 0 : -1;
+#endif
 }
 
 static const char JUNK[8] = { 'X','X','X','X','X','X','X','X' };
@@ -799,7 +810,7 @@ static int test_push_overwrites_orphaned_tail(void)
     bstack_t *bs = bstack_open(tmp);
     CHECK(bs != NULL);
     CHECK(bstack_push(bs, (const uint8_t *)"abc", 3, NULL) == 0);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     uint64_t off;
     CHECK(bstack_push(bs, (const uint8_t *)"de", 2, &off) == 0);
     CHECK(off == 3);
@@ -818,16 +829,16 @@ static int test_grow_over_orphaned_tail_reads_zero(void)
     CHECK(bs != NULL);
     CHECK(bstack_push(bs, (const uint8_t *)"ab", 2, NULL) == 0);
     uint64_t off, init;
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_extend(bs, 2, &off) == 0);
     CHECK(off == 2);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_extend_sparse(bs, (const uint8_t *)"c", 1, 2, &off) == 0);
     CHECK(off == 4);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_resize(bs, 8, &init) == 0);
     CHECK(init == 6);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_ensure(bs, 10, &init) == 0);
     CHECK(init == 8);
     uint8_t buf[10];
@@ -844,11 +855,11 @@ static int test_pop_and_discard_ignore_orphaned_tail(void)
     bstack_t *bs = bstack_open(tmp);
     CHECK(bs != NULL);
     CHECK(bstack_push(bs, (const uint8_t *)"abcd", 4, NULL) == 0);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     uint8_t buf[2]; size_t w;
     CHECK(bstack_pop(bs, 2, buf, &w) == 0);
     CHECK(memcmp(buf, "cd", 2) == 0);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_discard(bs, 1) == 0);
     uint64_t len;
     CHECK(bstack_len(bs, &len) == 0);
@@ -868,13 +879,13 @@ static int test_try_ops_use_committed_length_over_orphaned_tail(void)
     bstack_t *bs = bstack_open(tmp);
     CHECK(bs != NULL);
     CHECK(bstack_push(bs, (const uint8_t *)"ab", 2, NULL) == 0);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     int ok = 0;
     CHECK(bstack_try_discard(bs, 2, 0, &ok) == 0);
     CHECK(ok == 1);
     CHECK(bstack_try_extend(bs, 2, (const uint8_t *)"c", 1, &ok) == 0);
     CHECK(ok == 1);
-    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(plant_orphan(bs, JUNK, 8) == 0);
     CHECK(bstack_try_extend_zeros(bs, 3, 2, &ok) == 0);
     CHECK(ok == 1);
     uint8_t buf[5];
