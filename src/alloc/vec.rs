@@ -1,4 +1,4 @@
-//! Growable byte vector backed by a [`BStack`] allocation.
+//! Growable byte vector backed by a [`BStack`](crate::BStack) allocation.
 //!
 //! Requires features `alloc` and `set`.
 
@@ -205,7 +205,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     /// (same coords) to transfer ownership to `realloc`.
     ///
     /// On failure, `realloc` returns the surviving allocation in
-    /// [`BStackAllocError::handle`]:
+    /// [`BStackAllocError::handle`](crate::alloc::BStackAllocError::handle):
     ///
     /// * `Some(handle)` — we adopt it, so `self` tracks the real region (the
     ///   untouched original, or a fully committed new region whose old block

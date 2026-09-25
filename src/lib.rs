@@ -678,7 +678,7 @@
     doc = "performance is unaffected. See the [`fault`] module for details."
 )]
 
-/// Build an [`io::Error`](std::io::Error) from an [`ErrorKind`](std::io::ErrorKind)
+/// Build an [`io::Error`] from an [`ErrorKind`](std::io::ErrorKind)
 /// variant and a message, without repeating `io::Error::new(io::ErrorKind::…, …)`.
 ///
 /// * `$kind` — bare `ErrorKind` variant name (`InvalidData`, `NotFound`, …); expands

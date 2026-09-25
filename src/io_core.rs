@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// Bytes occupied by the file header
-/// (magic[8] + committed_len[8] + wip_ptr[8] + wip_aux[8]).
+/// (`magic[8]` + `committed_len[8]` + `wip_ptr[8]` + `wip_aux[8]`).
 ///
 /// `wip_ptr`/`wip_aux` hold the write-in-progress journal that makes in-place
 /// mutations crash-atomic (see *Crash recovery* in the crate docs); both are
