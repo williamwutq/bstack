@@ -84,7 +84,7 @@ pub(crate) fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Ve
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io_error!(UnexpectedEof, "pread_exact: unexpected EOF"));
+            return Err(io_error!(UnexpectedEof, "failed to fill whole buffer"));
         }
         filled += n;
     }
@@ -107,7 +107,7 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io_error!(UnexpectedEof, "pread_exact_into: unexpected EOF"));
+            return Err(io_error!(UnexpectedEof, "failed to fill whole buffer"));
         }
         filled += n;
     }
@@ -129,7 +129,8 @@ pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Resul
     let mut done = 0usize;
     while done < data.len() {
         match file.seek_write(&data[done..], offset + done as u64) {
-            Ok(0) => return Err(io_error!(WriteZero, "pwrite_all: wrote zero bytes")),
+            // Same error `write_all` / `write_all_at` return.
+            Ok(0) => return Err(io_error!(WriteZero, "failed to write whole buffer")),
             Ok(n) => done += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -734,7 +735,7 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     }
     let total = k
         .checked_mul(unit)
-        .ok_or_else(|| io_error!(InvalidData, "write_repeated: length overflow"))?;
+        .ok_or_else(|| io_error!(InvalidData, "repeat fill length overflows u64"))?;
     file.seek(SeekFrom::Start(phys))?;
     if unit > MOVE_CHUNK {
         // One copy already exceeds the buffer: write `s` itself.
