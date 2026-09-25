@@ -934,9 +934,10 @@ pub(crate) fn commit_grow(
 /// `logical_offset` is the pre-op payload size (the tail the growth is anchored
 /// at); `file_end == HEADER_SIZE + logical_offset` is the pre-op raw file size;
 /// `new_len == logical_offset + length` is the post-op payload size (already
-/// overflow-checked by the caller). Each `(rel, data)` block is written at logical
-/// offset `logical_offset + rel`; callers guarantee every block fits within
-/// `[logical_offset, new_len)` and that blocks do not overlap.
+/// overflow-checked by the caller, which also guarantees `new_len <= u64::MAX -
+/// HEADER_SIZE` so `HEADER_SIZE + new_len` cannot wrap). Each `(rel, data)` block
+/// is written at logical offset `logical_offset + rel`; callers guarantee every
+/// block fits within `[logical_offset, new_len)` and that blocks do not overlap.
 ///
 /// The efficiency win over a full `push` of `length` bytes: the extension is
 /// realised with a single `set_len`, so the gaps between blocks cost no I/O (they

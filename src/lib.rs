@@ -785,8 +785,22 @@ const LEGACY_MAGIC_PREFIX: [u8; 6] = [b'B', b'S', b'T', b'K', 0, 1];
 /// Header size of the pre-0.4.0 (0.1.x) format: `magic[8] + committed_len[8]`.
 const LEGACY_HEADER_SIZE: u64 = 16;
 
+/// Convert a `u64` byte count into a `usize` for a single in-memory buffer,
+/// rejecting values above `isize::MAX` — the largest a Rust allocation may be,
+/// and the point past which the cast would silently truncate on a 32-bit target
+/// (where `usize` is narrower than `u64`, cheaply reachable via sparse extends).
+/// `msg` names the operation for the error message.
+#[inline(always)]
+pub(crate) fn checked_buf_len(len: u64, msg: &'static str) -> io::Result<usize> {
+    if len > isize::MAX as u64 {
+        return Err(io_error!(OutOfMemory, msg));
+    }
+    Ok(len as usize)
+}
+
 /// Compute `base + len`, mapping `u64` overflow to an `InvalidInput` error
 /// carrying `msg`.
+#[inline(always)]
 #[cfg(any(feature = "set", feature = "atomic"))]
 pub(crate) fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<u64> {
     base.checked_add(len)
@@ -800,6 +814,7 @@ pub(crate) fn checked_end(base: u64, len: u64, msg: &'static str) -> io::Result<
 /// `swap_into`, `cas`); callers must load `locked` under the write lock so the
 /// check cannot race a concurrent `lock_up_to`.
 #[cfg(feature = "set")]
+#[inline(always)]
 pub(crate) fn check_offset_unlocked(
     op: &str,
     offset: u64,
@@ -1341,6 +1356,15 @@ impl BStack {
             return Ok(logical_offset);
         }
 
+        // `file_end` is a live file size, so it never overflows; reject any `n`
+        // that would push the raw file size (header + payload) past `u64::MAX`
+        // before it wraps `set_len` and truncates the file, header and all.
+        if n > u64::MAX - file_end {
+            return Err(io_error!(
+                InvalidInput,
+                "extend: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "extend");
         let new_file_end = file_end + n;
         Self::mark_replay(replay, file.set_len(new_file_end))?;
@@ -1407,6 +1431,12 @@ impl BStack {
                 "extend_sparse: payload size + length overflows u64"
             )
         })?;
+        if new_len > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "extend_sparse: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
@@ -1479,6 +1509,12 @@ impl BStack {
                 "extend_sparse_batched: payload size + length overflows u64"
             )
         })?;
+        if new_len > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "extend_sparse_batched: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "extend_sparse_batched");
         Self::mark_replay(
             replay,
@@ -1528,6 +1564,12 @@ impl BStack {
             return Ok(data_size);
         }
 
+        if target > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "resize: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "resize");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
         Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
@@ -1559,6 +1601,12 @@ impl BStack {
             return Ok(data_size);
         }
 
+        if target > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "ensure: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "ensure");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + target))?;
         Self::mark_replay(replay, commit_grow(file, clen, target, data_size, file_end))?;
@@ -1670,7 +1718,13 @@ impl BStack {
                 format!("pop({n}) would shrink payload below locked length ({locked})")
             ));
         }
-        let mut buf = vec![0u8; n as usize];
+        let mut buf = vec![
+            0u8;
+            checked_buf_len(
+                n,
+                "pop: removed region too large to buffer on this platform"
+            )?
+        ];
         fault_point!(self, "pop");
         read_at(file, new_data_len, &mut buf)?;
         Self::mark_replay(replay, commit_shrink(file, clen, new_data_len))?;
@@ -1712,8 +1766,12 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
+            let len = checked_buf_len(
+                data_size - offset,
+                "peek: region too large to buffer on this platform",
+            )?;
             fault_point!(self, "peek");
-            pread_exact(file, HEADER_SIZE + offset, (data_size - offset) as usize)
+            pread_exact(file, HEADER_SIZE + offset, len)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1726,9 +1784,13 @@ impl BStack {
                     format!("peek offset ({offset}) exceeds payload size ({data_size})")
                 ));
             }
+            let len = checked_buf_len(
+                data_size - offset,
+                "peek: region too large to buffer on this platform",
+            )?;
             fault_point!(self, "peek");
             file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
-            let mut buf = vec![0u8; (data_size - offset) as usize];
+            let mut buf = vec![0u8; len];
             file.read_exact(&mut buf)?;
             Ok(buf)
         }
@@ -1758,6 +1820,10 @@ impl BStack {
                 format!("get: end ({end}) < start ({start})")
             ));
         }
+        let len = checked_buf_len(
+            end - start,
+            "get: range too large to buffer on this platform",
+        )?;
         // Fast-path: if the range lies entirely within the locked region,
         // serve from the in-memory cache (if enabled) or fall back to a
         // lock-free pread — locked bytes are immutable so no rwlock needed.
@@ -1766,7 +1832,9 @@ impl BStack {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked {
                 if self.cache_enabled {
-                    let len = (end - start) as usize;
+                    // Cache is only populated for `locked <= isize::MAX` (see
+                    // `lock_up_to`), and `end <= locked` here, so the `as usize`
+                    // index casts below cannot truncate on a 32-bit target.
                     let mut buf = vec![0u8; len];
                     let cache = self.cache.lock().unwrap();
                     buf.copy_from_slice(&cache[start as usize..end as usize]);
@@ -1774,13 +1842,13 @@ impl BStack {
                 }
                 #[cfg(unix)]
                 {
-                    let mut buf = vec![0u8; (end - start) as usize];
+                    let mut buf = vec![0u8; len];
                     pread_exact_raw(self.fd, HEADER_SIZE + start, &mut buf)?;
                     return Ok(buf);
                 }
                 #[cfg(windows)]
                 {
-                    let mut buf = vec![0u8; (end - start) as usize];
+                    let mut buf = vec![0u8; len];
                     pread_exact_raw_handle(self.handle, HEADER_SIZE + start, &mut buf)?;
                     return Ok(buf);
                 }
@@ -1798,12 +1866,14 @@ impl BStack {
                 ));
             }
             fault_point!(self, "get");
-            pread_exact(file, HEADER_SIZE + start, (end - start) as usize)
+            pread_exact(file, HEADER_SIZE + start, len)
         }
         #[cfg(not(any(unix, windows)))]
         {
             let locked = self.locked.load(Ordering::Acquire);
             if end <= locked && self.cache_enabled {
+                // See the Unix fast path: a populated cache implies
+                // `end <= locked <= isize::MAX`, so these casts cannot truncate.
                 let cache = self.cache.lock().unwrap();
                 return Ok(cache[start as usize..end as usize].to_vec());
             }
@@ -1818,7 +1888,7 @@ impl BStack {
             }
             fault_point!(self, "get");
             file.seek(SeekFrom::Start(HEADER_SIZE + start))?;
-            let mut buf = vec![0u8; (end - start) as usize];
+            let mut buf = vec![0u8; len];
             file.read_exact(&mut buf)?;
             Ok(buf)
         }
@@ -2320,9 +2390,13 @@ impl BStack {
                 format!("splice: operation would modify locked region [0, {locked})")
             ));
         }
+        let removed_len = checked_buf_len(
+            n,
+            "splice: removed region too large to buffer on this platform",
+        )?;
         fault_point!(self, "splice");
         // Read the bytes to remove before any mutation.
-        let mut removed = vec![0u8; n as usize];
+        let mut removed = vec![0u8; removed_len];
         read_at(file, new_tail_start, &mut removed)?;
 
         Self::mark_replay(
@@ -2462,6 +2536,12 @@ impl BStack {
             n,
             "try_extend_zeros: data_size + n overflows u64",
         )?;
+        if new_len > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "try_extend_zeros: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "try_extend_zeros");
         Self::mark_replay(replay, file.set_len(HEADER_SIZE + new_len))?;
         Self::mark_replay(
@@ -2523,6 +2603,12 @@ impl BStack {
             length,
             "try_extend_sparse: data_size + length overflows u64",
         )?;
+        if new_len > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "try_extend_sparse: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "try_extend_sparse");
         let one = [(0u64, buf)];
         let blocks: &[(u64, &[u8])] = if buf.is_empty() { &[] } else { &one };
@@ -2591,6 +2677,12 @@ impl BStack {
             length,
             "try_extend_sparse_batched: data_size + length overflows u64",
         )?;
+        if new_len > u64::MAX - HEADER_SIZE {
+            return Err(io_error!(
+                InvalidInput,
+                "try_extend_sparse_batched: resulting file size overflows u64"
+            ));
+        }
         fault_point!(self, "try_extend_sparse_batched");
         Self::mark_replay(
             replay,
@@ -2705,7 +2797,10 @@ impl BStack {
                 results.push(pread_exact(
                     file,
                     HEADER_SIZE + r.start,
-                    (r.end - r.start) as usize,
+                    checked_buf_len(
+                        r.end - r.start,
+                        "get_batched: range too large to buffer on this platform",
+                    )?,
                 )?);
             }
             Ok(results)
@@ -2726,7 +2821,13 @@ impl BStack {
                     ));
                 }
                 file.seek(SeekFrom::Start(HEADER_SIZE + r.start))?;
-                let mut buf = vec![0u8; (r.end - r.start) as usize];
+                let mut buf = vec![
+                    0u8;
+                    checked_buf_len(
+                        r.end - r.start,
+                        "get_batched: range too large to buffer on this platform",
+                    )?
+                ];
                 file.read_exact(&mut buf)?;
                 results.push(buf);
             }
@@ -2938,8 +3039,12 @@ impl BStack {
                 format!("replace: operation would modify locked region [0, {locked})")
             ));
         }
+        let old_tail_len = checked_buf_len(
+            n,
+            "replace: removed region too large to buffer on this platform",
+        )?;
         fault_point!(self, "replace");
-        let mut old_tail = vec![0u8; n as usize];
+        let mut old_tail = vec![0u8; old_tail_len];
         read_at(file, new_tail_start, &mut old_tail)?;
         let new_tail = f(&old_tail);
 
@@ -3532,8 +3637,9 @@ impl BStack {
                 format!("process: range [{start}, {end}) overlaps locked region [0, {locked})")
             ));
         }
+        let buf_len = checked_buf_len(n, "process: range too large to buffer on this platform")?;
         fault_point!(self, "process");
-        let mut buf = vec![0u8; n as usize];
+        let mut buf = vec![0u8; buf_len];
         if n > 0 {
             read_at(file, start, &mut buf)?;
         }

@@ -675,6 +675,12 @@ impl<'a> BStackSlice<'a> {
 
     /// Read `[start, end)` relative to this slice into a new `Vec<u8>`.
     pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if end < start {
+            return Err(io_error!(
+                InvalidInput,
+                "read_range: end ({end}) < start ({start})"
+            ));
+        }
         if end > self.len() {
             return Err(io_error!(
                 InvalidInput,
@@ -682,12 +688,16 @@ impl<'a> BStackSlice<'a> {
                 self.len()
             ));
         }
+        // `start <= end <= self.len()`, so both absolute offsets stay within
+        // `[self.start(), self.end()]` and cannot overflow.
         self.stack.get(self.start() + start, self.start() + end)
     }
 
     /// Read `[start, start + buf.len())` relative to this slice into `buf`.
     pub fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
-        let end_rel = start + buf.len() as u64;
+        let end_rel = start
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| io_error!(InvalidInput, "read_range_into: start + len overflows u64"))?;
         if end_rel > self.len() {
             return Err(io_error!(
                 InvalidInput,
@@ -714,7 +724,9 @@ impl<'a> BStackSlice<'a> {
     #[cfg(feature = "set")]
     pub fn write_range(&mut self, start: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
-        let end_rel = start + data.len() as u64;
+        let end_rel = start
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| io_error!(InvalidInput, "write_range: start + len overflows u64"))?;
         if end_rel > self.len() {
             return Err(io_error!(
                 InvalidInput,
@@ -739,7 +751,9 @@ impl<'a> BStackSlice<'a> {
     /// Requires the `set` feature.
     #[cfg(feature = "set")]
     pub fn zero_range(&mut self, start: u64, n: u64) -> io::Result<()> {
-        let end_rel = start + n;
+        let end_rel = start
+            .checked_add(n)
+            .ok_or_else(|| io_error!(InvalidInput, "zero_range: start + n overflows u64"))?;
         if end_rel > self.len() {
             return Err(io_error!(
                 InvalidInput,

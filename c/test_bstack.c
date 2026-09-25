@@ -1855,6 +1855,89 @@ static int test_extend_persists_across_reopen(void)
     return 0;
 }
 
+/* A grow whose resulting raw file size (header + payload) would overflow
+ * uint64 must be rejected cleanly, not wrap ftruncate and truncate the file —
+ * header and all — into an unopenable, data-destroying state.
+ *
+ * `bstack_extend` takes a size_t count, so this overflow is only reachable
+ * where size_t is 64-bit; on a 32-bit target the count cannot reach it. */
+#if SIZE_MAX == UINT64_MAX
+static int test_extend_overflow_rejected_preserves_data(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+
+    CHECK(bstack_push(bs, (uint8_t *)"keepme", 6, NULL) == 0);
+    errno = 0;
+    CHECK(bstack_extend(bs, SIZE_MAX, NULL) == -1);
+    CHECK(errno == EINVAL);
+
+    /* The file and header are untouched: data still readable. */
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 6);
+    uint8_t buf[6]; size_t w;
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 6 && memcmp(buf, "keepme", 6) == 0);
+    bstack_close(bs);
+
+    /* And it reopens clean. */
+    bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_peek(bs, 0, buf, &w) == 0);
+    CHECK(w == 6 && memcmp(buf, "keepme", 6) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+#endif /* SIZE_MAX == UINT64_MAX */
+
+static int test_resize_grow_overflow_rejected(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"data", 4, NULL) == 0);
+    errno = 0;
+    CHECK(bstack_resize(bs, UINT64_MAX, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0 && len == 4);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_ensure_overflow_rejected(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"data", 4, NULL) == 0);
+    errno = 0;
+    CHECK(bstack_ensure(bs, UINT64_MAX, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0 && len == 4);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_extend_sparse_overflow_rejected(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"data", 4, NULL) == 0);
+    /* payload + length fits in uint64, but HEADER_SIZE + new_len would not. */
+    errno = 0;
+    CHECK(bstack_extend_sparse(bs, NULL, 0, UINT64_MAX - 10, NULL) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0 && len == 4);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 /* =========================================================================
  * bstack_extend_sparse / bstack_extend_sparse_batched
  * ====================================================================== */
@@ -2422,6 +2505,27 @@ static int test_zero_persists_across_reopen(void)
  * ====================================================================== */
 
 #ifdef BSTACK_FEATURE_ATOMIC
+
+/* `bstack_try_extend_zeros` takes a size_t count, so — like bstack_extend —
+ * the raw-file-size overflow is only reachable where size_t is 64-bit. */
+#if SIZE_MAX == UINT64_MAX
+static int test_try_extend_zeros_overflow_rejected(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"data", 4, NULL) == 0);
+    /* A count large enough that the raw file size would overflow uint64. */
+    int ok = -1;
+    errno = 0;
+    CHECK(bstack_try_extend_zeros(bs, 4, SIZE_MAX, &ok) == -1);
+    CHECK(errno == EINVAL);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0 && len == 4);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+#endif /* SIZE_MAX == UINT64_MAX */
 
 static int test_atrunc_net_truncation(void)
 {
@@ -6047,6 +6151,9 @@ int main(void)
     T(test_extend_appends_zeros);
     T(test_extend_zero_is_noop);
     T(test_extend_persists_across_reopen);
+#if SIZE_MAX == UINT64_MAX
+    T(test_extend_overflow_rejected_preserves_data);
+#endif
 
     /* bstack_extend_sparse / bstack_extend_sparse_batched */
     T(test_extend_sparse_writes_prefix_and_zeros_rest);
@@ -6056,6 +6163,7 @@ int main(void)
     T(test_extend_sparse_batched_overlap_errors);
     T(test_extend_sparse_batched_out_of_range_errors);
     T(test_extend_sparse_persists_across_reopen);
+    T(test_extend_sparse_overflow_rejected);
 
     /* bstack_resize */
     T(test_resize_grows_with_zeros);
@@ -6064,11 +6172,13 @@ int main(void)
     T(test_resize_to_zero_truncates);
     T(test_resize_shrink_below_locked_returns_error);
     T(test_resize_persists_across_reopen);
+    T(test_resize_grow_overflow_rejected);
 
     /* bstack_ensure */
     T(test_ensure_grows_short_payload_with_zeros);
     T(test_ensure_noop_when_already_long_enough);
     T(test_ensure_persists_across_reopen);
+    T(test_ensure_overflow_rejected);
 
 #ifdef BSTACK_FEATURE_ATOMIC
     /* bstack_ensure_with */
@@ -6129,6 +6239,9 @@ int main(void)
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
+#if SIZE_MAX == UINT64_MAX
+    T(test_try_extend_zeros_overflow_rejected);
+#endif
     /* bstack_atrunc */
     T(test_atrunc_net_truncation);
     T(test_atrunc_net_extension);
