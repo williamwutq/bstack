@@ -1,4 +1,4 @@
-//! Growable byte vector backed by a [`BStack`] allocation.
+//! Growable byte vector backed by a [`BStack`](crate::BStack) allocation.
 //!
 //! Requires features `alloc` and `set`.
 

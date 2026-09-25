@@ -549,7 +549,7 @@ const MAGIC: [u8; 8] = *b"BSTK\x00\x01\x13\x00";
 /// Any file whose first 6 bytes match is considered a compatible 0.1.x file.
 const MAGIC_PREFIX: [u8; 6] = *b"BSTK\x00\x01";
 
-/// Bytes occupied by the file header (magic[8] + committed_len[8]).
+/// Bytes occupied by the file header (`magic[8]` + `committed_len[8]`).
 const HEADER_SIZE: u64 = 16;
 
 /// Flush all in-flight writes to stable storage.
