@@ -81,24 +81,17 @@ The gain is small. The parameters already have names (`offset`, `len`), so the m
 
 ### Motivation
 
-Two size sources coexist. `len`/`is_empty` and crash recovery use the cached committed length `clen` (the `.1` of `RwLock<(File, u64)>`), but the read paths (`peek`/`get`/`peek_into`/`get_into`/`get_batched*`) bound-check against `File::metadata().len()` (an `fstat`), and the in-place write paths (`set`/`zero`/`repeat`/`swap`/`cas`/`cross_exchange`/`copy`/`process`/`process_gen`, the `*_crds` family) derive the payload size from `lseek(SEEK_END)`. In the steady state these agree, so those syscalls are pure overhead on the hot path.
+Reads and in-place writes already bound-check against the cached committed length `clen` (a4b9b16, backport of #94). Appends still position at the physical file end via `seek(SeekFrom::End(0))` (`file_size()` in C).
 
-They diverge in exactly one window: after a write fails **and its best-effort rollback also fails** (e.g. the rollback `set_len` errors and that error is swallowed), the physical file is larger than `clen`. A subsequent `set`/`swap` then accepts a range in `(clen, file_size − 16]` and writes into a region recovery will discard on the next `open` (silent loss); a subsequent `push` — which appends at the physical end — folds the orphaned tail into the committed payload. This is the hazard the 0.4.4 line fixed with deferred replay (see the NOT PLANNED note on that machinery, which this supersedes on the 0.2 line).
+The two diverge after a write fails **and its best-effort rollback also fails**, leaving the physical file larger than `clen`. A subsequent `push` then appends after the orphaned tail and commits it as payload. This is the hazard the 0.4.4 line fixed with deferred replay (see the NOT PLANNED note on that machinery, which this supersedes on the 0.2 line).
 
 ### Design (sketch)
 
-Make `clen` authoritative everywhere:
-
-- Reads bound-check against `guard.1` under the read lock instead of `metadata()`. `clen` is stable under the read lock and exactly equals the payload size, so no `fstat` is needed — `len()` already reads it this way.
-- In-place write ops bound-check against `guard.1` under the write lock instead of `lseek(SEEK_END)`.
-- Appends (`push`, `extend`, `extend_sparse*`, the `Push` gen op) position at `HEADER_SIZE + clen` rather than the physical file end, overwriting any orphaned tail a failed rollback left behind.
-
-This removes one syscall from every read and every in-place write **and** closes the failed-rollback hazard, with no new error type and no on-disk change. Master still uses `metadata()`/`seek(END)` in these paths, so this is a fresh optimization on both lines, not a backport.
+Appends (`push`, `extend`, `extend_sparse`, `extend_sparse_batched`, the `Push` gen op, and their C counterparts) position at `HEADER_SIZE + clen` instead of the physical end, overwriting any orphaned tail. This drops one `lseek` per append and closes the hazard, with no new error type and no on-disk change.
 
 ### Open questions
 
-- Is there any op that legitimately relies on the physical size differing from `clen`? (Reviewed: none — `clen` is committed in lockstep with every size change; the only divergence is the failure window this change neutralises.)
-- The non-Unix/Windows fallback paths also use `seek(SEEK_END)`; fold them in too.
+- The size-changing ops (`pop`, `pop_into`, `discard`, `resize`, `ensure`, `ensure_with`, `atrunc`, `splice`, `splice_into`, `replace`, `try_extend*`, `try_discard`) also read the physical size. Should they switch to `clen` in the same change?
 
 ---
 
