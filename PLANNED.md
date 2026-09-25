@@ -72,6 +72,18 @@ Reasons:
 
 The gain is small. The parameters already have names (`offset`, `len`), so the main benefit is call-site readability, which is a matter of taste. The cost is large. Rust has no overloading, so retrofitting means either adding a companion method beside every range method, which doubles the surface, or changing the `(offset, len)` signatures in place, which breaks every call site. Either way the crate takes on a new public type to document and maintain indefinitely, and a breaking change is not acceptable on the stable 0.2 line.
 
+### Adding a `fault-injection` module for deterministic I/O-failure testing
+
+Reasons:
+
+On the 0.2 line, none of the `atrunc` or batched write operations are atomic, so a crash or I/O failure partway through can leave a partial state. 0.4.x closed this with journalling (along with deferred replay and `InterruptedWrite`), which is too invasive to backport. Fault-injection testing on this line would mostly confirm failure modes that are already known and left unfixed on purpose. Shipping it would also suggest that 0.2's failure handling is hardened when it is not, which gives users a false sense of safety. Users who depend on correct behavior under I/O failure should upgrade to the 0.4.x line, which already ships this module.
+
+### Adding a `debug-no-sync` feature flag to skip durable sync in tests
+
+Reasons:
+
+The flag exists to speed up crash-safety and fault-injection harnesses. With fault injection not planned for this line (see above), there is no such harness to speed up. The C port's `BSTACK_TEST_NO_DURABLE_SYNC` stays as it is, and the parity gap is accepted. Users who need fast fault-injection testing should upgrade to the 0.4.x line, which ships both.
+
 ---
 
 ## Treat the committed length as the sole source of truth for logical size
@@ -92,25 +104,6 @@ Appends (`push`, `extend`, `extend_sparse`, `extend_sparse_batched`, the `Push` 
 ### Open questions
 
 - The size-changing ops (`pop`, `pop_into`, `discard`, `resize`, `ensure`, `ensure_with`, `atrunc`, `splice`, `splice_into`, `replace`, `try_extend*`, `try_discard`) also read the physical size. Should they switch to `clen` in the same change?
-
----
-
-## Debug feature flag to skip durable sync for faster fault-injection testing
-
-**Feature flag:** new debug-only flag (`debug-no-sync`), off by default and not for production use.
-**Breaking change:** No — purely additive, gated behind an opt-in flag.
-
-### Motivation
-
-Downstream crash-safety and fault-injection tests spend most of their wall-clock time paying for a real durable sync on every write, even when the test only cares about post-crash state correctness, not actual durability. A feature-gated flag that skips the durable sync (writes still happen, just without the sync) lets those harnesses iterate much faster, at the cost of no durability guarantee — so it must be scoped to debug/testing use only.
-
-On this line the gap is also a **C/Rust parity mismatch**: the C port already honours `BSTACK_TEST_NO_DURABLE_SYNC` at compile time (`c/bstack.c`), but the Rust `durable_sync` always issues the sync. The 0.4.x line shipped the Rust `debug-no-sync` feature; backporting it restores parity and speeds up this line's own fsync-heavy suites.
-
-*(Adapted from the 0.4.x line's planned entry for this feature.)*
-
-### Open questions
-
-- Gate on `all(debug_assertions, feature = "debug-no-sync")` (release builds always sync), matching the 0.4.x implementation and the C `-D` flag's intent.
 
 ---
 
@@ -146,25 +139,3 @@ It expands to the lifetime-only reborrow (via `transmute`, or `ptr::from_mut` + 
 
 - Exact spelling (`bstack_unsafe_reborrow_mut!` vs `bstack_reborrow_mut_unchecked!`).
 - Whether to also add a safe out-parameter variant (`process_gen_with` taking `&mut Option<BStackGenOp<'a>>`), as the 0.4.x plan proposed, or keep only the macro.
-
----
-
-## `fault-injection` module for deterministic I/O-failure testing
-
-**Feature flag:** dedicated (`fault-injection`), test/dev-oriented; active only with `debug_assertions`.
-**Breaking change:** No — additive; release builds contain none of the machinery.
-
-### Motivation
-
-The failure branches of the API — which surviving handle a failed operation returns, whether it reads back valid bytes, whether best-effort rollback frees an orphaned region — are hard to reach from the happy path, so they are barely exercised. A `BStack` that fails I/O on demand closes that gap: a test arms a fault at a chosen operation (or a seeded, reproducible schedule), drives the operation, and asserts on the outcome, including crash-window behaviour (a fault injected after the write reaches the file but before `sync`).
-
-### Design (sketch)
-
-A feature-gated fault hook consulted inside `BStack`'s I/O, after argument validation, returning a policy-supplied `io::Error` in place of the I/O. Configurable to fail the Nth op, fail ops matching a predicate, or fail with a seeded probability; deterministic from the seed. Because the allocators hold a concrete `BStack` by value, an in-type hook (as the `guarded` feature already does for slice access) is cleaner than a wrapper type. The 0.4.x line shipped this as a `fault` module gated on `all(debug_assertions, feature = "fault-injection")`.
-
-*(Lower priority — test infrastructure. Adapted and trimmed from the 0.4.x line's planned entry, which was framed around the allocator error contract.)*
-
-### Open questions
-
-- Whether faults are injected per public method or per underlying syscall (`read`/`write`/`sync`) — the latter is needed for partial-write and write-vs-sync crash windows.
-- Public API (useful for downstream allocator authors) vs. `pub(crate)` for this crate's own suite.
