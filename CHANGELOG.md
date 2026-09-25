@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **32-bit glibc, uclibc, and Android: lock-free reads at offsets of 2 GiB or more failed or read the wrong bytes.** Rust now reads through `read_exact_at`, which uses `pread64`. C now defines `_FILE_OFFSET_BITS 64`, and its I/O wrappers fail with `EOVERFLOW` instead of truncating an offset.
 - **Windows: single reads of 4 GiB or more failed.** Rust and C now split them into `DWORD`-sized chunks, and C also does this for writes.
+- **An orphaned tail left by a failed rollback could leak into the payload (Rust and C).** If a failed write's rollback truncation also failed, appends ran past the stale bytes and committed them, `pop` returned them, and zero-fill growth could expose them. Appends and truncations now use the cached committed length instead of the physical size: appends overwrite the tail, and zero-fill growth (`extend`, `resize`, `ensure`, the sparse extends, `try_extend_zeros`) cuts it first. Data appends skip one `fstat` in C. No API or on-disk change.
 
 ## [0.2.8] - 2026-09-13
 

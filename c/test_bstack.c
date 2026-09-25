@@ -777,6 +777,116 @@ static int test_recovery_repairs_header_after_partial_pop(void)
 }
 
 /* =========================================================================
+ * Orphaned tail past clen (failed-rollback simulation)
+ * ====================================================================== */
+
+/* Append junk past the committed length through a second fd, as a failed
+ * rollback would leave it. The header is left alone. */
+static int plant_orphan(const char *path, const char *junk, size_t n)
+{
+    int fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return -1;
+    ssize_t w = write(fd, junk, n);
+    close(fd);
+    return w == (ssize_t)n ? 0 : -1;
+}
+
+static const char JUNK[8] = { 'X','X','X','X','X','X','X','X' };
+
+static int test_push_overwrites_orphaned_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"abc", 3, NULL) == 0);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    uint64_t off;
+    CHECK(bstack_push(bs, (const uint8_t *)"de", 2, &off) == 0);
+    CHECK(off == 3);
+    uint8_t buf[5];
+    CHECK(bstack_get(bs, 0, 5, buf) == 0);
+    CHECK(memcmp(buf, "abcde", 5) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_grow_over_orphaned_tail_reads_zero(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"ab", 2, NULL) == 0);
+    uint64_t off, init;
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_extend(bs, 2, &off) == 0);
+    CHECK(off == 2);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_extend_sparse(bs, (const uint8_t *)"c", 1, 2, &off) == 0);
+    CHECK(off == 4);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_resize(bs, 8, &init) == 0);
+    CHECK(init == 6);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_ensure(bs, 10, &init) == 0);
+    CHECK(init == 8);
+    uint8_t buf[10];
+    CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "ab\0\0c\0\0\0\0\0", 10) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_pop_and_discard_ignore_orphaned_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"abcd", 4, NULL) == 0);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    uint8_t buf[2]; size_t w;
+    CHECK(bstack_pop(bs, 2, buf, &w) == 0);
+    CHECK(memcmp(buf, "cd", 2) == 0);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_discard(bs, 1) == 0);
+    uint64_t len;
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(len == 1);
+    struct stat st;
+    CHECK(stat(tmp, &st) == 0);
+    CHECK(st.st_size == 16 + 1);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+#ifdef BSTACK_FEATURE_ATOMIC
+static int test_try_ops_use_committed_length_over_orphaned_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (const uint8_t *)"ab", 2, NULL) == 0);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    int ok = 0;
+    CHECK(bstack_try_discard(bs, 2, 0, &ok) == 0);
+    CHECK(ok == 1);
+    CHECK(bstack_try_extend(bs, 2, (const uint8_t *)"c", 1, &ok) == 0);
+    CHECK(ok == 1);
+    CHECK(plant_orphan(tmp, JUNK, 8) == 0);
+    CHECK(bstack_try_extend_zeros(bs, 3, 2, &ok) == 0);
+    CHECK(ok == 1);
+    uint8_t buf[5];
+    CHECK(bstack_get(bs, 0, 5, buf) == 0);
+    CHECK(memcmp(buf, "abc\0\0", 5) == 0);
+    bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+#endif
+
+/* =========================================================================
  * Concurrency
  * ====================================================================== */
 
@@ -4841,6 +4951,14 @@ int main(void)
     /* Crash recovery */
     T(test_recovery_truncates_partial_push);
     T(test_recovery_repairs_header_after_partial_pop);
+
+    /* Orphaned tail past clen */
+    T(test_push_overwrites_orphaned_tail);
+    T(test_grow_over_orphaned_tail_reads_zero);
+    T(test_pop_and_discard_ignore_orphaned_tail);
+#ifdef BSTACK_FEATURE_ATOMIC
+    T(test_try_ops_use_committed_length_over_orphaned_tail);
+#endif
 
     /* Concurrency */
     T(test_concurrent_reads_do_not_serialise);

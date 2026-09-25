@@ -567,8 +567,8 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 
 | Operation                              | Sequence                                                                                  |
 |----------------------------------------|-------------------------------------------------------------------------------------------|
-| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
-| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `push`                                 | `lseek(16 + clen)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                    |
+| `extend`                               | `fstat` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                          |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
 | `set` *(feature)*                      | `lseek(offset)` → `write(data)` → sync                                                    |
@@ -679,8 +679,10 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 `BStack` wraps the file in a `RwLock`. The committed payload length is also
 cached in memory and kept in sync with the on-disk header by every
-write-lock-held operation, so `len`/`is_empty` and the bounds checks of every
-read and in-place write use it without a `File::metadata` or `lseek` syscall.
+write-lock-held operation. It is the sole source of truth for the payload size:
+`len`/`is_empty`, every bounds check, and every append and truncation use it
+rather than the physical file size, so an orphaned tail left by a failed
+rollback is never exposed, and appends overwrite it.
 
 | Operation                                                    | Lock (Unix / Windows) | Lock (other) |
 |--------------------------------------------------------------|-----------------------|--------------|

@@ -627,6 +627,17 @@ fn write_committed_len(file: &mut File, clen: &mut u64, len: u64) -> io::Result<
     Ok(())
 }
 
+/// Grow the file with zeros from the committed end `file_end` to `new_end`.
+///
+/// A failed rollback can leave an orphaned tail past `file_end`, and `set_len`
+/// only zero-fills past the physical end, so any such tail is cut first.
+fn grow_zeroed(file: &File, file_end: u64, new_end: u64) -> io::Result<()> {
+    if file.metadata()?.len() > file_end {
+        file.set_len(file_end)?;
+    }
+    file.set_len(new_end)
+}
+
 /// Size, in bytes, of the per-thread scratch buffer ([`IO_BUF`]) the streaming
 /// fill and copy helpers reuse, so a large `repeat`/`zero`/`copy` runs in O(1)
 /// memory instead of materialising the whole region. Matches the 0.4.x line's
@@ -810,7 +821,7 @@ fn commit_sparse_extend(
     new_len: u64,
     blocks: &[(u64, &[u8])],
 ) -> io::Result<()> {
-    file.set_len(HEADER_SIZE + new_len)?;
+    grow_zeroed(file, file_end, HEADER_SIZE + new_len)?;
     for (rel, data) in blocks {
         if let Err(e) = file
             .seek(SeekFrom::Start(HEADER_SIZE + logical_offset + rel))
@@ -972,11 +983,11 @@ pub struct BStack {
     /// `clen` (the `.1` field) is seeded from the validated header at
     /// construction time (after recovery) and kept in sync by every
     /// write-lock-held operation that commits a new `clen` to the header, via
-    /// `write_committed_len`. [`BStack::len`], [`BStack::is_empty`], and every
-    /// read and in-place mutator's bounds check read it under the same lock used
-    /// for the on-disk state, so no extra synchronisation is needed. It is the
-    /// size recovery would adopt, so a stale tail left by a failed grow is never
-    /// exposed.
+    /// `write_committed_len`. It is the sole source of truth for the payload
+    /// size: [`BStack::len`], every bounds check, and every append and truncation
+    /// read it under the same lock used for the on-disk state, never the physical
+    /// file size. It is the size recovery would adopt, so an orphaned tail left
+    /// by a failed rollback is never exposed; appends overwrite it.
     lock: RwLock<(File, u64)>,
     /// Monotonically growing partition boundary.  Bytes in `[0, locked)` are
     /// immutable and can be read without the rwlock on supported platforms.
@@ -1108,13 +1119,14 @@ impl BStack {
         let data = data.as_ref();
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if data.is_empty() {
             return Ok(logical_offset);
         }
 
+        file.seek(SeekFrom::Start(file_end))?;
         if let Err(e) = file.write_all(data) {
             let _ = file.set_len(file_end);
             return Err(e);
@@ -1154,15 +1166,15 @@ impl BStack {
     pub fn extend(&self, n: u64) -> io::Result<u64> {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if n == 0 {
             return Ok(logical_offset);
         }
 
         let new_file_end = file_end + n;
-        file.set_len(new_file_end)?;
+        grow_zeroed(file, file_end, new_file_end)?;
 
         let new_len = logical_offset + n;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
@@ -1222,8 +1234,8 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if length == 0 {
             return Ok(logical_offset);
@@ -1289,8 +1301,8 @@ impl BStack {
 
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let logical_offset = file_end - HEADER_SIZE;
+        let logical_offset = *clen;
+        let file_end = HEADER_SIZE + logical_offset;
 
         if length == 0 {
             // Every block was validated to fit within `[0, 0)`, so `blocks` is empty.
@@ -1324,8 +1336,7 @@ impl BStack {
     pub fn pop(&self, n: u64) -> io::Result<Vec<u8>> {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1655,8 +1666,7 @@ impl BStack {
         let n = buf.len() as u64;
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1703,8 +1713,7 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1751,8 +1760,8 @@ impl BStack {
     pub fn resize(&self, target: u64) -> io::Result<u64> {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target == data_size {
             return Ok(data_size);
@@ -1776,7 +1785,7 @@ impl BStack {
 
         // Grow (mirrors `extend`): the OS zero-fills the new region; commit the
         // new length, rolling the file back on a commit failure.
-        file.set_len(HEADER_SIZE + target)?;
+        grow_zeroed(file, file_end, HEADER_SIZE + target)?;
         if let Err(e) = write_committed_len(file, clen, target).and_then(|_| durable_sync(file)) {
             let _ = file.set_len(file_end);
             *clen = data_size;
@@ -1805,14 +1814,14 @@ impl BStack {
     pub fn ensure(&self, target: u64) -> io::Result<u64> {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target <= data_size {
             return Ok(data_size);
         }
 
-        file.set_len(HEADER_SIZE + target)?;
+        grow_zeroed(file, file_end, HEADER_SIZE + target)?;
         if let Err(e) = write_committed_len(file, clen, target).and_then(|_| durable_sync(file)) {
             let _ = file.set_len(file_end);
             *clen = data_size;
@@ -1861,8 +1870,8 @@ impl BStack {
     {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
 
         if target <= data_size {
             return Ok(data_size);
@@ -1880,9 +1889,10 @@ impl BStack {
         }
         let mut buf = vec![0u8; growth as usize];
         f(&mut buf);
-        // The cursor is at `file_end` (from the seek above); appending `buf`
-        // grows the file. The bytes sit beyond the committed length until the
-        // header write below, so a crash rolls back by truncation.
+        // Appending `buf` at the committed end grows the file. The bytes sit
+        // beyond the committed length until the header write below, so a crash
+        // rolls back by truncation.
+        file.seek(SeekFrom::Start(file_end))?;
         if let Err(e) = file.write_all(&buf) {
             let _ = file.set_len(file_end);
             return Err(e);
@@ -2107,8 +2117,8 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2187,8 +2197,8 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2273,8 +2283,8 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2348,14 +2358,15 @@ impl BStack {
         let buf = buf.as_ref();
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
         if buf.is_empty() {
             return Ok(true);
         }
+        file.seek(SeekFrom::Start(file_end))?;
         if let Err(e) = file.write_all(buf) {
             let _ = file.set_len(file_end);
             return Err(e);
@@ -2414,8 +2425,8 @@ impl BStack {
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2479,8 +2490,8 @@ impl BStack {
 
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2516,8 +2527,8 @@ impl BStack {
     pub fn try_extend_zeros(&self, s: u64, n: u64) -> io::Result<bool> {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if data_size != s {
             return Ok(false);
         }
@@ -2530,7 +2541,7 @@ impl BStack {
                 "try_extend_zeros: data_size + n overflows u64",
             )
         })?;
-        file.set_len(HEADER_SIZE + new_len)?;
+        grow_zeroed(file, file_end, HEADER_SIZE + new_len)?;
         if let Err(e) = write_committed_len(file, clen, new_len).and_then(|_| durable_sync(file)) {
             // Reset the cache up front so it reflects the rolled-back file
             // even if the best-effort header rewrite below fails.
@@ -2563,15 +2574,11 @@ impl BStack {
     #[cfg(feature = "atomic")]
     pub fn try_discard(&self, s: u64, n: u64) -> io::Result<bool> {
         if n == 0 {
-            let guard = self.lock.read().unwrap();
-            let file = &guard.0;
-            let data_size = file.metadata()?.len().saturating_sub(HEADER_SIZE);
-            return Ok(data_size == s);
+            return Ok(self.lock.read().unwrap().1 == s);
         }
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let raw_size = file.seek(SeekFrom::End(0))?;
-        let data_size = raw_size - HEADER_SIZE;
+        let data_size = *clen;
         if data_size != s {
             return Ok(false);
         }
@@ -2859,8 +2866,8 @@ impl BStack {
     {
         let mut guard = self.lock.write().unwrap();
         let (file, clen) = &mut *guard;
-        let file_end = file.seek(SeekFrom::End(0))?;
-        let data_size = file_end - HEADER_SIZE;
+        let data_size = *clen;
+        let file_end = HEADER_SIZE + data_size;
         if n > data_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -3670,8 +3677,9 @@ impl BStack {
                 }
                 Some(BStackGenOp::Push { data }) => {
                     if !data.is_empty() {
-                        let file_end = file.seek(SeekFrom::End(0))?;
-                        let logical_offset = file_end - HEADER_SIZE;
+                        let logical_offset = data_size;
+                        let file_end = HEADER_SIZE + logical_offset;
+                        file.seek(SeekFrom::Start(file_end))?;
                         if let Err(e) = file.write_all(data) {
                             let _ = file.set_len(file_end);
                             return Err(e);

@@ -492,6 +492,131 @@ mod tests {
         assert_eq!(clen_after, 5, "clen should be repaired to 5 after recovery");
     }
 
+    // ---- orphaned tail past clen (failed-rollback simulation) ---------------
+
+    /// Append `junk` past the committed length through a second handle, as a
+    /// failed rollback would leave it. The header is left alone.
+    fn plant_orphan(path: &std::path::Path, junk: &[u8]) {
+        use std::io::Write;
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(junk).unwrap();
+    }
+
+    #[test]
+    fn push_overwrites_orphaned_tail() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abc").unwrap();
+        plant_orphan(&p, b"XXXXXXXX");
+        assert_eq!(s.push(b"de").unwrap(), 3);
+        assert_eq!(s.len().unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"abcde");
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"abcde");
+    }
+
+    #[test]
+    fn extend_over_orphaned_tail_reads_zero() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"ab").unwrap();
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.extend(4).unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"ab\0\0\0\0");
+    }
+
+    #[test]
+    fn extend_sparse_over_orphaned_tail_zeroes_gaps() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"ab").unwrap();
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.extend_sparse(b"c", 4).unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"abc\0\0\0");
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.extend_sparse_batched([(1u64, b"d")], 3).unwrap(), 6);
+        assert_eq!(s.peek(6).unwrap(), b"\0d\0");
+    }
+
+    #[test]
+    fn resize_and_ensure_over_orphaned_tail_read_zero() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"ab").unwrap();
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.resize(4).unwrap(), 2);
+        assert_eq!(s.peek(0).unwrap(), b"ab\0\0");
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.ensure(6).unwrap(), 4);
+        assert_eq!(s.peek(0).unwrap(), b"ab\0\0\0\0");
+    }
+
+    #[test]
+    fn pop_and_discard_ignore_orphaned_tail() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abcdef").unwrap();
+        plant_orphan(&p, b"XXXX");
+        assert_eq!(s.pop(2).unwrap(), b"ef");
+        plant_orphan(&p, b"XXXX");
+        let mut buf = [0u8; 2];
+        s.pop_into(&mut buf).unwrap();
+        assert_eq!(&buf, b"cd");
+        plant_orphan(&p, b"XXXX");
+        s.discard(1).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"a");
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), HEADER_SIZE + 1);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn atomic_ops_use_committed_length_over_orphaned_tail() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abcd").unwrap();
+        plant_orphan(&p, &[0xFF; 8]);
+        assert!(s.try_discard(4, 0).unwrap());
+        assert!(s.try_extend(4, b"e").unwrap());
+        plant_orphan(&p, &[0xFF; 8]);
+        assert!(s.try_extend_zeros(5, 2).unwrap());
+        assert_eq!(s.peek(0).unwrap(), b"abcde\0\0");
+        plant_orphan(&p, &[0xFF; 8]);
+        assert!(s.try_extend_sparse(7, b"f", 2).unwrap());
+        plant_orphan(&p, &[0xFF; 8]);
+        assert!(s.try_extend_sparse_batched(9, [(1u64, b"g")], 2).unwrap());
+        assert_eq!(s.peek(7).unwrap(), b"f\0\0g");
+        plant_orphan(&p, &[0xFF; 8]);
+        assert!(s.try_discard(11, 6).unwrap());
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.splice(2, b"xyz").unwrap(), b"de");
+        plant_orphan(&p, &[0xFF; 8]);
+        s.atrunc(1, b"").unwrap();
+        plant_orphan(&p, &[0xFF; 8]);
+        let mut old = [0u8; 1];
+        s.splice_into(&mut old, b"").unwrap();
+        assert_eq!(&old, b"y");
+        plant_orphan(&p, &[0xFF; 8]);
+        s.replace(1, |t| [t, b"!"].concat()).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"abcx!");
+        plant_orphan(&p, &[0xFF; 8]);
+        assert_eq!(s.ensure_with(7, |b| b[1] = b'?').unwrap(), 5);
+        assert_eq!(s.peek(0).unwrap(), b"abcx!\0?");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_push_overwrites_orphaned_tail() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(b"abc").unwrap();
+        plant_orphan(&p, b"XXXXXXXX");
+        s.process_gen(|| Some(BStackGenOp::Push { data: b"de" }))
+            .unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"abcde");
+    }
+
     // ---- peek_into ----------------------------------------------------------
 
     #[test]

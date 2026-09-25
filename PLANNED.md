@@ -64,7 +64,7 @@ On a cached stack, reads whose range lies entirely within the locked region copy
 
 Reasons:
 
-The 0.4.x line guards against a follow-up write running against an inconsistent file — the window after a failed write whose best-effort rollback *also* failed — with an in-memory `replay_needed` flag, a new public `InterruptedWrite` error returned from *reads*, and a `recover()` entry point. On the 0.2 line the same hazard is addressed more cheaply by **Treat the committed length as the sole source of truth for logical size** (below): bounding every read and in-place write against `clen`, and appending at `HEADER_SIZE + clen` rather than the physical end, means a stale un-rolled-back tail can never be seen as valid payload — with no new error type and no on-disk change. The deferred-replay design also makes `len`/`is_empty` fallible (a `len().unwrap()` after a failed write would then panic), a borderline-breaking behavioural change not justified on a stable 0.2 line. Revisit only if the `clen`-authoritative change proves insufficient.
+The 0.4.x line guards against a follow-up write running against an inconsistent file — the window after a failed write whose best-effort rollback *also* failed — with an in-memory `replay_needed` flag, a new public `InterruptedWrite` error returned from *reads*, and a `recover()` entry point. On the 0.2 line the same hazard is addressed more cheaply by treating the committed length as the sole source of truth for logical size: bounding every read and in-place write against `clen`, and appending at `HEADER_SIZE + clen` rather than the physical end, means a stale un-rolled-back tail can never be seen as valid payload — with no new error type and no on-disk change. The deferred-replay design also makes `len`/`is_empty` fallible (a `len().unwrap()` after a failed write would then panic), a borderline-breaking behavioural change not justified on a stable 0.2 line. Revisit only if the `clen`-authoritative change proves insufficient.
 
 ### Adding a `ByteRange` type for `(offset, len)` parameters
 
@@ -83,27 +83,6 @@ On the 0.2 line, none of the `atrunc` or batched write operations are atomic, so
 Reasons:
 
 The flag exists to speed up crash-safety and fault-injection harnesses. With fault injection not planned for this line (see above), there is no such harness to speed up. The C port's `BSTACK_TEST_NO_DURABLE_SYNC` stays as it is, and the parity gap is accepted. Users who need fast fault-injection testing should upgrade to the 0.4.x line, which ships both.
-
----
-
-## Treat the committed length as the sole source of truth for logical size
-
-**Feature flag:** None (internal change; no API or on-disk change)
-**Breaking change:** No
-
-### Motivation
-
-Reads and in-place writes already bound-check against the cached committed length `clen` (a4b9b16, backport of #94). Appends still position at the physical file end via `seek(SeekFrom::End(0))` (`file_size()` in C).
-
-The two diverge after a write fails **and its best-effort rollback also fails**, leaving the physical file larger than `clen`. A subsequent `push` then appends after the orphaned tail and commits it as payload. This is the hazard the 0.4.4 line fixed with deferred replay (see the NOT PLANNED note on that machinery, which this supersedes on the 0.2 line).
-
-### Design (sketch)
-
-Appends (`push`, `extend`, `extend_sparse`, `extend_sparse_batched`, the `Push` gen op, and their C counterparts) position at `HEADER_SIZE + clen` instead of the physical end, overwriting any orphaned tail. This drops one `lseek` per append and closes the hazard, with no new error type and no on-disk change.
-
-### Open questions
-
-- The size-changing ops (`pop`, `pop_into`, `discard`, `resize`, `ensure`, `ensure_with`, `atrunc`, `splice`, `splice_into`, `replace`, `try_extend*`, `try_discard`) also read the physical size. Should they switch to `clen` in the same change?
 
 ---
 
