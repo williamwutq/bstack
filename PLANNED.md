@@ -100,6 +100,14 @@ Reasons:
 
 `RangeBounds::end_bound` must return `Bound<&u64>` — a reference into `self`. `BStackRange` stores `offset` and `len`, so the end (`offset + len`) is a computed temporary with no field to borrow, and only `start_bound` could be satisfied. Storing `end` instead of `len` would make both bounds borrowable but is invasive: it touches every `len`-reading method and the 16-byte on-disk `(offset, len)` layout. The need is already met by the existing `range()` accessor, which returns `Range<u64>` (itself `RangeBounds<u64>`) at zero cost.
 
+### Adding `coalescible()`, a query for pending coalesce work on `SegregatedBStackAllocator`
+
+The proposal: a read-only `coalescible()` that walks the arena and returns the number of merges `coalesce` would perform (free-to-free physical adjacencies), so callers can skip `coalesce` when it is zero.
+
+Reasons:
+
+Free-block adjacency is only observable by striding the arena, so `coalescible()` must perform the same full linear scan as `coalesce`, and it saves nothing on the scan itself. The claimed saving, avoiding the journalled write, does not exist either. `coalesce` already writes nothing and returns `0` when it finds no run to merge. When runs do exist, the caller calls `coalesce` anyway and pays for the scan twice. The only real difference is that the query takes the read lock rather than `inplace_gen`'s write lock. That is not enough to justify a new public method. The count is also stale as soon as the lock is released, so it cannot decide anything that calling `coalesce` directly would not decide more cheaply. Folding the count into `recover` does not change this, since it only covers the moment after reopen and goes stale in the same way. A query that is actually cheap would need incrementally maintained adjacency state updated on every `alloc`/`dealloc`/`realloc`, which is a different and much more invasive design.
+
 ---
 
 ## Compact `Repeat` staging within a batched commit (0.5.0)
@@ -468,70 +476,3 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 - **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
 - **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
 - **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
-
----
-
-## `coalescible()` — a cheap query for pending coalesce work on `SegregatedBStackAllocator`
-
-### Motivation
-
-`SegregatedBStackAllocator::coalesce` always strides the entire arena, so its cost is linear in the number of live blocks and reaches roughly 13 ms at 20,000 blocks on real filesystem I/O. In realistic interleaved workloads, however, freed blocks rarely come to rest physically adjacent to another free block, so the scan finds nothing to merge on the overwhelming majority of calls. There is currently no way to determine whether a scan would find any mergeable run without performing that scan in full. Because the answer depends on the physical adjacency of free blocks, which only the allocator can observe, it should be surfaced by the allocator rather than approximated by caller-side scheduling policy.
-
-### Design
-
-The value to expose is the number of merges `coalesce` would perform, which equals the count of free-to-free physical adjacencies, `(free blocks) − (free runs)`. A caller skips `coalesce` whenever it is zero.
-
-The default reported quantity is an adjacency **count**, because it is the minimal surface with a clean, testable invariant: `coalescible()` must equal what `coalesce()` would return if it ran without writing. A coalescible-*bytes* figure is recoverable in the same walk at no extra cost (see open questions) and can be offered alongside it.
-
-A dedicated method walks the arena once, reusing the `stats_scan`/`recover` walk and tracks only whether the previous physical block was free:
-
-```rust
-#[cfg(feature = "atomic")]
-pub fn coalescible(&self) -> io::Result<u64> {
-    let stack_len = self.stack.len()?; // retry on InvalidInput as stats() does
-    if stack_len <= Self::ARENA_START {
-        return Ok(0);
-    }
-    let scan_end =
-        Self::ARENA_START + ((stack_len - Self::ARENA_START) & !(Self::QUANTUM - 1));
-    let mut adjacencies = 0u64;
-    let mut prev_free = false;
-    let mut p = Self::ARENA_START;
-    let mut word_buf = [0u8; 8];
-    let mut pending = false;
-    self.stack.get_batched_gen(|| {
-        if pending {
-            pending = false;
-            let word = u64::from_le_bytes(word_buf);
-            let size = (word & !Self::IN_USE_BIT) << 4;
-            if word == 0 || size < Self::QUANTUM || size > scan_end - p {
-                p = scan_end; // zeroed tail or malformed: stop the scan here
-                return None;
-            }
-            let is_free = word & Self::IN_USE_BIT == 0;
-            if is_free && prev_free {
-                adjacencies += 1; // one more merge within this run
-            }
-            prev_free = is_free;
-            p += size;
-        }
-        if p >= scan_end {
-            return None;
-        }
-        pending = true;
-        Some((p, bstack_unsafe_reborrow_mut!(&mut word_buf[..])))
-    })?;
-    Ok(adjacencies)
-}
-```
-
-`adjacencies` counts each free block that immediately follows a free block, so it sums `(run_len − 1)` over every maximal free run, which is the merge count. The walk is linear in live blocks, which is the same cost profile as the `recover` scan that `new` already runs on every non-empty reopen and as the scan `coalesce` itself performs, so the query stays consistent with the allocator's existing costs rather than introducing a new one. It is a standalone query rather than a `BStackAllocStats` field, because a field would tie the value to the snapshot scan and defeat the purpose.
-
-The value is still meaningfully cheaper than `coalesce` in the common case it targets, because it reads the arena but never writes and so avoids the journalled `inplace_gen` commit. A caller that scans, finds `0`, and skips the merge pays one read pass instead of a read pass plus a durable write.
-
-Because the `recover` walk already strides every overhead word in exactly this order, the same `is_free && prev_free` accumulation can be folded into it, so that `recover` returns the coalescible count alongside its repair result rather than requiring a second scan. A caller that has just reopened the arena — where `new` runs `recover` before the handle escapes — then already holds the count without calling `coalescible()` at all. The standalone `coalescible()` above and this `recover`-side accumulation share the per-block body; whether to factor that body into one visitor both call, or to inline it in each, is left to implementation.
-
-### Open questions
-
-- **Naming.** Whether to name the method `coalescible`, reporting the adjacency (merge) count. The count alone is the minimal, invariant-checkable surface, since `coalescible()` must equal what `coalesce()` returns without writing.
-- **Whether to also expose a byte figure.** Whether to additionally return a coalescible-*bytes* value. Bytes are recoverable in the same walk at no extra cost and let a caller weigh reclamation value rather than just its existence, at the cost of a second returned quantity.
