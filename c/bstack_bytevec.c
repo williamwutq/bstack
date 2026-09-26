@@ -21,8 +21,19 @@ extern "C" {
 /* Byte offset of the first element within the block (past the 16-byte header). */
 #define BYTEVEC_HEADER_LEN UINT64_C(16)
 
-/* Absolute byte offset of element at index (0-based). */
-#define bytevec_elem_offset(index) (BYTEVEC_HEADER_LEN + (uint64_t)(index))
+/* Slice-relative byte offset of element at index (0-based).
+ *
+ * Saturates to UINT64_MAX on overflow so a corrupt header `len` (e.g.
+ * UINT64_MAX) cannot wrap `BYTEVEC_HEADER_LEN + index` back into a small
+ * in-block offset that would slip past the bstack_slice_* bounds check and
+ * overwrite the header or a neighbour; the saturated offset is rejected there
+ * with EINVAL instead. */
+static inline uint64_t bytevec_elem_offset(uint64_t index)
+{
+    if (index > UINT64_MAX - BYTEVEC_HEADER_LEN)
+        return UINT64_MAX;
+    return BYTEVEC_HEADER_LEN + index;
+}
 
 /* =========================================================================
  * Private helpers
@@ -438,6 +449,14 @@ int bstack_bytevec_fill(bstack_bytevec_t *v, uint8_t value)
         return -1;
     if (len == 0)
         return 0;
+    /* Guard the raw bstack_repeat (absolute offsets, not block-bounded) against
+     * a corrupt `len`: a len larger than the block can hold would otherwise
+     * repeat `value` across neighbouring allocations. */
+    if (len > UINT64_MAX - BYTEVEC_HEADER_LEN
+        || BYTEVEC_HEADER_LEN + len > bstack_slice_len(v->slice)) {
+        errno = EINVAL;
+        return -1;
+    }
     return bstack_repeat(bstack_allocator_stack(v->slice.allocator),
                          bytevec_abs_offset(v, 0), &value, 1, len);
 }

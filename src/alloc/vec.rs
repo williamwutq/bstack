@@ -117,6 +117,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     /// Returns `Err(InvalidInput)` if the arithmetic overflows `u64` — this
     /// prevents passing a wrapped-around value to the allocator and accidentally
     /// obtaining a block that is too small.
+    #[inline]
     fn block_size(capacity: u64) -> io::Result<u64> {
         capacity.checked_add(HEADER_LEN).ok_or_else(|| {
             io::Error::new(
@@ -126,12 +127,20 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         })
     }
 
-    fn byte_offset(index: u64) -> u64 {
-        // `index` is always < `len` which was read from a header we wrote, so
-        // this addition cannot overflow in well-formed data.  A corrupt
-        // on-disk `len` could cause overflow and a debug-mode panic; that is
-        // acceptable — corruption is not a recoverable condition here.
-        HEADER_LEN + index
+    /// Relative offset of logical byte `index` within the block slice.
+    ///
+    /// Checked so a corrupt on-disk `len` (e.g. `u64::MAX`) cannot wrap
+    /// `HEADER_LEN + index` back into a small in-block offset that would slip
+    /// past the slice bounds check and overwrite the header or a neighbour; an
+    /// overflow is reported as a clean error, per the corrupt-header policy.
+    #[inline]
+    fn byte_offset(index: u64) -> io::Result<u64> {
+        HEADER_LEN.checked_add(index).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BStackByteVec: byte offset overflows u64 (corrupt header)",
+            )
+        })
     }
 
     /// Re-read `(len, capacity)` from the block header on disk.
@@ -161,24 +170,24 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
     }
 
     fn read_byte_at(&self, index: u64) -> io::Result<u8> {
-        let start = Self::byte_offset(index);
+        let start = Self::byte_offset(index)?;
         let mut byte = [0u8; 1];
         self.slice.read_range_into(start, &mut byte)?;
         Ok(byte[0])
     }
 
     fn write_byte_at(&self, index: u64, value: u8) -> io::Result<()> {
-        let start = Self::byte_offset(index);
+        let start = Self::byte_offset(index)?;
         self.slice.write_range(start, [value])
     }
 
     fn write_bytes_at(&self, start_index: u64, values: &[u8]) -> io::Result<()> {
-        let start = Self::byte_offset(start_index);
+        let start = Self::byte_offset(start_index)?;
         self.slice.write_range(start, values)
     }
 
     fn zero_byte_at(&self, index: u64) -> io::Result<()> {
-        self.slice.zero_range(Self::byte_offset(index), 1)
+        self.slice.zero_range(Self::byte_offset(index)?, 1)
     }
 
     /// Reallocate the block to hold `new_cap` bytes, updating `self.slice`.
@@ -377,7 +386,7 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         if new_len >= len {
             return Ok(());
         }
-        let start = Self::byte_offset(new_len);
+        let start = Self::byte_offset(new_len)?;
         let removed = len - new_len;
         self.write_len_field(new_len)?;
         self.slice.zero_range(start, removed)
@@ -987,9 +996,10 @@ impl<'a, A: BStackSliceAllocator> BStackByteVec<'a, A> {
         if count == 0 {
             return Ok(Some(Vec::new()));
         }
-        let removed = self
-            .slice
-            .read_range(Self::byte_offset(range.start), Self::byte_offset(range.end))?;
+        let removed = self.slice.read_range(
+            Self::byte_offset(range.start)?,
+            Self::byte_offset(range.end)?,
+        )?;
         let tail = len - range.end;
         if tail > 0 {
             let alloc: &'a A = self.slice.allocator();
@@ -1114,6 +1124,18 @@ mod tests {
         let path = temp_path();
         let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
         (alloc, path)
+    }
+
+    // A corrupt header `len` must be rejected cleanly, not wrap `HEADER_LEN +
+    // len` into a small in-block offset that overwrites the header itself.
+    #[test]
+    fn push_on_corrupt_len_errors_without_wrapping() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        v.write_len_field(u64::MAX).unwrap(); // simulate on-disk corruption
+        let err = v.push(9).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     // ── constructors and header recovery ─────────────────────────────────────

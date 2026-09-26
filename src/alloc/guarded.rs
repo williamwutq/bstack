@@ -198,7 +198,28 @@ where
         let raw = data.as_ref();
         let n = self.len().min(raw.len() as u64);
         let cooked = self.pre_write(&raw[..n as usize])?;
-        slice.write(cooked.as_ref())?;
+        let cooked = cooked.as_ref();
+        // The transformed bytes are written to the raw block, which
+        // `BStackSlice::write` clips to the block length. Reject an output that
+        // would be silently truncated (longer than the block — e.g. dropping a
+        // transforming guard's auth tail) and, for a full-length write, one that
+        // would leave a stale raw tail (shorter than the block, later decoding
+        // as a corrupt new-prefix/old-tail mix). A shorter output for a partial
+        // write is the intended prefix overwrite.
+        let raw_len = slice.len();
+        let full = n == self.len();
+        if cooked.len() as u64 > raw_len || (full && cooked.len() as u64 != raw_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "guard `pre_write` returned {} bytes for a {raw_len}-byte block; the \
+                     transformed output must fit the block (and fill it exactly for a \
+                     whole-slice write) rather than being silently truncated",
+                    cooked.len()
+                ),
+            ));
+        }
+        slice.write(cooked)?;
         self.post_write(0, n)
     }
 
@@ -214,7 +235,22 @@ where
         let n = self.len();
         let zeros = vec![0u8; n as usize];
         let cooked = self.pre_write(&zeros)?;
-        slice.write(cooked.as_ref())?;
+        let cooked = cooked.as_ref();
+        // `zero` overwrites the whole slice, so the transformed fill must fill
+        // the raw block exactly — reject a length-changing encoding rather than
+        // silently truncating it or leaving a stale raw tail.
+        if cooked.len() as u64 != slice.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "guard `pre_write` returned {} bytes for a {}-byte block; a whole-slice \
+                     zero requires the transformed output to fill the block exactly",
+                    cooked.len(),
+                    slice.len()
+                ),
+            ));
+        }
+        slice.write(cooked)?;
         self.post_write(0, n)
     }
 }
@@ -305,4 +341,83 @@ pub unsafe trait BStackAtomicGuardedSliceSubview<'a, A: BStackAllocator + 'a>:
 where
     Self: 'a,
 {
+}
+
+#[cfg(all(test, feature = "set"))]
+mod length_change_tests {
+    use super::*;
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, LinearBStackAllocator};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn mk_alloc() -> (LinearBStackAllocator, std::path::PathBuf) {
+        static C: AtomicU64 = AtomicU64::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bstack_guard_len_{}_{}.bin",
+            std::process::id(),
+            id
+        ));
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        (alloc, path)
+    }
+
+    /// A guard whose `pre_write` changes the length: `grow` appends a trailing
+    /// byte (like an auth tag), otherwise it drops the last byte.
+    struct Reshape<'a> {
+        slice: BStackSlice<'a, LinearBStackAllocator>,
+        grow: bool,
+    }
+    impl<'a> BStackGuardedSlice<'a, LinearBStackAllocator> for Reshape<'a> {
+        fn len(&self) -> u64 {
+            self.slice.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a, LinearBStackAllocator> {
+            self.slice
+        }
+        fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            let mut out = data.to_vec();
+            if self.grow {
+                out.push(0xAA);
+            } else {
+                out.pop();
+            }
+            Ok(Cow::Owned(out))
+        }
+    }
+
+    // A transforming guard whose `pre_write` output length differs from the raw
+    // block must error on a whole-slice write, not silently drop the tail (grow)
+    // or leave a stale raw tail (shrink).
+    #[test]
+    fn write_rejects_length_changing_pre_write() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _ = alloc.alloc(4).unwrap();
+
+        let grow = Reshape {
+            slice: unsafe { BStackSlice::from_raw_parts(&alloc, 0, 4) },
+            grow: true,
+        };
+        assert_eq!(
+            grow.write(b"abcd").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let shrink = Reshape {
+            slice: unsafe { BStackSlice::from_raw_parts(&alloc, 0, 4) },
+            grow: false,
+        };
+        assert_eq!(
+            shrink.write(b"abcd").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }
