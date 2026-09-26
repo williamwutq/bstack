@@ -989,6 +989,47 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
     }
 
+    // A grow whose resulting raw file size (header + payload) would overflow
+    // `u64` must be rejected cleanly, not wrap `set_len` and truncate the file —
+    // header and all — into an unopenable, data-destroying state.
+    #[test]
+    fn extend_overflow_rejected_preserves_data() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"keepme").unwrap();
+        let err = s.extend(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"keepme");
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"keepme");
+    }
+
+    #[test]
+    fn extend_sparse_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        // `payload + length` fits in u64, but `HEADER_SIZE + new_len` would not.
+        let err = s.extend_sparse(b"", u64::MAX - 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
+    #[test]
+    #[cfg(feature = "atomic")]
+    fn try_extend_zeros_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        // `data_size + n` fits in u64, but `HEADER_SIZE + new_len` would not.
+        let err = s.try_extend_zeros(4, u64::MAX - 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
     // ---- resize ---------------------------------------------------------
 
     #[test]
@@ -1055,6 +1096,16 @@ mod tests {
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
     }
 
+    #[test]
+    fn resize_grow_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        let err = s.resize(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
     // ---- ensure ---------------------------------------------------------
 
     #[test]
@@ -1098,6 +1149,16 @@ mod tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    #[test]
+    fn ensure_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        let err = s.ensure(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
     }
 
     // ---- ensure_with (feature-gated) -----------------------------------
@@ -2570,6 +2631,49 @@ mod alloc_tests {
         let _g = Guard(path);
         let s = alloc.alloc(4).unwrap();
         let err = s.zero_range(3, 2).unwrap_err(); // 3+2 > 4
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // A near-`u64::MAX` start must not wrap `start + len` small enough to pass
+    // the length check and land an out-of-slice write in another allocation.
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_range_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let err = s.write_range(u64::MAX, b"abc").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_range_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let err = s.zero_range(u64::MAX, 4).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_range_into_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let mut buf = [0u8; 3];
+        let err = s.read_range_into(u64::MAX, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_range_start_after_end_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        // `start > end` with `end <= len`: must be rejected before the absolute
+        // offsets are computed, not silently wrapped.
+        let err = s.read_range(3, 1).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 

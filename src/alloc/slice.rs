@@ -451,12 +451,20 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     ///
     /// Returns an error if `start > end` or if `end` exceeds `self.len()`.
     pub fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if end < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read_range: end ({end}) < start ({start})"),
+            ));
+        }
         if end > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("range [{start}, {end}) exceeds slice length {}", self.len()),
             ));
         }
+        // `start <= end <= self.len()`, so both absolute offsets stay within
+        // `[self.start(), self.end()]` and cannot overflow.
         self.stack().get(self.start() + start, self.start() + end)
     }
 
@@ -470,7 +478,12 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// Returns [`io::ErrorKind::InvalidInput`] if `start + buf.len()` exceeds
     /// `self.len()`.
     pub fn read_range_into(&self, start: u64, buf: &mut [u8]) -> io::Result<()> {
-        let end_rel = start + buf.len() as u64;
+        let end_rel = start.checked_add(buf.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_range_into: start + len overflows u64",
+            )
+        })?;
         if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -512,7 +525,12 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     #[cfg(feature = "set")]
     pub fn write_range(&self, start: u64, data: impl AsRef<[u8]>) -> io::Result<()> {
         let data = data.as_ref();
-        let end_rel = start + data.len() as u64;
+        let end_rel = start.checked_add(data.len() as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "write_range: start + len overflows u64",
+            )
+        })?;
         if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -545,7 +563,12 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// `self.len()`.
     #[cfg(feature = "set")]
     pub fn zero_range(&self, start: u64, n: u64) -> io::Result<()> {
-        let end_rel = start + n;
+        let end_rel = start.checked_add(n).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero_range: start + n overflows u64",
+            )
+        })?;
         if end_rel > self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

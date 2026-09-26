@@ -638,6 +638,15 @@ int bstack_extend(bstack_t *bs, size_t n, uint64_t *out_offset)
         return 0;
     }
 
+    /* `raw_size` is a live file size, so it never overflows; reject any `n` that
+     * would push the raw file size (header + payload) past UINT64_MAX before it
+     * wraps ftruncate and truncates the file, header and all. */
+    if ((uint64_t)n > UINT64_MAX - raw_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
+
     /* Extend the file; the OS will zero-fill the new space. */
     uint64_t new_raw_size = raw_size + (uint64_t)n;
     if (grow_zeroed(bs->fd, raw_size, new_raw_size) != 0)
@@ -747,6 +756,14 @@ int bstack_peek(bstack_t *bs, uint64_t offset,
         return -1;
     }
 
+#if UINT64_MAX > SIZE_MAX
+    /* 32-bit target: a range wider than size_t would truncate the read count. */
+    if (data_size - offset > (uint64_t)SIZE_MAX) {
+        BS_RDUNLOCK(bs);
+        errno = EOVERFLOW;
+        return -1;
+    }
+#endif
     size_t to_read = (size_t)(data_size - offset);
     if (to_read > 0) {
         if (plat_pread(bs->fd, buf, to_read, HEADER_SIZE + offset) != 0)
@@ -784,6 +801,13 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
      * cache_mutex); otherwise fall through to a lock-free pread. */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (end <= locked) {
+#if UINT64_MAX > SIZE_MAX
+        /* 32-bit target: a range wider than size_t would truncate the count. */
+        if (end - start > (uint64_t)SIZE_MAX) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+#endif
         size_t to_read = (size_t)(end - start);
         if (bs->cache_enabled) {
             if (to_read > 0) {
@@ -809,6 +833,14 @@ int bstack_get(bstack_t *bs, uint64_t start, uint64_t end,
         return -1;
     }
 
+#if UINT64_MAX > SIZE_MAX
+    /* 32-bit target: a range wider than size_t would truncate the read count. */
+    if (end - start > (uint64_t)SIZE_MAX) {
+        BS_RDUNLOCK(bs);
+        errno = EOVERFLOW;
+        return -1;
+    }
+#endif
     size_t to_read = (size_t)(end - start);
     if (to_read > 0) {
         if (plat_pread(bs->fd, buf, to_read, HEADER_SIZE + start) != 0)
@@ -919,7 +951,13 @@ int bstack_resize(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
         return 0;
     }
 
-    /* Grow: the OS zero-fills the new space. */
+    /* Grow: the OS zero-fills the new space. Reject a target whose raw file
+     * size would overflow UINT64_MAX before it wraps ftruncate. */
+    if (target > UINT64_MAX - HEADER_SIZE) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
     if (grow_zeroed(bs->fd, raw_size, HEADER_SIZE + target) != 0)
         goto fail_unlock;
 
@@ -966,6 +1004,13 @@ int bstack_ensure(bstack_t *bs, uint64_t target, uint64_t *out_initial_len)
         return 0;
     }
 
+    /* Reject a target whose raw file size would overflow UINT64_MAX before it
+     * wraps ftruncate and truncates the file, header and all. */
+    if (target > UINT64_MAX - HEADER_SIZE) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
     if (grow_zeroed(bs->fd, raw_size, HEADER_SIZE + target) != 0)
         goto fail_unlock;
 
@@ -1050,6 +1095,13 @@ static int commit_sparse_extend(bstack_t *bs, uint64_t logical_offset,
                                 uint64_t raw_size, uint64_t new_len,
                                 const bstack_iovec_t *blocks, size_t n_blocks)
 {
+    /* Reject a grow whose raw file size (header + payload) would overflow
+     * UINT64_MAX before it wraps ftruncate and truncates the file. The caller
+     * has already checked `logical_offset + length` does not overflow. */
+    if (new_len > UINT64_MAX - HEADER_SIZE) {
+        errno = EINVAL;
+        return -1;
+    }
     if (grow_zeroed(bs->fd, raw_size, HEADER_SIZE + new_len) != 0)
         return -1;
     for (size_t i = 0; i < n_blocks; i++) {
@@ -1910,6 +1962,14 @@ int bstack_try_extend_zeros(bstack_t *bs, uint64_t s, size_t n, int *ok)
         return 0;
     }
 
+    /* `raw_size` never overflows; reject any `n` that would push the raw file
+     * size past UINT64_MAX before it wraps ftruncate. Covers both `data_size +
+     * n` and `HEADER_SIZE + new_len`. */
+    if ((uint64_t)n > UINT64_MAX - raw_size) {
+        BS_WRUNLOCK(bs);
+        errno = EINVAL;
+        return -1;
+    }
     uint64_t new_len = data_size + (uint64_t)n;
     if (grow_zeroed(bs->fd, raw_size, HEADER_SIZE + new_len) != 0 ||
         write_committed_len(bs->fd, &bs->clen, new_len) != 0 ||
@@ -2311,9 +2371,17 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
         return -1;
     }
     uint64_t n = end - start;
+#if UINT64_MAX > SIZE_MAX
+    /* 32-bit target: a range wider than size_t would truncate the malloc and
+     * the bytes read/written back below. */
+    if (n > (uint64_t)SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+#endif
 
     BS_WRLOCK(bs);
-    
+
     /* Load locked under the write lock (see bstack_set for rationale). */
     uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
     if (start < locked) {
