@@ -110,6 +110,114 @@ Free-block adjacency is only observable by striding the arena, so `coalescible()
 
 ---
 
+## `SegregatedBStackAllocator` whole-arena scan/rebuild trusts a consistent, quiescent arena
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** Only if `coalesce` is made `unsafe` (an API break); the window-fusing alternative and the `recover` / tiling / stride fixes are internal, with no on-disk format change.
+**Impact:** HIGH
+
+### Motivation
+
+`recover` and `coalesce` scan the whole arena and rebuild the free lists. Both assume a consistent tiling and a quiescent allocator. The multi-call `alloc` and `realloc` sequences and the classed-reuse path break those assumptions.
+
+**Double or overlapping allocation** (HIGH, concurrency). `coalesce` is a safe `pub fn` on a `Sync` type and documents itself as concurrency-safe. It rebuilds every free list from the on-disk overhead words and republishes the head table, so it requires a consistent snapshot of the arena. `alloc` breaks that snapshot across two lock acquisitions. `pop_class` advances the free-list head in one gen and leaves the popped block's overhead free-tagged on disk. A separate `set` later flips the block in-use. A `coalesce` that runs between the two reads the block as free and relinks it. The claim then marks it in-use. The block is now both live and on a free list, so a later `alloc` hands it out a second time. A `coalesce` that instead merges the block into a run starting at an earlier free neighbour records one free block spanning the live block. That produces overlapping allocations.
+
+**Silent user-data corruption** (HIGH, concurrency). The `realloc` move widens this window. `alloc_raw(new_len, .., in_use=false)` stages the destination block free-tagged and already holding the copied user data, and `commit_move` flips it in-use afterward. A concurrent `coalesce` reads the staged block as free, and its `record_run` writes an `[overhead | next_free]` pair over the block's first 16 bytes. The `next_free` half lands on the first 8 payload bytes and survives `commit_move`, so the moved data is corrupt.
+
+**Silent loss of durable allocations** (HIGH). `recover` reads the first zero overhead word as a crashed tail-extend and discards `[p, EOF)` on the strength of that one word. A zero gap earlier in the arena therefore takes every live allocation beyond it. Such a gap arises with no crash from the tiling failure below. It also arises from a torn `grow_tail_inplace`, where `try_extend_zeros` commits the zeroed growth and a separate `set` records the new size. A failure of that `set` followed by continued use lets the next `alloc` extend past the zeros and leave a live block beyond the gap.
+
+**Broken arena tiling** (MEDIUM). `recover` and `coalesce` relink a non-class-size free block, such as a coalesce-merged run, onto the largest class whose size is at most the block's. The classed `alloc` path then claims and records only the class size, which leaves the block's extra bytes as an unaccounted gap of stale data. The next scan reads that gap as an overhead word and misparses it, reaching one of three ends: a zero word triggers the discard-to-EOF above, a plausible free word produces a relink that overlaps a live block, and any other word aborts the scan and leaks the arena tail.
+
+**Metadata corruption and open-time denial of service** (MEDIUM, crafted file). `recover`'s stride check is `p + size > stack_len`, where `size = word << 4` comes from disk. A release build wraps the addition, so the check passes and `p` wraps below `ARENA_START`, and the free-branch `set` then writes into the header. A debug build panics inside the automatic `recover` in `new()`, so a crafted file blocks the open.
+
+### Design
+
+Three of the four fixes are settled.
+
+**`recover` zero-word discard.** Walk `[p, EOF)` and require every overhead word to be zero before the discard. On the first non-zero word, resynchronise from that block and parse it as the next block.
+
+**Classed reuse.** On a classed `alloc` hit, read the popped block's recorded size. When it exceeds the class size, carve the remainder into its own class-sized free block. The oversized path already performs this read-and-carve. The arena then stays fully tiled.
+
+**`recover` stride.** Replace `p + size > stack_len` with `size > stack_len - p`. `coalesce` (:577, :586) and `stats_scan` (:1400) already use that form.
+
+The `coalesce` concurrency fix remains open.
+
+### Open questions
+
+**Quiescence mechanism for `coalesce`.** `coalesce` rebuilds every free list from a whole-arena snapshot, so it requires the arena to be quiescent for the full scan. A concurrent `alloc` or `realloc` breaks that by leaving a detached free-tagged block or a free-tagged staged move block on disk.
+
+(a) Mark `coalesce` `unsafe` and require the caller to guarantee quiescence, as `recover` does.
+
+(b) Hold an `AtomicBool` for the duration of `coalesce`. A concurrent `alloc` or `realloc` reads it and returns `io::ErrorKind::ResourceBusy` while it is set.
+
+(c) Fuse the `pop_class`-then-claim and `alloc_raw`-then-`commit_move` sequences each into a single gen, so the arena always presents fully claimed or fully free blocks.
+
+Shape (c) also protects a future concurrent `recover` and is the most invasive. Shapes (a) and (b) mirror the checked_slab `recover` decision and settle with it.
+
+---
+
+## `CheckedSlabBStackAllocator` safe `recover()` treats in-flight states as leaks
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** Only if `recover` is made `unsafe` (an API break); the `AtomicBool` + `ResourceBusy` alternative is internal, with no on-disk format change.
+**Impact:** HIGH
+
+### Motivation
+
+`recover` is a safe `pub fn`. Its documentation permits overlap with a concurrent `alloc` or `dealloc` and grounds correctness on one claim: a reclaimed block is reachable by neither the free list nor a live handle, so its state holds between the scan and the splice.
+
+The multi-call windows break that claim. Each leaves a block that is zero-tagged and absent from the free list. That is the exact shape `recover` treats as a reclaimable leak, yet the mutator's next call changes it. Three windows exist.
+
+In `alloc`, the pop gen runs before the claim `set`. A `recover` between them splices the detached block back onto the free list. The claim then marks it in-use. The block is now live and free-listed, so a later `alloc` doubles it.
+
+Also in `alloc`, the tail `extend` runs before `write_overhead`. A `recover` between them splices the fresh zero blocks as free. The overhead write then forms an in-use block that contains those free-list nodes, so allocations overlap.
+
+In `dealloc`, `write_free_run` runs before the `cross_exchange`. A `recover` between them splices the same blocks that `dealloc` then splices again. That forms a doubly linked list or a cycle.
+
+The internal Mutex serialises `recover` against itself alone. `alloc` and `dealloc` run without it. This is the same class as segregated's `coalesce` race.
+
+### Design
+
+Each splice is one `cross_exchange` and is atomic on its own. The leak-shaped states persist across the whole scan, so the fix must make the entire scan exclusive of any in-flight `alloc` or `dealloc` sequence. Segregated already takes this stance: its `recover` is `unsafe` and requires quiescence. The mechanism is the open question below.
+
+### Open questions
+
+**Quiescence mechanism.**
+
+(a) Mark `recover` `unsafe` and require the caller to guarantee no concurrent `alloc` or `dealloc`, for example by running it right after `open` and before the handle is shared. This carries zero runtime cost and matches segregated.
+
+(b) Hold an `AtomicBool` for the duration of `recover`. `alloc` and `dealloc` read it on entry and return `io::ErrorKind::ResourceBusy` while it is set. This keeps `recover` safe at the cost of one atomic load per operation and a transient error the caller retries.
+
+Both shapes avoid a shared lock across `alloc` and `dealloc`. Shape (b) raises two follow-ups: whether it also guards the non-`atomic` `recover`, and whether `alloc` and `dealloc` surface `ResourceBusy` or retry internally. Settle with segregated's `coalesce`.
+
+---
+
+## `GhostTreeBstackAllocator` has no in-process poison guard after a torn tree mutation
+
+**Feature flag:** `alloc` + `set`
+**Breaking change:** No
+**Impact:** HIGH
+
+### Motivation
+
+A tree mutation writes several AVL nodes as a sequence of individually durable ops. The removal up-pass and a `dealloc` insert both do this. A real I/O error partway commits the earlier writes and drops the rest. The on-disk tree is then structurally torn: a node becomes reachable from two parents.
+
+A reopen repairs the tree, since `coalesce_and_rebalance` dedups it. Between the error and a reopen the allocator keeps serving calls. Two later allocations descend the two paths of a double-parented node and receive **overlapping regions**. Ghost_tree's own comments record this state and warn that one region can reach two allocations.
+
+`FirstFitBStackAllocator` guards this class with an in-memory `poisoned` flag armed by an on-disk CAS and checked at every entry. Ghost_tree keeps serving a torn tree for want of the same guard. The overlap needs only a real I/O error and continued use in the same session, with no crash or concurrency.
+
+### Design
+
+Add an in-memory `poisoned: AtomicBool` that mirrors first_fit's `poisoned` and `guard_not_poisoned`. `alloc`, `dealloc`, and `realloc` each read the flag on entry and return an error while it is set. Any error raised after a tree mutation begins sets the flag. A torn tree then refuses further work until a reopen rebuilds a consistent tree with `coalesce_and_rebalance` and produces a fresh handle. The in-memory flag suffices for the in-process overlap, since a reopen reconciles the on-disk tree.
+
+### Open questions
+
+**On-disk arming.** first_fit arms an on-disk CAS flag alongside the in-memory bool. Ghost_tree's reopen already repairs the tree, so an on-disk arm duplicates that repair. Decide whether the on-disk flag earns its extra write.
+
+**The atomic tail-shrink `lost` half** (lower impact). The atomic branch returns `handle: Some(old_len)` and leaves `lost` clear. A `SpliceShrink` deferred replay rolls the truncation forward, so after a reopen the handle's tail lies out of bounds. The harm needs a real I/O error mid-splice, a crash, and a caller that persisted the extent. Setting `lost = true` may be wrong. The atomic `Atrunc` is one opaque call, and it reports the same error for a fault before arming and a fault after arming. A fault before arming keeps `old_len` valid. A fault after arming moves the durable length to `new_len`. Ghost_tree cannot separate the two, so it cannot know which handle to return. Decide whether ghost_tree fixes this locally or needs a richer error signal from the `Atrunc` and journal primitive.
+
+---
+
 ## Compact `Repeat` staging within a batched commit (0.5.0)
 
 **Feature flag:** `set` + `atomic`.
