@@ -4,8 +4,9 @@
 //! [`SlabBStackAllocator`](super::SlabBStackAllocator) that prefixes every block
 //! with an 8-byte overhead field encoding whether the block is free or in use.
 //! The overhead makes leaked blocks recoverable by a linear scan after a crash
-//! and lets `dealloc` detect double-free at runtime before the free list can be
-//! corrupted.
+//! and lets `dealloc` catch double-free at runtime on a best-effort basis (it
+//! reliably rejects a sequential double-free but is not a concurrency barrier;
+//! and UB is still UB.
 
 #[cfg(feature = "atomic")]
 use super::BStackAllocStats;
@@ -1579,6 +1580,10 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
     /// returned without touching any list. A multi-block allocation at the tail
     /// is reclaimed with a single [`BStack::discard`]; otherwise every block is
     /// prepended to the free list.
+    ///
+    /// The double-free check is **best-effort**: it reliably rejects a
+    /// sequential double-free but is not a concurrency barrier, and UB is still
+    /// UB (two live handles to one block require `unsafe`).
     ///
     /// Passing the null/empty sentinel slice (`start == 0, len == 0`) is a
     /// no-op that returns `Ok(())`.

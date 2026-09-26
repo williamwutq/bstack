@@ -1262,6 +1262,10 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// block). Otherwise an oversized block at the tail is discarded in one call,
     /// and every other block is spliced onto its class head via one crash-atomic
     /// [`BStack::inplace_gen`] operation.
+    ///
+    /// The double-free check is **best-effort**: it reliably rejects a
+    /// sequential double-free but is not a concurrency barrier, and UB is still
+    /// UB (two live handles to one block require `unsafe`).
     fn dealloc<'a>(
         &'a self,
         slice: BStackOwnedSlice<'a, Self>,
