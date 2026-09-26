@@ -135,8 +135,20 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
             .ok_or_else(|| io_error!(InvalidInput, "BStackByteVec: block size overflows u64"))
     }
 
-    fn byte_offset(index: u64) -> u64 {
-        HEADER_LEN + index
+    /// Relative offset of logical byte `index` within the block slice.
+    ///
+    /// Checked so a corrupt header `len` (e.g. `u64::MAX`) cannot wrap
+    /// `HEADER_LEN + index` back into a small in-block offset that would slip
+    /// past the slice bounds check and overwrite the header or a neighbour; an
+    /// overflow is reported as a clean error, per the type's corrupt-header
+    /// policy.
+    fn byte_offset(index: u64) -> io::Result<u64> {
+        HEADER_LEN.checked_add(index).ok_or_else(|| {
+            io_error!(
+                InvalidInput,
+                "BStackByteVec: byte offset overflows u64 (corrupt header)"
+            )
+        })
     }
 
     fn read_header(&self) -> io::Result<(u64, u64)> {
@@ -163,26 +175,25 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     }
 
     fn read_byte_at(&self, index: u64) -> io::Result<u8> {
-        let start = Self::byte_offset(index);
+        let start = Self::byte_offset(index)?;
         let mut byte = [0u8; 1];
         self.slice.read_range_into(start, &mut byte)?;
         Ok(byte[0])
     }
 
     fn write_byte_at(&mut self, index: u64, value: u8) -> io::Result<()> {
-        let start = Self::byte_offset(index);
+        let start = Self::byte_offset(index)?;
         self.slice.write_range(start, [value])
     }
 
     fn write_bytes_at(&mut self, start_index: u64, values: &[u8]) -> io::Result<()> {
-        let start = Self::byte_offset(start_index);
+        let start = Self::byte_offset(start_index)?;
         self.slice.write_range(start, values)
     }
 
     fn zero_byte_at(&mut self, index: u64) -> io::Result<()> {
-        self.slice
-            .as_slice_mut()
-            .zero_range(Self::byte_offset(index), 1)
+        let start = Self::byte_offset(index)?;
+        self.slice.as_slice_mut().zero_range(start, 1)
     }
 
     /// Absolute payload offset of logical byte `index` within the backing
@@ -420,7 +431,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         if new_len >= len {
             return Ok(());
         }
-        let start = Self::byte_offset(new_len);
+        let start = Self::byte_offset(new_len)?;
         let removed = len - new_len;
         self.write_len_field(new_len)?;
         self.slice.zero_range(start, removed)
@@ -524,8 +535,24 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         if len == 0 {
             return Ok(());
         }
-        let offset = self.abs_offset(0);
-        self.slice.allocator().stack().repeat(offset, [value], len)
+        // Route the fill through the block-bounded slice view rather than a raw
+        // `stack.repeat` on absolute offsets: a corrupt `len` larger than the
+        // block can hold is then rejected cleanly (per the corrupt-header
+        // policy) instead of repeating `value` across neighbouring allocations.
+        let end = HEADER_LEN.checked_add(len).ok_or_else(|| {
+            io_error!(
+                InvalidInput,
+                "BStackByteVec::fill: len overflows block offset (corrupt header)"
+            )
+        })?;
+        if end > self.slice.len() {
+            return Err(io_error!(
+                InvalidInput,
+                "BStackByteVec::fill: len exceeds block capacity (corrupt header)"
+            ));
+        }
+        let mut view = self.slice.as_slice().subslice(HEADER_LEN, end);
+        view.fill(value)
     }
 
     /// Set the length to `new_len`, filling any new slots with `value`.
@@ -1001,10 +1028,10 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
         if count == 0 {
             return Ok(Some(Vec::new()));
         }
-        let removed = self
-            .slice
-            .as_slice()
-            .read_range(Self::byte_offset(range.start), Self::byte_offset(range.end))?;
+        let removed = self.slice.as_slice().read_range(
+            Self::byte_offset(range.start)?,
+            Self::byte_offset(range.end)?,
+        )?;
         let tail = len - range.end;
         if tail > 0 {
             let alloc: &'a A = self.slice.allocator();
@@ -1160,6 +1187,41 @@ mod tests {
             assert_eq!(v.get(i as u64).unwrap(), Some(expected));
         }
         assert_eq!(v.get(5).unwrap(), None);
+    }
+
+    // A corrupt header `len` must be rejected cleanly, not wrap `HEADER_LEN +
+    // len` into a small in-block offset that overwrites the header itself.
+    #[test]
+    fn push_on_corrupt_len_errors_without_wrapping() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        v.write_len_field(u64::MAX).unwrap(); // simulate on-disk corruption
+        let err = v.push(9).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // `fill` must not repeat `value` across neighbouring allocations when the
+    // header `len` is corrupt — an overflowing `len` and an in-range but
+    // oversized `len` both error.
+    #[test]
+    fn fill_on_corrupt_len_overflow_errors() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        v.write_len_field(u64::MAX).unwrap();
+        let err = v.fill(7).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn fill_on_len_exceeding_block_errors() {
+        let (alloc, path) = make_alloc();
+        let _g = Guard(path);
+        let mut v = BStackByteVec::from_slice(&[1, 2, 3], &alloc).unwrap();
+        v.write_len_field(1000).unwrap(); // fits u64, far exceeds the 3-byte block
+        let err = v.fill(7).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

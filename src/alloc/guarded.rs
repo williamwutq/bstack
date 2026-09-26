@@ -484,7 +484,24 @@ where
         let mut slice = unsafe { self.raw_block() };
         let data = data.as_ref();
         let cooked = self.encode(data)?;
-        slice.write(cooked.as_ref())?;
+        let cooked = cooked.as_ref();
+        // `write` overwrites the *whole* raw block, so `encode` must fill it
+        // exactly. Reject a length mismatch instead of letting the underlying
+        // `BStackSlice::write` silently truncate an over-long encoding (dropping
+        // e.g. an AEAD tail) or leave a stale raw tail from a short one, which
+        // would later decode as a corrupt new-prefix/old-tail mix. Mirrors the
+        // check `atomic_process` (write_range/process/…) already performs.
+        if cooked.len() as u64 != slice.len() {
+            return Err(io_error!(
+                InvalidInput,
+                "guard `encode` returned {} bytes for a {}-byte block; `write` overwrites the \
+                 whole block and requires `encode` to fill it exactly. This typically indicates \
+                 a programming error in the guard's `encode` implementation.",
+                cooked.len(),
+                slice.len()
+            ));
+        }
+        slice.write(cooked)?;
         self.on_write(0, data.len() as u64)
     }
 
@@ -981,6 +998,34 @@ mod tests {
         }
     }
 
+    /// A guard whose `encode` changes the length: `grow` appends a trailing
+    /// byte (like an AEAD tag), otherwise it drops the last byte. Used to check
+    /// that `write` rejects an encoding that does not exactly fill the raw block
+    /// instead of silently truncating it or leaving a stale tail.
+    #[cfg(feature = "set")]
+    struct Reshape<'a> {
+        slice: BStackSlice<'a>,
+        grow: bool,
+    }
+    #[cfg(feature = "set")]
+    impl<'a> BStackGuardedSlice<'a, A> for Reshape<'a> {
+        fn len(&self) -> u64 {
+            self.slice.len()
+        }
+        unsafe fn raw_block(&self) -> BStackSlice<'a> {
+            self.slice.clone()
+        }
+        fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
+            let mut out = data.to_vec();
+            if self.grow {
+                out.push(0xAA);
+            } else {
+                out.pop();
+            }
+            Ok(Cow::Owned(out))
+        }
+    }
+
     // ---- reads, accessors, scans (feature `guarded`) ----
 
     #[test]
@@ -1248,6 +1293,38 @@ mod tests {
         let raw = region(&stack, 0, 8).read().unwrap();
         let expect: Vec<u8> = b"12345678".iter().map(|b| b ^ key).collect();
         assert_eq!(raw, expect);
+    }
+
+    /// `write` must reject an `encode` output that is longer than the raw block
+    /// (e.g. an AEAD tag) rather than silently dropping the tail, and one that
+    /// is shorter rather than leaving a stale raw tail. The block is left
+    /// unchanged in both cases.
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_rejects_length_changing_encode() {
+        let (stack, _c) = mk_stack();
+        stack.push(b"abcd").unwrap();
+
+        let grow = Reshape {
+            slice: region(&stack, 0, 4),
+            grow: true,
+        };
+        assert_eq!(
+            grow.write(b"abcd").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let shrink = Reshape {
+            slice: region(&stack, 0, 4),
+            grow: false,
+        };
+        assert_eq!(
+            shrink.write(b"abcd").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // Neither attempt mutated the raw block.
+        assert_eq!(region(&stack, 0, 4).read().unwrap(), b"abcd");
     }
 
     /// A guard overriding only the **deprecated** hooks keeps working, and the
