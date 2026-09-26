@@ -202,6 +202,7 @@ impl<'a, A: BStackOwnedSliceAllocator> BStackByteVec<'a, A> {
     ///
     /// Equal to the block's start plus the 16-byte header plus `index`.  Must be
     /// recomputed after any reallocation, since the block's start may move.
+    #[cfg(feature = "atomic")]
     fn abs_offset(&self, index: u64) -> u64 {
         self.slice
             .start()
