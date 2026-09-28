@@ -1327,7 +1327,7 @@ int slab_bstack_allocator_stats(
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
  *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
- *              magic = "ALCK\x00\x01\x03\x00"
+ *              magic = "ALCK\x00\x01\x04\x00"
  *   [48..)   — block arena
  *
  * Each block in the arena:
