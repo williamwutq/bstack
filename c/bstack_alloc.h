@@ -3,6 +3,9 @@
 
 #include "bstack.h"
 #include <errno.h>
+#ifdef BSTACK_FEATURE_ATOMIC
+#include <stdatomic.h>
+#endif
 
 /*
  * bstack_alloc — region-management layer on top of bstack.
@@ -1067,12 +1070,9 @@ int slab_bstack_allocator_stats(
  * leave open), free-list push splices a block or a whole freed run with one
  * bstack_cross_exchange, and tail grow/shrink use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
- * The handle still owns an in-memory mutex (lock), held only by recover to keep
- * it single-flight: the recover scan and its one optional tail discard run as a
- * single bstack_process_gen sequence (so the bstack write lock, not the mutex,
- * serialises the scan against alloc/dealloc), while the mutex only prevents two
- * concurrent recover runs from each reclaiming the same leaked block.  Ordinary
- * alloc/dealloc/realloc never take it.
+ * recover is exclusive: while it runs, every mutator fails with errno = EBUSY,
+ * leaving its slices intact for a retry.  An in-memory mutex (lock) keeps
+ * recover single-flight; ordinary operations never take it.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
@@ -1085,6 +1085,13 @@ typedef struct {
     /* Opaque platform mutex; held only by recover() to keep it single-flight
      * (alloc/dealloc/realloc are lock-free).  Shared across threads. */
     void              *lock;
+    /* Set while recover() runs; mutators fail with EBUSY.  Required: the scan
+     * misreads an in-flight op's intermediate state as a leak and relinks it
+     * (double allocation). */
+    atomic_bool        recovering;
+    /* Mutators in flight; recover() waits for it to drain.  The flag alone
+     * misses an op that checked it just before recover() set it. */
+    atomic_size_t      in_flight;
 #endif
 } checked_slab_bstack_allocator_t;
 
@@ -1125,6 +1132,9 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(
  * past suspicious regions, and discards any orphaned tail left by a failed
  * realloc truncation.  Writes *out_unsure (if non-NULL) with the count of
  * blocks that could not be classified with certainty (0 = fully recovered).
+ *
+ * Under -DBSTACK_FEATURE_ATOMIC, waits for in-flight mutators to finish and
+ * makes any mutator entered meanwhile fail with errno = EBUSY.
  *
  * Returns 0 on success, -1 on I/O error (errno set).
  * checked_slab_bstack_allocator_open calls this automatically.

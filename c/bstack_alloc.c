@@ -28,10 +28,13 @@
 #ifdef BSTACK_FEATURE_ATOMIC
 #  ifdef _WIN32
 #    include <windows.h>
+#    define THREAD_YIELD()  ((void)SwitchToThread())
 #    define MUTEX_LOCK(a)   EnterCriticalSection((CRITICAL_SECTION *)(a)->lock)
 #    define MUTEX_UNLOCK(a) LeaveCriticalSection((CRITICAL_SECTION *)(a)->lock)
 #  else
 #    include <pthread.h>
+#    include <sched.h>
+#    define THREAD_YIELD()  ((void)sched_yield())
 #    define MUTEX_LOCK(a)   ((void)pthread_mutex_lock((pthread_mutex_t *)(a)->lock))
 #    define MUTEX_UNLOCK(a) ((void)pthread_mutex_unlock((pthread_mutex_t *)(a)->lock))
 #  endif
@@ -5417,13 +5420,19 @@ int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc
      * instead prevents two recover runs from overlapping (which would let both
      * reclaim the same leaked block and double-link it). */
     MUTEX_LOCK(alloc);
+    /* Exclude alloc/dealloc for the whole call, not just the scan: the reclaim
+     * relies on leaked blocks staying untouched until spliced.  seq_cst pairs
+     * with alck_enter_op (store flag, then load count). */
+    atomic_store(&alloc->recovering, 1);
+    while (atomic_load(&alloc->in_flight) != 0)
+        THREAD_YIELD();
 
     /* Cheap early-out hint; the authoritative size is read under the
      * process_gen lock below via BSTACK_GEN_LEN. */
-    if (bstack_len(bs, &stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    if (bstack_len(bs, &stack_len) != 0) { ret = -1; goto unlock; }
     if (stack_len <= ALCK_ARENA_START) {
         if (out_unsure) *out_unsure = 0;
-        MUTEX_UNLOCK(alloc); return 0;
+        goto unlock;
     }
 
     memset(&c, 0, sizeof c);
@@ -5434,9 +5443,8 @@ int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc
         ret = -1; goto done;
     }
 
-    /* Phase 2: splice reclaimed leaks onto the free list, lock-free.  Each is
-     * unreachable by alloc/dealloc, so its leaked state is stable across the
-     * unlocked gap, and alck_push_free_blocks splices atomically. */
+    /* Phase 2: splice reclaimed leaks onto the free list; each splice is an
+     * atomic cross_exchange. */
     for (i = 0; i < c.reclaim_cnt; i++) {
         if (alck_push_free_blocks(bs, c.reclaim[i], 1, alloc->block_size) != 0) {
             ret = -1; goto done;
@@ -5448,6 +5456,8 @@ done:
     free(c.free_arr);
     free(c.reclaim);
     free(c.reach);
+unlock:
+    atomic_store(&alloc->recovering, 0);
     MUTEX_UNLOCK(alloc);
     return ret;
 }
@@ -5584,13 +5594,40 @@ done:
 
 /* ---- vtable implementations -------------------------------------------- */
 
+/* Register a public mutator, or fail with EBUSY while recover runs.  Increment
+ * before checking (seq_cst): recover then either sees the count or we see its
+ * flag.  Non-atomic handles are single-threaded, so these are no-ops there. */
+static inline int alck_enter_op(checked_slab_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_add(&a->in_flight, 1);
+    if (atomic_load(&a->recovering)) {
+        atomic_fetch_sub(&a->in_flight, 1);
+        errno = EBUSY;
+        return -1;
+    }
+#else
+    (void)a;
+#endif
+    return 0;
+}
+
+static inline void alck_leave_op(checked_slab_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_sub(&a->in_flight, 1);
+#else
+    (void)a;
+#endif
+}
+
 static bstack_t *alck_vt_stack(bstack_allocator_t *base)
 {
     return ((checked_slab_bstack_allocator_t *)base)->bs;
 }
 
-static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
-                          bstack_slice_t *out)
+static int alck_alloc_impl(bstack_allocator_t *base, uint64_t len,
+                           bstack_slice_t *out)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t num_blocks;
@@ -5646,7 +5683,7 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
     }
 }
 
-static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+static int alck_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t block_start, overhead, num_blocks, backing, slice_end;
@@ -5699,7 +5736,7 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size);
 }
 
-static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+static int alck_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
                              uint64_t new_len, bstack_slice_t *out)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
@@ -5709,10 +5746,10 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     if (check_own_slice(base, s) != 0)
         return -1;
     if (s.len == 0 && s.offset == 0)
-        return alck_vt_alloc(base, new_len, out);
+        return alck_alloc_impl(base, new_len, out);
 
     if (new_len == 0) {
-        if (alck_vt_dealloc(base, s) != 0) return -1;
+        if (alck_dealloc_impl(base, s) != 0) return -1;
         out->allocator = base; out->offset = 0; out->len = 0;
         return 0;
     }
@@ -5811,7 +5848,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                 uint8_t       *tmp;
                 uint64_t       copy_len;
 
-                if (alck_vt_alloc(base, new_len, &new_s) != 0) return -1;
+                if (alck_alloc_impl(base, new_len, &new_s) != 0) return -1;
 
                 copy_len = s.len < new_len ? s.len : new_len;
                 if (copy_len > 0) {
@@ -5828,7 +5865,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                     free(tmp);
                 }
 
-                if (alck_vt_dealloc(base, s) != 0) return -1;
+                if (alck_dealloc_impl(base, s) != 0) return -1;
                 *out = new_s;
                 return 0;
             }
@@ -5922,6 +5959,43 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     }
 }
 
+/* Public entries: each takes one alck_enter_op/alck_leave_op pair; internal
+ * paths call the _impl bodies directly (a nested enter could fail mid-op). */
+
+static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                          bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_alloc_impl(base, len, out);
+    alck_leave_op(a);
+    return r;
+}
+
+static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) return -1;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_dealloc_impl(base, s);
+    alck_leave_op(a);
+    return r;
+}
+
+static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                             uint64_t new_len, bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) return -1;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_realloc_impl(base, s, new_len, out);
+    alck_leave_op(a);
+    return r;
+}
+
 static const bstack_allocator_vtbl_t alck_allocator_vtbl = {
     alck_vt_stack,
     alck_vt_alloc,
@@ -5955,6 +6029,8 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+    atomic_init(&a->recovering, 0);
+    atomic_init(&a->in_flight, 0);
 #endif
 
     memset(hdr, 0, sizeof hdr);
@@ -6028,6 +6104,8 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+    atomic_init(&a->recovering, 0);
+    atomic_init(&a->in_flight, 0);
 #endif
 
     a->base.vtbl      = &alck_allocator_vtbl;

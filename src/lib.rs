@@ -423,7 +423,9 @@
 //!   an empty stack and [`CheckedSlabBStackAllocator::open`] to reopen one
 //!   ([`open`](CheckedSlabBStackAllocator::open) runs
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
-//!   Requires both `alloc` and `set` features.
+//!   Requires both `alloc` and `set` features; with `atomic`, mutators called
+//!   while `recover` runs fail with
+//!   [`ResourceBusy`](std::io::ErrorKind::ResourceBusy).
 //!
 //! * [`DebugCheckingAllocator`] — Debug/test wrapper around any
 //!   [`BStackAllocator`].  Tracks allocated and freed regions in memory and

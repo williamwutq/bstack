@@ -1308,6 +1308,133 @@ static int test_concurrent_realloc_tail_paths(void)
     csl_unlink(tmp); return 0;
 }
 
+/* --- recover excludes mutators --------------------------------------- */
+
+static int test_mutators_refuse_while_recovering(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 8);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, out;
+    uint64_t unsure = 1;
+    CHECK(bstack_allocator_alloc(al, 8, &s) == 0);
+
+    atomic_store(&a->recovering, 1);
+    errno = 0;
+    CHECK(bstack_allocator_alloc(al, 8, &out) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_realloc(al, s, 32, &out) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_dealloc(al, s) == -1 && errno == EBUSY);
+    atomic_store(&a->recovering, 0);
+
+    CHECK(atomic_load(&a->in_flight) == 0);
+    CHECK(bstack_allocator_dealloc(al, s) == 0);
+    CHECK(checked_slab_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
+#define CSL_RECOVER_THREADS 4
+#define CSL_RECOVER_ITERS   200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid;
+    int                 ok;
+    pthread_mutex_t    *live_lock;
+    uint64_t           *live; /* one live offset per thread, 0 = none */
+    volatile int       *done;
+} csl_recover_arg_t;
+
+static void *csl_recover_churn_body(csl_recover_arg_t *w);
+
+static void *csl_recover_churn_worker(void *raw)
+{
+    csl_recover_arg_t *w = raw;
+    csl_recover_churn_body(w);
+    __atomic_fetch_add((int *)w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static void *csl_recover_churn_body(csl_recover_arg_t *w)
+{
+    uint8_t wbuf[8], rbuf[8];
+    memset(wbuf, (uint8_t)w->tid, 8);
+    w->ok = 1;
+
+    for (int i = 0; i < CSL_RECOVER_ITERS; i++) {
+        bstack_slice_t s;
+        int r;
+        while ((r = bstack_allocator_alloc(w->a, 8, &s)) != 0 && errno == EBUSY) {}
+        if (r != 0) { w->ok = 0; return NULL; }
+
+        pthread_mutex_lock(w->live_lock);
+        for (int t = 0; t < CSL_RECOVER_THREADS; t++)
+            if (w->live[t] == s.offset) w->ok = 0; /* handed out twice */
+        w->live[w->tid] = s.offset;
+        pthread_mutex_unlock(w->live_lock);
+        if (!w->ok) return NULL;
+
+        if (bstack_slice_write(s, wbuf, 8) != 0 ||
+            bstack_slice_read(s, rbuf)     != 0 ||
+            memcmp(wbuf, rbuf, 8)          != 0) {
+            w->ok = 0; return NULL;
+        }
+
+        pthread_mutex_lock(w->live_lock);
+        w->live[w->tid] = 0;
+        pthread_mutex_unlock(w->live_lock);
+
+        while ((r = bstack_allocator_dealloc(w->a, s)) != 0 && errno == EBUSY) {}
+        if (r != 0) { w->ok = 0; return NULL; }
+    }
+    return NULL;
+}
+
+static int test_concurrent_recover_never_doubles_blocks(void)
+{
+    /* recover racing alloc/dealloc used to relink in-flight blocks as leaks,
+     * handing one block to two callers. */
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a =
+        checked_slab_bstack_allocator_new(bs, 8);
+    CHECK(a);
+
+    pthread_mutex_t   live_lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t          live[CSL_RECOVER_THREADS] = {0};
+    volatile int      done = 0;
+    pthread_t         threads[CSL_RECOVER_THREADS];
+    csl_recover_arg_t args[CSL_RECOVER_THREADS];
+    for (int i = 0; i < CSL_RECOVER_THREADS; i++) {
+        args[i].a = (bstack_allocator_t *)a; args[i].tid = i; args[i].ok = 1;
+        args[i].live_lock = &live_lock; args[i].live = live; args[i].done = &done;
+        pthread_create(&threads[i], NULL, csl_recover_churn_worker, &args[i]);
+    }
+
+    /* Recover in a loop until every worker has finished. */
+    int recover_ok = 1;
+    while (__atomic_load_n((int *)&done, __ATOMIC_ACQUIRE) < CSL_RECOVER_THREADS)
+        if (checked_slab_bstack_allocator_recover(a, NULL) != 0) recover_ok = 0;
+    for (int i = 0; i < CSL_RECOVER_THREADS; i++) pthread_join(threads[i], NULL);
+    CHECK(recover_ok);
+    for (int i = 0; i < CSL_RECOVER_THREADS; i++) CHECK(args[i].ok);
+
+    uint64_t unsure = 1;
+    CHECK(checked_slab_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1368,6 +1495,8 @@ int main(void)
     /* ── concurrent ──────────────────────────────────────────────────── */
     T(test_concurrent_alloc_dealloc_data_integrity);
     T(test_concurrent_realloc_tail_paths);
+    T(test_mutators_refuse_while_recovering);
+    T(test_concurrent_recover_never_doubles_blocks);
 #endif
 
     printf("\n%d / %d passed\n", g_passed, g_total);

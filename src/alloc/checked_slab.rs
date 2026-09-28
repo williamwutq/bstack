@@ -19,6 +19,8 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 #[cfg(feature = "atomic")]
 use std::sync::Mutex;
+#[cfg(feature = "atomic")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::HashSet, fmt, io};
 
 #[cfg(feature = "set")]
@@ -114,13 +116,9 @@ const ALCK_MAGIC_PREFIX: [u8; 6] = *b"ALCK\x00\x01";
 /// [`BStack::try_extend_zeros`] / [`BStack::try_discard`] to perform
 /// check-and-act atomically under `BStack`'s write lock, also without a lock.
 ///
-/// An internal [`Mutex`] is retained solely to make [`recover`](Self::recover)
-/// (and the automatic `recover` call in [`open`](Self::open)) single-flight:
-/// the recovery *scan* itself is serialised against alloc/dealloc by the
-/// [`BStack`] write lock it holds across one [`BStack::process_gen`] sequence,
-/// while the `Mutex` only prevents two concurrent `recover` runs from each
-/// reclaiming the same leaked block. It plays no part in ordinary
-/// alloc/dealloc/realloc.
+/// [`recover`](Self::recover) is exclusive: while it runs, every mutator
+/// fails with [`io::ErrorKind::ResourceBusy`] (see its docs). An internal
+/// [`Mutex`] makes `recover` single-flight; ordinary operations never take it.
 ///
 /// ```
 /// fn assert_send<T: Send>() {}
@@ -177,8 +175,44 @@ pub struct CheckedSlabBStackAllocator {
     /// Ordinary alloc/dealloc/realloc never take it — they stay lock-free.
     #[cfg(feature = "atomic")]
     lock: Mutex<()>,
+    /// Set while [`recover`](Self::recover) runs; mutators refuse with
+    /// `ResourceBusy`. Required: the scan misreads an in-flight op's
+    /// intermediate state as a leak and relinks it (double allocation).
+    #[cfg(feature = "atomic")]
+    recovering: AtomicBool,
+    /// Mutators in flight; `recover` waits for it to drain. The flag alone
+    /// misses an op that checked it just before `recover` set it.
+    #[cfg(feature = "atomic")]
+    in_flight: AtomicUsize,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
+}
+
+/// Holds one [`in_flight`](CheckedSlabBStackAllocator::in_flight) count.
+#[cfg(feature = "atomic")]
+struct OpGuard<'a>(&'a AtomicUsize);
+
+#[cfg(feature = "atomic")]
+impl Drop for OpGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(feature = "atomic"))]
+struct OpGuard<'a>(PhantomData<&'a ()>);
+
+/// Clears [`recovering`](CheckedSlabBStackAllocator::recovering) on every exit.
+#[cfg(feature = "atomic")]
+struct RecoverGuard<'a>(&'a AtomicBool);
+
+#[cfg(feature = "atomic")]
+impl Drop for RecoverGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
@@ -296,6 +330,10 @@ impl CheckedSlabBStackAllocator {
             block_size,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
+            #[cfg(feature = "atomic")]
+            recovering: AtomicBool::new(false),
+            #[cfg(feature = "atomic")]
+            in_flight: AtomicUsize::new(0),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         })
@@ -394,6 +432,10 @@ impl CheckedSlabBStackAllocator {
             block_size: stored_block_size,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
+            #[cfg(feature = "atomic")]
+            recovering: AtomicBool::new(false),
+            #[cfg(feature = "atomic")]
+            in_flight: AtomicUsize::new(0),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
@@ -446,21 +488,17 @@ impl CheckedSlabBStackAllocator {
     ///
     /// After the locked scan, each reclaimed block is prepended to the free
     /// list individually with `push_free_blocks` — the list is never
-    /// rebuilt. This runs **outside** the scan lock and may overlap a
-    /// concurrent `alloc`/`dealloc`: a reclaimed block is a *leak*, reachable by
-    /// neither (no live slice points at it and it is absent from the free list),
-    /// so its state cannot change between the scan and the splice, and each
-    /// splice is itself an atomic [`BStack::cross_exchange`]. A crash mid-reclaim
-    /// simply leaves the remaining leaks to be re-found on the next run.
+    /// rebuilt. Each splice is an atomic [`BStack::cross_exchange`]. A crash
+    /// mid-reclaim simply leaves the remaining leaks to be re-found on the next
+    /// run.
     ///
     /// # Concurrency
     ///
-    /// The allocator-level [`Mutex`] is held for the whole call. It no longer
-    /// guards individual free-list reads — Phase 1 does that with the `BStack`
-    /// write lock — but it serialises `recover` against **itself**: two
-    /// overlapping runs could each observe the same block as leaked and splice
-    /// it into the free list twice, corrupting the list. The lock makes recovery
-    /// single-flight; ordinary `alloc`/`dealloc` never take it.
+    /// An in-flight `alloc`/`dealloc`/`realloc` passes through states that look
+    /// exactly like leaks, so `recover` excludes them for the whole call: it
+    /// waits for in-flight mutators to finish, and any mutator entered meanwhile
+    /// fails with [`io::ErrorKind::ResourceBusy`] and may be retried. The
+    /// allocator-level [`Mutex`] makes `recover` single-flight against itself.
     ///
     /// # Safety of destructive steps
     ///
@@ -481,6 +519,14 @@ impl CheckedSlabBStackAllocator {
         // lock instead prevents two `recover` runs from overlapping, which would
         // let both reclaim the same leaked block and double-link it.
         let _guard = self.lock.lock().unwrap();
+        // Exclude alloc/dealloc for the whole call, not just the scan: the
+        // reclaim relies on leaked blocks staying untouched until spliced.
+        // SeqCst pairs with `enter_op` (store flag, then load count).
+        self.recovering.store(true, Ordering::SeqCst);
+        let _recovering = RecoverGuard(&self.recovering);
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
 
         // Cheap early-out for an empty allocator. Only a hint: the authoritative
         // payload size is taken under the `process_gen` lock below via `Len`.
@@ -1343,45 +1389,36 @@ impl CheckedSlabBStackAllocator {
 }
 
 #[cfg(feature = "set")]
-impl fmt::Debug for CheckedSlabBStackAllocator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CheckedSlabBStackAllocator")
-            .field("data_size", &self.data_size())
-            .finish_non_exhaustive()
-    }
-}
-
 #[cfg(feature = "set")]
-impl BStackAllocator for CheckedSlabBStackAllocator {
-    type Error = io::Error;
-    type Allocated<'a> = BStackSlice<'a, Self>;
-
+impl CheckedSlabBStackAllocator {
+    /// Register a public mutator for the rest of its scope, or fail with
+    /// [`io::ErrorKind::ResourceBusy`] while [`recover`](Self::recover) runs.
+    /// Internal paths must not call it (a nested call could fail mid-op).
+    #[cfg(feature = "atomic")]
     #[inline]
-    fn stack(&self) -> &BStack {
-        &self.stack
+    fn enter_op(&self) -> io::Result<OpGuard<'_>> {
+        // Increment before checking (SeqCst): `recover` then either sees the
+        // count or we see its flag.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = OpGuard(&self.in_flight);
+        if self.recovering.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "recover is in progress; retry",
+            ));
+        }
+        Ok(guard)
     }
 
+    /// Non-`atomic` builds are `!Sync`, so `recover` cannot overlap a mutator.
+    #[cfg(not(feature = "atomic"))]
     #[inline]
-    fn into_stack(self) -> BStack {
-        self.stack
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn enter_op(&self) -> io::Result<OpGuard<'_>> {
+        Ok(OpGuard(PhantomData))
     }
 
-    /// Allocate `len` bytes.
-    ///
-    /// The returned slice covers the `data` region only; the 8-byte overhead
-    /// prefix is written transparently. `len == 0` yields the empty sentinel
-    /// slice. Single-block requests reuse a free-list block when available and
-    /// otherwise extend the tail; multi-block requests always extend the tail.
-    ///
-    /// # Crash consistency
-    ///
-    /// | Path | Calls | Safety |
-    /// |------|-------|--------|
-    /// | `len == 0` | 0 | trivially safe |
-    /// | free-list hit | 2 (`set` + `set`) | crash may leak popped block |
-    /// | tail extend, single block | 2 (`extend` + `set`) | crash may leak extended block |
-    /// | tail extend, multi-block | 2 (`extend` + `set`) | crash may leak extended blocks |
-    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+    fn alloc_impl(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
         if len == 0 {
             return Ok(BStackSlice::empty(self));
         }
@@ -1425,42 +1462,7 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         Ok(unsafe { BStackSlice::from_raw_parts(self, block_start + Self::OVERHEAD, len) })
     }
 
-    /// Release the region described by `slice`.
-    ///
-    /// Reads the overhead at the block start (`slice.start() − 8`). If the
-    /// high bit is clear the block is already free and a double-free error is
-    /// returned without touching any list. A multi-block allocation at the tail
-    /// is reclaimed with a single [`BStack::discard`]; otherwise every block is
-    /// prepended to the free list.
-    ///
-    /// Passing the null/empty sentinel slice (`start == 0, len == 0`) is a
-    /// no-op that returns `Ok(())`.
-    ///
-    /// # Slice origin requirement
-    ///
-    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
-    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
-    /// instance. Passing an arbitrary sub-slice or a manually constructed
-    /// [`BStackSlice`] may corrupt the allocator's internal state.
-    ///
-    /// # Errors
-    ///
-    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
-    ///   overhead prefix offset, or the block's overhead high bit is clear
-    ///   (double-free detected).
-    /// * [`io::ErrorKind::InvalidData`] — the in-use overhead records a zero
-    ///   block count (metadata corrupt).
-    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
-    ///
-    /// # Crash consistency
-    ///
-    /// | Path | Calls | Safety |
-    /// |------|-------|--------|
-    /// | null slice | 0 | trivially safe |
-    /// | tail (any block count) | 1 (`discard`) | crash-safe by inheritance |
-    /// | free list | 2 (`set` + `set`) | crash leaks freed blocks; double-free guard unaffected |
-    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
-        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::dealloc")?;
+    fn dealloc_impl(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
         if slice.is_empty() && slice.start() == 0 {
             return Ok(());
         }
@@ -1519,58 +1521,16 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         self.push_free_blocks(block_start, num_blocks)
     }
 
-    /// Resize the region described by `slice` to `new_len` bytes.
-    ///
-    /// Returns a (possibly different) slice covering the resized region. If
-    /// `slice` is the null/empty sentinel (`start == 0, len == 0`), delegates
-    /// to [`alloc`](Self::alloc). If `new_len == 0`, deallocates `slice` and
-    /// returns the null sentinel.
-    ///
-    /// # Slice origin requirement
-    ///
-    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
-    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
-    /// instance. Passing an arbitrary sub-slice obtained via
-    /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
-    /// manually constructed [`BStackSlice::new`] is not supported and may
-    /// corrupt the allocator's internal state.
-    ///
-    /// # Resize strategies
-    ///
-    /// | Case | Strategy |
-    /// |------|----------|
-    /// | Same block count | Adjust visible length, zeroing newly-exposed bytes on grow |
-    /// | Slice at tail | Extend or discard the tail and update the overhead count |
-    /// | Shrink, non-tail | Recycle excess blocks into the free list, then shrink the overhead |
-    /// | Grow, non-tail | Allocate a fresh region, copy, release the old |
-    ///
-    /// # Errors
-    ///
-    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
-    ///   overhead prefix offset, or the block's overhead high bit is clear
-    ///   (realloc of a freed or invalid block).
-    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
-    ///
-    /// # Crash consistency
-    ///
-    /// | Case | Calls | Safety |
-    /// |------|-------|--------|
-    /// | same block count | 0–1 (`zero`) | trivially safe |
-    /// | tail shrink | 2 (`set` + `discard`) | crash before `discard` leaves orphaned tail; reclaimed by `recover` |
-    /// | tail grow | 2 (`extend` + `set`) | crash leaks capacity extension; original data intact |
-    /// | shrink non-tail | 3 (`set` + `set` + `set`) | crash leaks excess blocks; no live allocation corrupted |
-    /// | grow non-tail | 4–5 (`alloc` + copy + `dealloc`) | crash leaks old block; new allocation is consistent |
-    fn realloc<'a>(
+    fn realloc_impl<'a>(
         &'a self,
         slice: BStackSlice<'a, Self>,
         new_len: u64,
     ) -> io::Result<BStackSlice<'a, Self>> {
-        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::realloc")?;
         if slice.is_empty() && slice.start() == 0 {
-            return self.alloc(new_len);
+            return self.alloc_impl(new_len);
         }
         if new_len == 0 {
-            self.dealloc(slice)?;
+            self.dealloc_impl(slice)?;
             return Ok(BStackSlice::empty(self));
         }
         if new_len == slice.len() {
@@ -1675,10 +1635,10 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
             // Not at tail (or tail moved under atomic): grow non-tail.
             // alloc and dealloc each handle their own free-list and tail
             // operations independently.
-            let new_slice = self.alloc(new_len)?;
+            let new_slice = self.alloc_impl(new_len)?;
             let data = slice.read()?;
             new_slice.write(&data)?;
-            self.dealloc(slice)?;
+            self.dealloc_impl(slice)?;
             return Ok(new_slice);
         }
 
@@ -1772,6 +1732,141 @@ impl BStackAllocator for CheckedSlabBStackAllocator {
         // 2. In bounds: the first new_n blocks are still live in the stack payload.
         // 3. Alloc origin: slice.start() is unchanged; overhead records new_n.
         Ok(unsafe { BStackSlice::from_raw_parts(self, slice.start(), new_len) })
+    }
+}
+
+impl fmt::Debug for CheckedSlabBStackAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckedSlabBStackAllocator")
+            .field("data_size", &self.data_size())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "set")]
+impl BStackAllocator for CheckedSlabBStackAllocator {
+    type Error = io::Error;
+    type Allocated<'a> = BStackSlice<'a, Self>;
+
+    #[inline]
+    fn stack(&self) -> &BStack {
+        &self.stack
+    }
+
+    #[inline]
+    fn into_stack(self) -> BStack {
+        self.stack
+    }
+
+    /// Allocate `len` bytes.
+    ///
+    /// The returned slice covers the `data` region only; the 8-byte overhead
+    /// prefix is written transparently. `len == 0` yields the empty sentinel
+    /// slice. Single-block requests reuse a free-list block when available and
+    /// otherwise extend the tail; multi-block requests always extend the tail.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | `len == 0` | 0 | trivially safe |
+    /// | free-list hit | 2 (`set` + `set`) | crash may leak popped block |
+    /// | tail extend, single block | 2 (`extend` + `set`) | crash may leak extended block |
+    /// | tail extend, multi-block | 2 (`extend` + `set`) | crash may leak extended blocks |
+    fn alloc(&self, len: u64) -> io::Result<BStackSlice<'_, Self>> {
+        let _op = self.enter_op()?;
+        self.alloc_impl(len)
+    }
+
+    /// Release the region described by `slice`.
+    ///
+    /// Reads the overhead at the block start (`slice.start() − 8`). If the
+    /// high bit is clear the block is already free and a double-free error is
+    /// returned without touching any list. A multi-block allocation at the tail
+    /// is reclaimed with a single [`BStack::discard`]; otherwise every block is
+    /// prepended to the free list.
+    ///
+    /// Passing the null/empty sentinel slice (`start == 0, len == 0`) is a
+    /// no-op that returns `Ok(())`.
+    ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
+    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
+    /// instance. Passing an arbitrary sub-slice or a manually constructed
+    /// [`BStackSlice`] may corrupt the allocator's internal state.
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
+    ///   overhead prefix offset, or the block's overhead high bit is clear
+    ///   (double-free detected).
+    /// * [`io::ErrorKind::InvalidData`] — the in-use overhead records a zero
+    ///   block count (metadata corrupt).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Path | Calls | Safety |
+    /// |------|-------|--------|
+    /// | null slice | 0 | trivially safe |
+    /// | tail (any block count) | 1 (`discard`) | crash-safe by inheritance |
+    /// | free list | 2 (`set` + `set`) | crash leaks freed blocks; double-free guard unaffected |
+    fn dealloc(&self, slice: BStackSlice<'_, Self>) -> io::Result<()> {
+        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::dealloc")?;
+        let _op = self.enter_op()?;
+        self.dealloc_impl(slice)
+    }
+
+    /// Resize the region described by `slice` to `new_len` bytes.
+    ///
+    /// Returns a (possibly different) slice covering the resized region. If
+    /// `slice` is the null/empty sentinel (`start == 0, len == 0`), delegates
+    /// to [`alloc`](Self::alloc). If `new_len == 0`, deallocates `slice` and
+    /// returns the null sentinel.
+    ///
+    /// # Slice origin requirement
+    ///
+    /// `slice` **must** have been returned directly by [`alloc`](Self::alloc)
+    /// or by a prior call to [`realloc`](Self::realloc) on this same allocator
+    /// instance. Passing an arbitrary sub-slice obtained via
+    /// [`BStackSlice::subslice`], [`BStackSlice::subslice_range`], or a
+    /// manually constructed [`BStackSlice::new`] is not supported and may
+    /// corrupt the allocator's internal state.
+    ///
+    /// # Resize strategies
+    ///
+    /// | Case | Strategy |
+    /// |------|----------|
+    /// | Same block count | Adjust visible length, zeroing newly-exposed bytes on grow |
+    /// | Slice at tail | Extend or discard the tail and update the overhead count |
+    /// | Shrink, non-tail | Recycle excess blocks into the free list, then shrink the overhead |
+    /// | Grow, non-tail | Allocate a fresh region, copy, release the old |
+    ///
+    /// # Errors
+    ///
+    /// * [`io::ErrorKind::InvalidInput`] — `slice.start()` is below the
+    ///   overhead prefix offset, or the block's overhead high bit is clear
+    ///   (realloc of a freed or invalid block).
+    /// * Any [`io::Error`] propagated from the underlying [`BStack`] operations.
+    ///
+    /// # Crash consistency
+    ///
+    /// | Case | Calls | Safety |
+    /// |------|-------|--------|
+    /// | same block count | 0–1 (`zero`) | trivially safe |
+    /// | tail shrink | 2 (`set` + `discard`) | crash before `discard` leaves orphaned tail; reclaimed by `recover` |
+    /// | tail grow | 2 (`extend` + `set`) | crash leaks capacity extension; original data intact |
+    /// | shrink non-tail | 3 (`set` + `set` + `set`) | crash leaks excess blocks; no live allocation corrupted |
+    /// | grow non-tail | 4–5 (`alloc` + copy + `dealloc`) | crash leaks old block; new allocation is consistent |
+    fn realloc<'a>(
+        &'a self,
+        slice: BStackSlice<'a, Self>,
+        new_len: u64,
+    ) -> io::Result<BStackSlice<'a, Self>> {
+        ensure_own_slice(self, &slice, "CheckedSlabBStackAllocator::realloc")?;
+        let _op = self.enter_op()?;
+        self.realloc_impl(slice, new_len)
     }
 }
 
@@ -2270,6 +2365,96 @@ mod tests {
         }
 
         // All threads done: the allocator should be fully consistent.
+        assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn mutators_refuse_while_recovering() {
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = CheckedSlabBStackAllocator::new(stack, 8).unwrap();
+        let s = alloc.alloc(8).unwrap();
+
+        alloc.recovering.store(true, Ordering::SeqCst);
+        assert_eq!(alloc.alloc(8).unwrap_err().kind(), ErrorKind::ResourceBusy);
+        assert_eq!(
+            alloc.realloc(s, 32).unwrap_err().kind(),
+            ErrorKind::ResourceBusy
+        );
+        assert_eq!(
+            alloc.dealloc(s).unwrap_err().kind(),
+            ErrorKind::ResourceBusy
+        );
+        alloc.recovering.store(false, Ordering::SeqCst);
+
+        assert_eq!(alloc.in_flight.load(Ordering::SeqCst), 0);
+        alloc.dealloc(s).unwrap();
+        assert_eq!(alloc.recover().unwrap(), 0);
+    }
+
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn concurrent_recover_never_doubles_blocks() {
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // `recover` racing alloc/dealloc used to relink in-flight blocks as
+        // leaks, handing one block to two callers.
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 200;
+
+        let (stack, path) = empty_stack();
+        let _g = Guard(path);
+        let alloc = Arc::new(CheckedSlabBStackAllocator::new(stack, 8).unwrap());
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let recoverer = {
+            let alloc = Arc::clone(&alloc);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    alloc.recover().unwrap();
+                }
+            })
+        };
+        let workers: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let alloc = Arc::clone(&alloc);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    let a: &CheckedSlabBStackAllocator = &alloc;
+                    for _ in 0..ROUNDS {
+                        let slice = loop {
+                            match a.alloc(8) {
+                                Ok(s) => break s,
+                                Err(e) => assert_eq!(e.kind(), ErrorKind::ResourceBusy),
+                            }
+                        };
+                        let off = slice.start();
+                        assert!(
+                            live.lock().unwrap().insert(off),
+                            "duplicate live offset {off}"
+                        );
+                        slice.write([tid as u8; 8]).unwrap();
+                        assert_eq!(slice.read().unwrap(), vec![tid as u8; 8]);
+                        live.lock().unwrap().remove(&off);
+                        while let Err(e) = a.dealloc(slice) {
+                            assert_eq!(e.kind(), ErrorKind::ResourceBusy);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        recoverer.join().unwrap();
         assert_eq!(alloc.recover().unwrap(), 0);
     }
 
