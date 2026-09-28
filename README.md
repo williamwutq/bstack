@@ -1311,7 +1311,9 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`), and
 additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`;
-freed batches leave only `recover`-reclaimable leaks on a crash).
+freed batches leave only `recover`-reclaimable leaks on a crash). With
+`atomic`, `recover()` is exclusive: mutators called while it runs fail with
+`ResourceBusy` (C: `EBUSY`) and may be retried.
 
 `stats` (`atomic`) counts live allocations, each spanning one or more blocks;
 leaked blocks count as free until `recover()`.
