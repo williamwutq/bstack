@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`repeat`/`zero`/`copy` (Rust: `set` / `set`+`atomic`; C: `bstack_repeat`/`bstack_zero`/`bstack_copy`) now stream through a bounded buffer instead of materialising the whole region.** A large fill or copy previously allocated the entire `count * pattern.len()` (or `n`) bytes up front; it now uses a fixed ~4 KiB buffer, so peak memory is O(chunk) regardless of region size. Results and durability are unchanged (still not crash-atomic on this line — a crash mid-write can still tear the region); `copy` runs in the overlap-safe direction (memmove semantics) rather than relying on full buffering, and it gains its first C-side tests. No API or on-disk change.
 - **Reads and in-place writes now bound-check against the cached committed length (Rust and C).** This covers `peek`, `get`, the `get_batched` family, `lock_up_to`, and every in-place mutator (`set`, `swap`, `cas`, `copy`, `process_gen`, the `*_crds` family, …), saving an `fstat`/`lseek` per call. Appends, truncations, and recovery still read the physical size.
+- **`CheckedSlabBStackAllocator` version bumped to 0.1.4 (`alloc` + `set`; Rust and C): magic `ALCK\x00\x01\x02\x00` → `ALCK\x00\x01\x04\x00`.** No layout change; the patch byte records a writer carrying the `recover` exclusion fix below, and skips `\x03`, which on the 0.4.x line marks the bulk-allocation writer this line lacks. Only the first 6 bytes are checked on open, so existing 0.1.x files stay compatible. Backported from the 0.4.x line.
 
 ### Fixed
 

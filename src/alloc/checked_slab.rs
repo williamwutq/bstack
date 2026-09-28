@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::HashSet, fmt, io};
 
 #[cfg(feature = "set")]
-const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x02\x00";
+const ALCK_MAGIC: [u8; 8] = *b"ALCK\x00\x01\x04\x00";
 
 /// Compatibility prefix checked on open: `ALCK` + major 0 + minor 1.
 /// Any file whose first 6 bytes match is considered compatible.
