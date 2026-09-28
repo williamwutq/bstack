@@ -156,42 +156,6 @@ Shape (c) also protects a future concurrent `recover` and is the most invasive. 
 
 ---
 
-## `CheckedSlabBStackAllocator` safe `recover()` treats in-flight states as leaks
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** Only if `recover` is made `unsafe` (an API break); the `AtomicBool` + `ResourceBusy` alternative is internal, with no on-disk format change.
-**Impact:** HIGH
-
-### Motivation
-
-`recover` is a safe `pub fn`. Its documentation permits overlap with a concurrent `alloc` or `dealloc` and grounds correctness on one claim: a reclaimed block is reachable by neither the free list nor a live handle, so its state holds between the scan and the splice.
-
-The multi-call windows break that claim. Each leaves a block that is zero-tagged and absent from the free list. That is the exact shape `recover` treats as a reclaimable leak, yet the mutator's next call changes it. Three windows exist.
-
-In `alloc`, the pop gen runs before the claim `set`. A `recover` between them splices the detached block back onto the free list. The claim then marks it in-use. The block is now live and free-listed, so a later `alloc` doubles it.
-
-Also in `alloc`, the tail `extend` runs before `write_overhead`. A `recover` between them splices the fresh zero blocks as free. The overhead write then forms an in-use block that contains those free-list nodes, so allocations overlap.
-
-In `dealloc`, `write_free_run` runs before the `cross_exchange`. A `recover` between them splices the same blocks that `dealloc` then splices again. That forms a doubly linked list or a cycle.
-
-The internal Mutex serialises `recover` against itself alone. `alloc` and `dealloc` run without it. This is the same class as segregated's `coalesce` race.
-
-### Design
-
-Each splice is one `cross_exchange` and is atomic on its own. The leak-shaped states persist across the whole scan, so the fix must make the entire scan exclusive of any in-flight `alloc` or `dealloc` sequence. Segregated already takes this stance: its `recover` is `unsafe` and requires quiescence. The mechanism is the open question below.
-
-### Open questions
-
-**Quiescence mechanism.**
-
-(a) Mark `recover` `unsafe` and require the caller to guarantee no concurrent `alloc` or `dealloc`, for example by running it right after `open` and before the handle is shared. This carries zero runtime cost and matches segregated.
-
-(b) Hold an `AtomicBool` for the duration of `recover`. `alloc` and `dealloc` read it on entry and return `io::ErrorKind::ResourceBusy` while it is set. This keeps `recover` safe at the cost of one atomic load per operation and a transient error the caller retries.
-
-Both shapes avoid a shared lock across `alloc` and `dealloc`. Shape (b) raises two follow-ups: whether it also guards the non-`atomic` `recover`, and whether `alloc` and `dealloc` surface `ResourceBusy` or retry internally. Settle with segregated's `coalesce`.
-
----
-
 ## `GhostTreeBstackAllocator` has no in-process poison guard after a torn tree mutation
 
 **Feature flag:** `alloc` + `set`
