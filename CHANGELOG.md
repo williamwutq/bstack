@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Reads, in-place writes, appends, and truncations now use the cached committed length instead of the file size (Rust and C).** This covers `peek`, `get`, the `get_batched` family, `lock_up_to`, every in-place mutator (`set`, `swap`, `cas`, `copy`, `process_gen`, `inplace_gen`, the `*_crds` family, …), and every size change (`push`, `extend`, `pop`, `discard`, `resize`, `ensure`, the sparse extends, `atrunc`/`splice`/`replace`, the `try_*` family), saving an `fstat`/`lseek` per call. The deferred replay every write runs first keeps it equal to the file size. Rust appends now use a positional write (`pwrite` / `WriteFile` + `OVERLAPPED`) instead of seek then write. Recovery still reads the physical size.
 - **Moves, copies, and repeat-fills no longer heap-allocate (Rust).** They stream through a reused per-thread 4 KiB buffer, and a fill whose pattern exceeds it writes the pattern directly. The C port already used a stack buffer.
+- **`CheckedSlabBStackAllocator` version bumped to 0.1.4 (`alloc` + `set`; Rust and C): magic `ALCK\x00\x01\x03\x00` → `ALCK\x00\x01\x04\x00`.** No layout change; the patch byte records a writer carrying the `recover` exclusion fix below.
 
 ### Fixed
 

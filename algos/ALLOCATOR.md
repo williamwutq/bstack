@@ -383,7 +383,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x01\x00"` (version 0.1.1).
+* **`magic`** — `"ALCK\x00\x01\x04\x00"` (version 0.1.4).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 
