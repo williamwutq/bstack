@@ -1680,8 +1680,8 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * scans under a bstack_process_gen, this walk needs only the shared lock. No
  * allocator-level lock is taken.
  *
- * A malformed overhead word, or a zeroed tail left by a crashed extend, ends
- * the scan at that point; the returned counts cover only the arena prefix
+ * A zero gap is skipped uncounted. A malformed overhead word ends the scan at
+ * that point; the returned counts cover only the arena prefix
  * that parsed cleanly — run segregated_bstack_allocator_coalesce (or
  * segregated_bstack_allocator_recover) first for an authoritative snapshot.
  *

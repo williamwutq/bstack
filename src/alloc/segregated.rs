@@ -72,8 +72,9 @@ const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x03\x00";
 /// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
 const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
-/// Bytes `recover`'s zero-run scan reads per step, into a stack buffer; a
-/// multiple of the 16-byte quantum so every chunk starts on a word boundary.
+/// Bytes a zero-gap scan (`recover`, `coalesce`, `stats`) reads per step, into
+/// a stack buffer; a multiple of the 16-byte quantum so every chunk starts on a
+/// word boundary.
 const ZERO_SCAN_CHUNK: usize = 2048;
 
 /// A segregated free-list allocator implementing [`BStackAllocator`] on top of a
@@ -682,6 +683,10 @@ impl SegregatedBStackAllocator {
             NeedRun,
             /// `word_buf` = word at `j`; extend the run or close it.
             HaveRun,
+            /// Inside a zero gap: issue a `Read` of the next chunk at `p`.
+            NeedGap,
+            /// `chunk[..gap_n]` = bytes at `p`; resync at a header or keep skipping.
+            HaveGap,
             /// Scan done: drain the accumulated writes, then the head table.
             Flush,
         }
@@ -695,6 +700,8 @@ impl SegregatedBStackAllocator {
         let mut writes: Vec<(u64, Box<[u8; 16]>)> = Vec::new();
         let mut head_bytes = [0u8; Self::NUM_CLASSES as usize * 8];
         let mut word_buf = [0u8; 8];
+        let mut chunk = [0u8; ZERO_SCAN_CHUNK];
+        let mut gap_n = 0usize;
         // The arena length as seen under the lock; every bound below is expressed as
         // a subtraction against it, and the scan keeps `p <= stack_len`, `j <= stack_len`.
         let mut stack_len = 0u64;
@@ -747,9 +754,11 @@ impl SegregatedBStackAllocator {
                     }
                     Scan::HaveBlock => {
                         let word = u64::from_le_bytes(word_buf);
-                        // Zeroed tail from a crashed extend: stop (tail unhandled).
+                        // Never a valid header: skip the gap as `recover` does
+                        // (zero to the end is a crashed-extend tail, left alone).
                         if word == 0 {
-                            state = Scan::Flush;
+                            p += Self::QUANTUM;
+                            state = Scan::NeedGap;
                             continue;
                         }
                         if word & Self::IN_USE_BIT != 0 {
@@ -816,6 +825,32 @@ impl SegregatedBStackAllocator {
                         fused += run_blocks.saturating_sub(k as u64);
                         p = j;
                         state = Scan::NeedBlock;
+                        continue;
+                    }
+                    Scan::NeedGap => {
+                        if p >= stack_len {
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        gap_n = (stack_len - p).min(ZERO_SCAN_CHUNK as u64) as usize;
+                        state = Scan::HaveGap;
+                        return Some(BStackGenOp::Read {
+                            offset: p,
+                            // SAFETY: `chunk` outlives this call.
+                            buf: bstack_unsafe_reborrow_mut!(&mut chunk[..gap_n]),
+                        });
+                    }
+                    Scan::HaveGap => {
+                        match Self::nonzero_word_in_chunk(&chunk[..gap_n]) {
+                            Some(i) => {
+                                p += i; // resync at the next header
+                                state = Scan::NeedBlock;
+                            }
+                            None => {
+                                p += gap_n as u64;
+                                state = Scan::NeedGap;
+                            }
+                        }
                         continue;
                     }
                     Scan::Flush => {
@@ -1480,8 +1515,8 @@ impl SegregatedBStackAllocator {
     /// # Errors
     ///
     /// Any [`io::Error`] from the underlying [`BStack::get_batched_gen`]
-    /// call. A malformed overhead word, or a zeroed tail left by a crashed
-    /// `extend`, ends the scan at that point; the returned counts cover only
+    /// call. A zero gap is skipped uncounted. A malformed overhead word ends
+    /// the scan at that point; the returned counts cover only
     /// the arena prefix that parsed cleanly — run
     /// [`coalesce`](Self::coalesce) (or the `unsafe` [`recover`](Self::recover))
     /// first for an authoritative snapshot.
@@ -1518,46 +1553,65 @@ impl SegregatedBStackAllocator {
         let mut in_use_bytes = 0u64;
         let mut p = Self::ARENA_START;
         let mut word_buf = [0u8; 8];
+        let mut chunk = [0u8; ZERO_SCAN_CHUNK];
+        // Inside a zero gap, `chunk[..gap_n]` is read instead of `word_buf`
+        // until the next non-zero header.
+        let mut in_gap = false;
+        let mut gap_n = 0usize;
         // Set once a read has been issued; the *next* call processes the
         // buffer it filled before issuing (or declining) the next one.
         let mut pending = false;
         self.stack.get_batched_gen(|| {
             if pending {
                 pending = false;
-                let word = u64::from_le_bytes(word_buf);
-                if word == 0 {
-                    // Zeroed tail from a crashed `extend`: stop (recover()
-                    // and coalesce() both discard/skip this the same way).
-                    p = scan_end;
-                    return None;
-                }
-                // `size` comes off disk and may be arbitrary, so the fit test
-                // is `size > scan_end - p` (no underflow: `p < scan_end` here)
-                // rather than `p + size`, which could overflow. `<< 4` makes it
-                // a multiple of QUANTUM, so only the lower bound is left.
-                let size = (word & !Self::IN_USE_BIT) << 4;
-                if size < Self::QUANTUM || size > scan_end - p {
-                    p = scan_end; // malformed: stop the scan here
-                    return None;
-                }
-                if word & Self::IN_USE_BIT != 0 {
-                    in_use_blocks += 1;
-                    in_use_bytes += size;
+                if in_gap {
+                    match Self::nonzero_word_in_chunk(&chunk[..gap_n]) {
+                        Some(i) => {
+                            p += i; // resync at the next header
+                            in_gap = false;
+                        }
+                        None => p += gap_n as u64,
+                    }
                 } else {
-                    free_blocks += 1;
-                    free_bytes += size;
+                    let word = u64::from_le_bytes(word_buf);
+                    if word == 0 {
+                        // Never a valid header: skip the gap as `recover` does
+                        // (zero to the end is a crashed-`extend` tail).
+                        p += Self::QUANTUM;
+                        in_gap = true;
+                    } else {
+                        // `size` comes off disk and may be arbitrary, so the fit test
+                        // is `size > scan_end - p` (no underflow: `p < scan_end` here)
+                        // rather than `p + size`, which could overflow. `<< 4` makes it
+                        // a multiple of QUANTUM, so only the lower bound is left.
+                        let size = (word & !Self::IN_USE_BIT) << 4;
+                        if size < Self::QUANTUM || size > scan_end - p {
+                            p = scan_end; // malformed: stop the scan here
+                            return None;
+                        }
+                        if word & Self::IN_USE_BIT != 0 {
+                            in_use_blocks += 1;
+                            in_use_bytes += size;
+                        } else {
+                            free_blocks += 1;
+                            free_bytes += size;
+                        }
+                        p += size;
+                    }
                 }
-                p += size;
             }
             if p >= scan_end {
                 return None;
             }
             pending = true;
-            Some((
-                p,
+            if in_gap {
+                gap_n = (scan_end - p).min(ZERO_SCAN_CHUNK as u64) as usize;
+                // SAFETY: `chunk` outlives this call.
+                Some((p, bstack_unsafe_reborrow_mut!(&mut chunk[..gap_n])))
+            } else {
                 // SAFETY: `word_buf` outlives this call.
-                bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
-            ))
+                Some((p, bstack_unsafe_reborrow_mut!(&mut word_buf[..])))
+            }
         })?;
         Ok(BStackAllocStats {
             free_blocks,
@@ -2808,16 +2862,27 @@ impl SegregatedBStackAllocator {
         if !grew {
             return Ok(false);
         }
-        // Old block's slack [start+old_len, old_end) may hold stale bytes
-        // from a prior shrink; the extension past old_end is already zero.
-        let slack = (old_size - Self::OVERHEAD) - old_len;
-        if slack > 0 && init {
-            self.stack.zero(start + old_len, slack)?;
-        }
-        self.stack.set(
-            block_start,
-            (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
-        )?;
+        (|| {
+            // Old block's slack [start+old_len, old_end) may hold stale bytes
+            // from a prior shrink; the extension past old_end is already zero.
+            let slack = (old_size - Self::OVERHEAD) - old_len;
+            if slack > 0 && init {
+                self.stack.zero(start + old_len, slack)?;
+            }
+            self.stack.set(
+                block_start,
+                (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
+            )
+        })()
+        .inspect_err(|_| {
+            // Best-effort: drop the unrecorded extension, else it is a mid-arena
+            // zero gap once the next alloc extends past it.
+            let delta = new_size - old_size;
+            #[cfg(feature = "atomic")]
+            let _ = self.stack.try_discard(old_end + delta, delta);
+            #[cfg(not(feature = "atomic"))]
+            let _ = self.stack.discard(delta);
+        })?;
         Ok(true)
     }
 }
@@ -3951,6 +4016,57 @@ mod tests {
         assert_eq!(&y.read().unwrap()[..13], b"after the gap");
     }
 
+    /// `coalesce` used to stop at a zero gap, republishing heads rebuilt from
+    /// the prefix only and so unlinking every free block past it.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_resyncs_past_mid_arena_zero_gap() {
+        let (a, _g) = new_alloc();
+        let f0 = a.alloc(100).unwrap(); // block 112
+        let f1 = a.alloc(100).unwrap();
+        let x = a.alloc(24).unwrap(); // block 32, becomes the gap
+        let g0 = a.alloc(100).unwrap();
+        let g1 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let (f0_start, g0_start) = (f0.start(), g0.start());
+        a.stack
+            .set(x.start() - Seg::OVERHEAD, 0u64.to_le_bytes())
+            .unwrap();
+        for s in [f0, f1, g0, g1] {
+            a.dealloc(s).unwrap();
+        }
+
+        assert_eq!(a.coalesce().unwrap(), 2, "both pairs fuse");
+        let mut got = [a.alloc(216).unwrap().start(), a.alloc(216).unwrap().start()];
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [f0_start, g0_start],
+            "the run past the gap stays linked"
+        );
+        assert_eq!(unsafe { a.recover() }.unwrap(), 2, "only the gap is leaked");
+    }
+
+    /// `stats` used to stop at a zero gap, dropping every block past it.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_skips_mid_arena_zero_gap() {
+        let (a, _g) = new_alloc();
+        let _before = a.alloc(100).unwrap(); // block 112
+        let x = a.alloc(24).unwrap(); // block 32, becomes the gap
+        let _after = a.alloc(100).unwrap();
+        let freed = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        a.stack
+            .set(x.start() - Seg::OVERHEAD, 0u64.to_le_bytes())
+            .unwrap();
+        a.dealloc(freed).unwrap();
+
+        let s = a.stats().unwrap();
+        assert_eq!((s.in_use_blocks, s.in_use_bytes), (3, 3 * 112));
+        assert_eq!((s.free_blocks, s.free_bytes), (1, 112));
+    }
+
     /// A crafted free size near `u64::MAX` wrapped `p + size` past the bound
     /// check (release) or panicked in the automatic `recover` (debug).
     #[test]
@@ -4756,6 +4872,33 @@ mod bulk_fault_tests {
             vec![0x9Au8; 100],
             "old data intact after recover"
         );
+    }
+
+    // A fault at the tail grow's size-recording `set` drops the zero extension
+    // again, so the next alloc cannot leave a live block past a zero gap.
+    #[test]
+    fn realloc_tail_grow_set_fault_drops_extension() {
+        let path = temp_path("seg_tail_grow_set");
+        let _g = Guard(path.clone());
+        let alloc = Seg::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut s = alloc.alloc(104).unwrap(); // block 112, no slack to scrub
+        s.write([0x5Cu8; 104]).unwrap();
+        let len = alloc.stack().len().unwrap();
+
+        let policy: Arc<dyn FaultPolicy> = Arc::new(FailOpAt::new("set", 0, ErrorKind::Other));
+        alloc.stack().set_fault_policy(Some(policy));
+        let err = alloc
+            .realloc(s, 300)
+            .expect_err("size-recording set fault must fail the grow");
+        alloc.stack().set_fault_policy(None);
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        assert_eq!(alloc.stack().len().unwrap(), len, "extension dropped");
+
+        let s = err.into_handle().expect("old block handed back");
+        let _next = alloc.alloc(24).unwrap();
+        assert_eq!(unsafe { alloc.recover() }.unwrap(), 0, "no zero gap left");
+        assert_eq!(s.read().unwrap(), vec![0x5Cu8; 104], "old data intact");
     }
 
     #[test]

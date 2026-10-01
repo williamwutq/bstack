@@ -1249,6 +1249,76 @@ static int test_coalesce_empty_arena(void)
     sg_unlink(tmp); return 0;
 }
 
+/* coalesce used to stop at a zero gap, republishing heads rebuilt from the
+ * prefix only and so unlinking every free block past it. */
+static int test_coalesce_resyncs_past_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t f0, f1, x, g0, g1, pin, r0, r1;
+    uint64_t fused = 999, unsure = 999, f0_off, g0_off;
+    uint8_t zero[8] = {0};
+    CHECK(bstack_allocator_alloc(base, 100, &f0) == 0);  /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 100, &f1) == 0);
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);    /* block 32, the gap */
+    CHECK(bstack_allocator_alloc(base, 100, &g0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &g1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    f0_off = f0.offset; g0_off = g0.offset;
+    CHECK(bstack_set(bs, x.offset - 8, zero, 8) == 0);
+    CHECK(bstack_allocator_dealloc(base, f0) == 0);
+    CHECK(bstack_allocator_dealloc(base, f1) == 0);
+    CHECK(bstack_allocator_dealloc(base, g0) == 0);
+    CHECK(bstack_allocator_dealloc(base, g1) == 0);
+
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 2);                                    /* both pairs fuse */
+    CHECK(bstack_allocator_alloc(base, 216, &r0) == 0);
+    CHECK(bstack_allocator_alloc(base, 216, &r1) == 0);
+    /* the run past the gap stays linked */
+    CHECK((r0.offset == f0_off && r1.offset == g0_off)
+          || (r0.offset == g0_off && r1.offset == f0_off));
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 2);                                   /* only the gap */
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* stats used to stop at a zero gap, dropping every block past it. */
+static int test_stats_skips_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t before, x, after, freed, pin;
+    uint64_t fb, fy, ub, uy;
+    uint8_t zero[8] = {0};
+    CHECK(bstack_allocator_alloc(base, 100, &before) == 0); /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);       /* block 32, the gap */
+    CHECK(bstack_allocator_alloc(base, 100, &after) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &freed) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    CHECK(bstack_set(bs, x.offset - 8, zero, 8) == 0);
+    CHECK(bstack_allocator_dealloc(base, freed) == 0);
+
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(ub == 3 && uy == 3 * 112);
+    CHECK(fb == 1 && fy == 112);
+    (void)before; (void)after; (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 static int test_coalesce_partial_run(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -1627,6 +1697,7 @@ int main(void)
     T(test_coalesce_empty_arena);
     T(test_coalesce_partial_run);
     T(test_coalesce_splits_non_class_run);
+    T(test_coalesce_resyncs_past_mid_arena_zero_gap);
 
     T(test_stats_empty_arena_is_all_zero);
     T(test_stats_accepts_null_out_pointers);
@@ -1634,6 +1705,7 @@ int main(void)
     T(test_stats_oversized_block_counts_physical_size);
     T(test_stats_clamps_tail_that_is_not_a_whole_quantum);
     T(test_stats_survives_concurrent_tail_discard);
+    T(test_stats_skips_mid_arena_zero_gap);
     T(test_mutators_refuse_while_coalescing);
     T(test_concurrent_coalesce_never_doubles_blocks);
 #endif
