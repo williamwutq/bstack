@@ -1563,7 +1563,9 @@ int checked_slab_bstack_allocator_stats(
  * tail grow / oversized-discard paths use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
  * The handle carries no mutex at all; recover() is the sole exception and
- * requires a quiescent allocator (see its contract).
+ * requires a quiescent allocator (see its contract).  coalesce() is exclusive:
+ * while it runs, every mutator fails with errno = EBUSY, leaving its slices
+ * intact for a retry.
  *
  * Without -DBSTACK_FEATURE_ATOMIC a shrink cannot reclaim its freed excess —
  * recording the smaller size and dropping the excess cannot be fused without a
@@ -1582,6 +1584,15 @@ int checked_slab_bstack_allocator_stats(
 typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Set while coalesce() runs; mutators fail with EBUSY.  Required: the scan
+     * misreads an in-flight op's detached free-tagged block as free and relinks
+     * it (double allocation). */
+    atomic_bool        coalescing;
+    /* Mutators in flight; coalesce() waits for it to drain.  The flag alone
+     * misses an op that checked it just before coalesce() set it. */
+    atomic_size_t      in_flight;
+#endif
 } segregated_bstack_allocator_t;
 
 /*
@@ -1634,11 +1645,12 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
  * *out_fused (if non-NULL) with the number of blocks fused into a neighbour
  * (0 = nothing was adjacent, and nothing is written).
  *
- * Unlike recover, this needs no quiescence: the whole scan-and-rewrite runs
- * inside one bstack_inplace_gen, striding the overhead words one at a time under
- * the held write lock and committing the merges as one journalled batch, so a
- * concurrent alloc/dealloc can neither observe an intermediate state nor be
- * clobbered — no allocator-level lock.  A torn commit re-parses as a valid arena
+ * Unlike recover, this needs no caller-guaranteed quiescence: the whole
+ * scan-and-rewrite runs inside one bstack_inplace_gen and commits the merges as
+ * one journalled batch, and coalesce excludes mutators itself — it waits for
+ * in-flight ones, and any alloc/dealloc/realloc (or bulk op) entered meanwhile
+ * fails with errno = EBUSY and may be retried; concurrent coalesce calls run one
+ * at a time.  A torn commit re-parses as a valid arena
  * and is reclaimed by recover, so the pass is restartable; the scan follows only
  * physical sizes, never next_free, so a corrupt free list cannot cycle it.  A run
  * reaching the tail is merged like any other — tail discard is not attempted.

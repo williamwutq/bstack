@@ -596,11 +596,21 @@ slack, never a head that overruns the block); a run reaching the tail is merged.
 
 Unlike `recover`, `coalesce` is a **safe** method. The whole scan-and-rewrite
 runs inside one `BStack::inplace_gen`, striding the overhead words one at a time
-under the held write lock and committing the merges as one journalled batch, so
-a concurrent `alloc`/`dealloc` can neither observe an intermediate state nor be
-clobbered, with no allocator-level lock. A torn commit re-parses as a valid arena
-and is reclaimed by `recover`, so the pass is restartable; the scan follows only
-physical sizes, never `next_free`, so a corrupt free list cannot cycle it.
+under the held write lock and committing the merges as one journalled batch. A
+torn commit re-parses as a valid arena and is reclaimed by `recover`, so the pass
+is restartable; the scan follows only physical sizes, never `next_free`, so a
+corrupt free list cannot cycle it.
+
+The write lock alone does not make it safe: an in-flight `alloc` or `realloc`
+leaves a popped or staged block free-tagged between its own calls, and the scan
+would relink it, handing it out twice. `coalesce` therefore excludes every
+mutator for the whole call, the same way `CheckedSlabBStackAllocator::recover`
+does: each mutator increments an in-flight counter and then checks an
+`AtomicBool`; `coalesce` takes the flag by compare-and-swap (so concurrent
+`coalesce` calls run one at a time) and waits for the counter to drain. A mutator
+refused this way fails with `ResourceBusy` before touching anything and hands
+back its handles for a retry. Internal paths, such as `realloc`'s nested
+`dealloc`, skip the check.
 
 ### Thread safety
 
