@@ -10122,6 +10122,18 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
         return 0;
     }
 
+    /* Exclude mutators for the whole scan: an in-flight op's detached
+     * free-tagged block reads as free.  Taken by CAS so a second coalesce waits
+     * rather than clearing this one's flag.  seq_cst pairs with alsg_enter_op
+     * (store flag, then load count). */
+    for (;;) {
+        _Bool expected = 0;
+        if (atomic_compare_exchange_strong(&alloc->coalescing, &expected, 1)) break;
+        THREAD_YIELD();
+    }
+    while (atomic_load(&alloc->in_flight) != 0)
+        THREAD_YIELD();
+
     memset(&c, 0, sizeof c);                  /* heads[] <- SENTINEL (0) */
     c.prev  = &prev;
     c.state = ALSG_CO_NEEDLEN;
@@ -10129,6 +10141,7 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
 
     r = bstack_inplace_gen(bs, alsg_coalesce_gen, &c, &prev);
     free(c.writes);
+    atomic_store(&alloc->coalescing, 0);
     if (r) return -1;
     if (out_fused) *out_fused = c.fused;
     return 0;
@@ -10236,13 +10249,40 @@ int segregated_bstack_allocator_stats(
 
 /* ---- vtable implementations -------------------------------------------- */
 
+/* Register a public mutator, or fail with EBUSY while coalesce runs.  Increment
+ * before checking (seq_cst): coalesce then either sees the count or we see its
+ * flag.  Without atomic there is no coalesce, so these are no-ops. */
+static inline int alsg_enter_op(segregated_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_add(&a->in_flight, 1);
+    if (atomic_load(&a->coalescing)) {
+        atomic_fetch_sub(&a->in_flight, 1);
+        errno = EBUSY;
+        return -1;
+    }
+#else
+    (void)a;
+#endif
+    return 0;
+}
+
+static inline void alsg_leave_op(segregated_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_sub(&a->in_flight, 1);
+#else
+    (void)a;
+#endif
+}
+
 static bstack_t *alsg_vt_stack(bstack_allocator_t *base)
 {
     return ((segregated_bstack_allocator_t *)base)->bs;
 }
 
-static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
-                         bstack_slice_t *out)
+static int alsg_alloc_impl(bstack_allocator_t *base, uint64_t len,
+                           bstack_slice_t *out)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     uint64_t blk, sz;
@@ -10255,7 +10295,7 @@ success:
     out->allocator = base; return 0;
 }
 
-static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+static int alsg_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t *bs = a->bs;
@@ -10308,8 +10348,8 @@ static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     return alsg_push(bs, block_start, size, class) == 0 ? 0 : -2;
 }
 
-static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
-                           uint64_t new_len, bstack_slice_t *out)
+static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
+                             uint64_t new_len, bstack_slice_t *out)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t      *bs = a->bs;
@@ -10322,7 +10362,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
     /* Empty handle: realloc is a fresh alloc. */
     if (s.len == 0 && s.offset == 0) {
-        if (alsg_vt_alloc(base, new_len, out)) {
+        if (alsg_alloc_impl(base, new_len, out)) {
             out->allocator = base; out->offset = 0; out->len = 0;
             return -1;
         }
@@ -10330,7 +10370,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     }
     /* new_len == 0: dealloc consumes s; propagate its survivor signal. */
     if (new_len == 0) {
-        int dr = alsg_vt_dealloc(base, s);
+        int dr = alsg_dealloc_impl(base, s);
         if (dr) {
             if (dr == -1) { out->allocator = base; out->offset = start; out->len = old_len; }
             return dr;
@@ -10496,7 +10536,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
         recovered.allocator = base; recovered.offset = nb + ALSG_OVERHEAD;
         recovered.len = new_len;
         old_s.allocator = base; old_s.offset = start; old_s.len = old_len;
-        if (alsg_vt_dealloc(base, old_s)) goto fail_recover;
+        if (alsg_dealloc_impl(base, old_s)) goto fail_recover;
         result.offset = nb + ALSG_OVERHEAD; result.len = new_len; goto success;
 #endif
     }
@@ -10510,6 +10550,43 @@ fail_invalid:
 fail_recover:
     *out = recovered;
     return -1;
+}
+
+/* Public entries: each takes one alsg_enter_op/alsg_leave_op pair; internal
+ * paths call the _impl bodies directly (a nested enter could fail mid-op). */
+
+static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                         bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_alloc_impl(base, len, out);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) return -1;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_dealloc_impl(base, s);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                           uint64_t new_len, bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
+    if (alsg_enter_op(a)) { *out = s; return -1; }
+    r = alsg_realloc_impl(base, s, new_len, out);
+    alsg_leave_op(a);
+    return r;
 }
 
 #ifndef BSTACK_FEATURE_ATOMIC
@@ -11010,8 +11087,8 @@ static uint8_t *alsg_reuse_buf(struct alsg_reuse *tab, size_t *ntab, uint64_t si
  * by recover().  On failure the fresh tail is discarded and the detached blocks
  * re-pushed, both best-effort, and out_slices is left unmodified.
  */
-static int alsg_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
-                              size_t n, bstack_slice_t *out_slices)
+static int alsg_alloc_bulk_impl(bstack_allocator_t *base, const uint64_t *lens,
+                                size_t n, bstack_slice_t *out_slices)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t             *bs = a->bs;
@@ -11247,8 +11324,8 @@ done:
  * class left unspliced (or a crash after staging) leaves its blocks free-tagged
  * and reclaimed by recover().
  */
-static int alsg_vt_dealloc_bulk(bstack_allocator_t *base,
-                                const bstack_slice_t *slices, size_t n)
+static int alsg_dealloc_bulk_impl(bstack_allocator_t *base,
+                                  const bstack_slice_t *slices, size_t n)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t          *bs = a->bs;
@@ -11345,6 +11422,30 @@ done:
     return ret;
 }
 
+static int alsg_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (n == 0) return alsg_alloc_bulk_impl(base, lens, n, out_slices);
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_alloc_bulk_impl(base, lens, n, out_slices);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slices(base, slices, n) != 0) return -1;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_dealloc_bulk_impl(base, slices, n);
+    alsg_leave_op(a);
+    return r;
+}
+
 static const bstack_bulk_allocator_vtbl_t alsg_bulk_vtbl = {
     { alsg_vt_stack, alsg_vt_alloc, alsg_vt_realloc, alsg_vt_dealloc },
     alsg_vt_alloc_bulk,
@@ -11364,6 +11465,8 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs)
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
 #ifdef BSTACK_FEATURE_ATOMIC
+    atomic_init(&a->coalescing, 0);
+    atomic_init(&a->in_flight, 0);
     a->base.vtbl      = &alsg_bulk_vtbl.base;
     a->base.bulk_vtbl = &alsg_bulk_vtbl;
 #else
