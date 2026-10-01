@@ -764,9 +764,8 @@ static int test_foreign_slice_is_rejected(void)
 }
 
 /* =========================================================================
- * Bulk (BStackBulkAllocator) — requires -DBSTACK_FEATURE_ATOMIC
+ * recover
  * ====================================================================== */
-#ifdef BSTACK_FEATURE_ATOMIC
 
 #define SG_HEAD_OFF(c) (40u + (uint64_t)(c) * 8u)
 
@@ -783,6 +782,110 @@ static uint64_t sg_rd64(const uint8_t *p)
     for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
     return v;
 }
+
+/* A non-class free size used to be linked whole onto a smaller class; the pop
+ * then claimed only the class size, leaving an untracked gap. */
+static int test_recover_splits_non_class_free_block(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin, r;
+    uint64_t xb, unsure = 999;
+    uint8_t w[8], got[6];
+
+    CHECK(bstack_allocator_alloc(base, 300, &x) == 0);   /* block 320 */
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 300, &pin) == 0);
+    CHECK(bstack_slice_write(pin, (const uint8_t *)"pinned", 6) == 0);
+    CHECK(bstack_allocator_dealloc(base, x) == 0);
+    /* Re-tile the free 320 as a free 272 (not a class size) + a free 48. */
+    sg_wr64(w, 272u >> 4); CHECK(bstack_set(bs, xb, w, 8) == 0);
+    sg_wr64(w, 48u >> 4);  CHECK(bstack_set(bs, xb + 272, w, 8) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    /* 272 splits into 256 + 16. */
+    CHECK(bstack_get(bs, xb, xb + 8, w) == 0);             CHECK(sg_rd64(w) == 256u >> 4);
+    CHECK(bstack_get(bs, xb + 256, xb + 264, w) == 0);     CHECK(sg_rd64(w) == 16u >> 4);
+
+    CHECK(bstack_allocator_alloc(base, 248, &r) == 0);    /* block 256 */
+    CHECK(r.offset == xb + 8);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    CHECK(bstack_get(bs, pin.offset, pin.offset + 6, got) == 0);
+    CHECK(memcmp(got, "pinned", 6) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A zero word followed by a valid header is a gap, not a crashed-extend tail;
+ * discarding from it used to drop every block after it. */
+static int test_recover_resyncs_past_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y;
+    uint64_t xb, len, len2, unsure = 999;
+    uint8_t zero[8] = {0}, got[13];
+
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);    /* block 32 */
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 100, &y) == 0);
+    CHECK(bstack_slice_write(y, (const uint8_t *)"after the gap", 13) == 0);
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(bstack_set(bs, xb, zero, 8) == 0);
+
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 2);                                   /* the 32-byte gap */
+    CHECK(bstack_len(bs, &len2) == 0);
+    CHECK(len2 == len);
+    CHECK(bstack_get(bs, y.offset, y.offset + 13, got) == 0);
+    CHECK(memcmp(got, "after the gap", 13) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A crafted free size near UINT64_MAX must not wrap the bound check. */
+static int test_recover_rejects_wrapping_free_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin;
+    uint64_t xb, unsure = 0;
+    uint8_t w[8], magic[6];
+
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 24, &pin) == 0);
+    CHECK(bstack_allocator_dealloc(base, x) == 0);
+    sg_wr64(w, UINT64_C(0x0FFFFFFFFFFFFFF0)); CHECK(bstack_set(bs, xb, w, 8) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure > 0);
+    CHECK(bstack_get(bs, 24, 30, magic) == 0);
+    CHECK(memcmp(magic, "ALSG\x00\x02", 6) == 0);         /* header untouched */
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* =========================================================================
+ * Bulk (BStackBulkAllocator) — requires -DBSTACK_FEATURE_ATOMIC
+ * ====================================================================== */
+#ifdef BSTACK_FEATURE_ATOMIC
 
 /* n == 0 is a no-op; a zero-length entry yields the null sentinel slice. */
 static int test_bulk_empty_and_zero_lengths(void)
@@ -955,8 +1058,8 @@ static int test_bulk_dealloc_rejects_bad_batches(void)
     sg_unlink(t1); sg_unlink(t2); return 0;
 }
 
-/* recover() relinks a non-class size onto the largest class <= size, so
- * alloc_bulk must accept it there too (single alloc already does). */
+/* recover() splits a non-class size into exact class blocks, so alloc_bulk's
+ * exact-size check accepts the class piece. */
 static int test_bulk_reuses_recovered_non_class_size(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -984,7 +1087,7 @@ static int test_bulk_reuses_recovered_non_class_size(void)
     CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
     CHECK(unsure == 0);
 
-    /* largest_class_le(272) == 256, so it lands on class 15. */
+    /* 272 splits into 256 (class 15) + 16 (class 0). */
     CHECK(bstack_get(bs, SG_HEAD_OFF(15), SG_HEAD_OFF(15) + 8, w) == 0);
     CHECK(sg_rd64(w) == xb);
 
@@ -992,6 +1095,8 @@ static int test_bulk_reuses_recovered_non_class_size(void)
     lens[0] = 248;
     CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
     CHECK(out[0].offset == xb + 8);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);                                   /* tiling intact */
 
     CHECK(bstack_allocator_dealloc(base, pin) == 0);
     bstack_close(segregated_bstack_allocator_into_stack(a));
@@ -1088,6 +1193,42 @@ static int test_coalesce_noop_without_adjacency(void)
     g0 = x.offset; g1 = y.offset;
     CHECK((g0 == s0 && g1 == s2) || (g0 == s2 && g1 == s0));
     (void)b1; (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A non-class merged run is split into class blocks, and re-merging the same
+ * pieces counts as no progress, so coalesce reaches a fixpoint. */
+static int test_coalesce_splits_non_class_run(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t b0, b1, b2, pin, r;
+    uint64_t fused = 999, unsure = 999, base_off;
+    CHECK(bstack_allocator_alloc(base, 100, &b0) == 0);  /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 100, &b1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b2) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    base_off = b0.offset;
+    CHECK(bstack_allocator_dealloc(base, b0) == 0);
+    CHECK(bstack_allocator_dealloc(base, b1) == 0);
+    CHECK(bstack_allocator_dealloc(base, b2) == 0);
+
+    /* 3 x 112 = 336 is not a class: it becomes 320 + 16, a net drop of 1. */
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 1);
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 0);
+    CHECK(bstack_allocator_alloc(base, 300, &r) == 0);   /* block 320 */
+    CHECK(r.offset == base_off);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    (void)pin;
 
     bstack_close(segregated_bstack_allocator_into_stack(a));
     sg_unlink(tmp); return 0;
@@ -1343,6 +1484,10 @@ int main(void)
 
     T(test_foreign_slice_is_rejected);
 
+    T(test_recover_splits_non_class_free_block);
+    T(test_recover_resyncs_past_mid_arena_zero_gap);
+    T(test_recover_rejects_wrapping_free_size);
+
 #ifdef BSTACK_FEATURE_ATOMIC
     T(test_bulk_empty_and_zero_lengths);
     T(test_bulk_alloc_distinct_usable);
@@ -1356,6 +1501,7 @@ int main(void)
     T(test_coalesce_noop_without_adjacency);
     T(test_coalesce_empty_arena);
     T(test_coalesce_partial_run);
+    T(test_coalesce_splits_non_class_run);
 
     T(test_stats_empty_arena_is_all_zero);
     T(test_stats_accepts_null_out_pointers);
