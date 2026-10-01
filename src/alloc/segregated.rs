@@ -317,7 +317,7 @@ impl SegregatedBStackAllocator {
     /// Offset within `chunk` of the first non-zero overhead word (one per
     /// quantum), if any.
     #[inline]
-    fn first_nonzero_word(chunk: &[u8]) -> Option<u64> {
+    fn nonzero_word_in_chunk(chunk: &[u8]) -> Option<u64> {
         chunk
             .chunks(Self::QUANTUM as usize)
             .position(|w| w.iter().take(Self::OVERHEAD as usize).any(|&b| b != 0))
@@ -328,7 +328,7 @@ impl SegregatedBStackAllocator {
     /// non-zero, or `None` if every such word is zero. Reads
     /// `ZERO_SCAN_CHUNK`-byte chunks, all under one [`BStack::get_batched_gen`] lock.
     #[cfg(feature = "atomic")]
-    fn next_nonzero_word(&self, from: u64, end: u64) -> io::Result<Option<u64>> {
+    fn scan_nonzero_word(&self, from: u64, end: u64) -> io::Result<Option<u64>> {
         let mut buf = [0u8; ZERO_SCAN_CHUNK];
         let mut q = from;
         let mut n = 0usize;
@@ -337,7 +337,7 @@ impl SegregatedBStackAllocator {
         let mut pending = false;
         self.stack.get_batched_gen(|| {
             if pending {
-                if let Some(i) = Self::first_nonzero_word(&buf[..n]) {
+                if let Some(i) = Self::nonzero_word_in_chunk(&buf[..n]) {
                     hit = Some(q + i);
                     return None;
                 }
@@ -358,12 +358,12 @@ impl SegregatedBStackAllocator {
     /// non-zero, or `None` if every such word is zero. Reads
     /// `ZERO_SCAN_CHUNK`-byte chunks.
     #[cfg(not(feature = "atomic"))]
-    fn next_nonzero_word(&self, mut q: u64, end: u64) -> io::Result<Option<u64>> {
+    fn scan_nonzero_word(&self, mut q: u64, end: u64) -> io::Result<Option<u64>> {
         let mut buf = [0u8; ZERO_SCAN_CHUNK];
         while q < end {
             let n = (end - q).min(ZERO_SCAN_CHUNK as u64) as usize;
             self.stack.get_into(q, &mut buf[..n])?;
-            if let Some(i) = Self::first_nonzero_word(&buf[..n]) {
+            if let Some(i) = Self::nonzero_word_in_chunk(&buf[..n]) {
                 return Ok(Some(q + i));
             }
             q += n as u64;
@@ -534,7 +534,7 @@ impl SegregatedBStackAllocator {
                 // A zero word is never a valid header (free blocks store
                 // size >> 4 ≥ 1). Only an all-zero run to EOF is a crashed-extend
                 // tail; otherwise a mid-arena gap would take every block after it.
-                match self.next_nonzero_word(p + Self::QUANTUM, stack_len)? {
+                match self.scan_nonzero_word(p + Self::QUANTUM, stack_len)? {
                     None => {
                         self.stack.discard(stack_len - p)?;
                         break;

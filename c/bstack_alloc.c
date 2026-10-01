@@ -9874,12 +9874,10 @@ success:
 
 /* ---- recover ----------------------------------------------------------- */
 
-/* First quantum-aligned offset in [from, end) whose overhead word is non-zero.
- * Sets *found and *out on a hit; *found = 0 if every such word is zero.  Reads
- * ALSG_ZERO_SCAN_CHUNK-byte chunks (all under one bstack_get_batched_gen lock
- * with atomic). */
-static inline int alsg_first_nonzero_word(const uint8_t *chunk, size_t n,
-                                          uint64_t *out)
+/* Offset within chunk of the first non-zero overhead word (one per quantum).
+ * Returns 1 and sets *out on a hit, 0 if none. */
+static inline int alsg_nonzero_word_in_chunk(const uint8_t *chunk, size_t n,
+                                             uint64_t *out)
 {
     size_t i, b;
     for (i = 0; i < n; i += (size_t)ALSG_QUANTUM)
@@ -9888,6 +9886,10 @@ static inline int alsg_first_nonzero_word(const uint8_t *chunk, size_t n,
     return 0;
 }
 
+/* alsg_scan_nonzero_word: first quantum-aligned offset in [from, end) whose
+ * overhead word is non-zero.  Sets *found and *out on a hit; *found = 0 if every
+ * such word is zero.  Reads ALSG_ZERO_SCAN_CHUNK-byte chunks (all under one
+ * bstack_get_batched_gen lock with atomic). */
 #ifdef BSTACK_FEATURE_ATOMIC
 /* Fields ordered widest-alignment-first (byte buffer sized in multiples of 8,
  * then u64, then size_t, then the ints) so the struct has no internal padding. */
@@ -9904,7 +9906,7 @@ static int alsg_nz_gen(uint64_t *out_offset, uint8_t **out_buf,
     struct alsg_nz_ctx *c = ctxp;
     if (c->pending) {
         uint64_t i;
-        if (alsg_first_nonzero_word(c->buf, c->n, &i)) {
+        if (alsg_nonzero_word_in_chunk(c->buf, c->n, &i)) {
             c->found = 1; c->hit = c->q + i; return 0;
         }
         c->q += c->n;
@@ -9919,7 +9921,7 @@ static int alsg_nz_gen(uint64_t *out_offset, uint8_t **out_buf,
     return 1;
 }
 
-static int alsg_next_nonzero_word(bstack_t *bs, uint64_t from, uint64_t end,
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t from, uint64_t end,
                                   int *found, uint64_t *out)
 {
     struct alsg_nz_ctx c;
@@ -9930,7 +9932,7 @@ static int alsg_next_nonzero_word(bstack_t *bs, uint64_t from, uint64_t end,
     return 0;
 }
 #else
-static int alsg_next_nonzero_word(bstack_t *bs, uint64_t q, uint64_t end,
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t q, uint64_t end,
                                   int *found, uint64_t *out)
 {
     uint8_t buf[ALSG_ZERO_SCAN_CHUNK];
@@ -9939,7 +9941,7 @@ static int alsg_next_nonzero_word(bstack_t *bs, uint64_t q, uint64_t end,
                                                    : ALSG_ZERO_SCAN_CHUNK;
         uint64_t i;
         if (bstack_get(bs, q, q + n, buf)) return -1;
-        if (alsg_first_nonzero_word(buf, n, &i)) {
+        if (alsg_nonzero_word_in_chunk(buf, n, &i)) {
             *found = 1; *out = q + i; return 0;
         }
         q += n;
@@ -9984,7 +9986,7 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
              * otherwise a mid-arena gap would take every block after it. */
             int found;
             uint64_t q;
-            if (alsg_next_nonzero_word(bs, p + ALSG_QUANTUM, stack_len, &found, &q))
+            if (alsg_scan_nonzero_word(bs, p + ALSG_QUANTUM, stack_len, &found, &q))
                 return -1;
             if (!found) {
                 uint64_t dn = stack_len - p;
