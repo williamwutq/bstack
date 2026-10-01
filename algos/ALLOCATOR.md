@@ -570,16 +570,25 @@ Every path either commits atomically or leaves an orphaned-but-recoverable block
   (over free excess only) writes all freed pieces first and the claiming header
   last.
 
+Every block on a classed list is exactly its class size: a pop claims and
+records the class size without reading the block's own, so a larger block would
+leave an untracked gap that desyncs the next scan.
+
 `recover()` rebuilds every free list with one linear scan of the overhead words:
 a live block is strided by its **recorded physical size** (no length-to-class
-derivation); a free block is relinked onto the head of the largest class `≤ size`
-(`classify(largest_class_le(size))`, or the oversized head above 4096), which
-reclaims leaked blocks and degrades a malformed non-class size to a leak rather
-than a head that would overrun the block; a fully-zeroed tail is discarded. The rebuilt head table is published as one crash-atomic contiguous
-write. The scan trusts only the overhead words and is idempotent. In-use orphans
-(e.g. the old block of a crashed *move*) are left live; a deep GC to reclaim them
-is future work. `recover` requires a quiescent allocator and is `unsafe`; `new`
-runs it before the handle escapes.
+derivation); a free block is relinked by its stored size, which reclaims leaked
+blocks. A non-class size (such as a merged run) is first split by the greedy
+carve into exact class blocks, written as one crash-atomic `set_batched`
+(without `atomic`, back to front so the block's own header shrinks last and a
+crash mid-split still tiles); above 4096 it goes to the oversized head whole.
+A zero overhead word is never a valid header: if every word to EOF is zero it is
+a crashed `extend` tail and is discarded, otherwise the gap is left leaked
+(counted as unsure) and the scan resumes at the next header. The rebuilt head
+table is published as one crash-atomic contiguous write. The scan trusts only the
+overhead words and is idempotent. In-use orphans (e.g. the old block of a
+crashed *move*) are left live; a deep GC to reclaim them is future work.
+`recover` requires a quiescent allocator and is `unsafe`; `new` runs it before
+the handle escapes.
 
 ### Coalescing (`atomic` feature)
 
@@ -589,10 +598,11 @@ contiguous run. `coalesce()` fuses them. It is the `recover` walk plus a merge:
 it strides the arena by the recorded physical sizes and, on any run of two or
 more adjacent free blocks, writes one merged free block in place and rebuilds
 every free list from the scan — the same wholesale rebuild `recover` uses, so no
-swallowed block needs a per-block unlink. Returns the number of blocks fused into a
-neighbour; `0` means nothing was adjacent, and nothing is written. A merged run
-lands on the largest class `≤` its size (a non-class size degrades to retained
-slack, never a head that overruns the block); a run reaching the tail is merged.
+swallowed block needs a per-block unlink. A merged run is split into exact class
+blocks as in `recover`; a run reaching the tail is merged. Returns the net drop in
+free blocks (run blocks minus pieces written); `0` means nothing merged and
+nothing is written, so re-merging a run that splits back into the same pieces
+counts as no progress and repeated calls reach a fixpoint.
 
 Unlike `recover`, `coalesce` is a **safe** method. The whole scan-and-rewrite
 runs inside one `BStack::inplace_gen`, striding the overhead words one at a time

@@ -72,6 +72,11 @@ const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x03\x00";
 /// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
 const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
+/// Bytes a zero-gap scan (`recover`, `coalesce`, `stats`) reads per step, into
+/// a stack buffer; a multiple of the 16-byte quantum so every chunk starts on a
+/// word boundary.
+const ZERO_SCAN_CHUNK: usize = 2048;
+
 /// A segregated free-list allocator implementing [`BStackAllocator`] on top of a
 /// [`BStack`].
 ///
@@ -284,6 +289,89 @@ impl SegregatedBStackAllocator {
         v & !(w - 1) // round down to a multiple of w in the octave (a class)
     }
 
+    /// Greedily decompose a free `region` (multiple of 16) into exact class
+    /// sizes: the largest class `≤` the remainder, repeated; a region
+    /// `> MAX_CLASS` is one oversized piece. Every classed free-list block must be
+    /// exactly its class size — pops claim that size without reading the block's.
+    #[inline]
+    fn carve_pieces(region: u64) -> ([u64; Self::MAX_CARVE_PIECES], usize) {
+        let mut pieces = [0u64; Self::MAX_CARVE_PIECES];
+        let mut k = 0usize;
+        let mut rem = region;
+        while rem > 0 {
+            let ps = if rem > Self::MAX_CLASS {
+                rem
+            } else {
+                Self::largest_class_le(rem)
+            };
+            debug_assert!(
+                k < Self::MAX_CARVE_PIECES,
+                "greedy carve exceeded MAX_CARVE_PIECES"
+            );
+            pieces[k] = ps;
+            rem -= ps;
+            k += 1;
+        }
+        (pieces, k)
+    }
+
+    /// Offset within `chunk` of the first non-zero overhead word (one per
+    /// quantum), if any.
+    #[inline]
+    fn nonzero_word_in_chunk(chunk: &[u8]) -> Option<u64> {
+        chunk
+            .chunks(Self::QUANTUM as usize)
+            .position(|w| w.iter().take(Self::OVERHEAD as usize).any(|&b| b != 0))
+            .map(|i| i as u64 * Self::QUANTUM)
+    }
+
+    /// First quantum-aligned offset in `[from, end)` whose overhead word is
+    /// non-zero, or `None` if every such word is zero. Reads
+    /// `ZERO_SCAN_CHUNK`-byte chunks, all under one [`BStack::get_batched_gen`] lock.
+    #[cfg(feature = "atomic")]
+    fn scan_nonzero_word(&self, from: u64, end: u64) -> io::Result<Option<u64>> {
+        let mut buf = [0u8; ZERO_SCAN_CHUNK];
+        let mut q = from;
+        let mut n = 0usize;
+        let mut hit = None;
+        // Set once a read has been issued; the next call checks what it filled.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                if let Some(i) = Self::nonzero_word_in_chunk(&buf[..n]) {
+                    hit = Some(q + i);
+                    return None;
+                }
+                q += n as u64;
+            }
+            if q >= end {
+                return None;
+            }
+            n = (end - q).min(ZERO_SCAN_CHUNK as u64) as usize;
+            pending = true;
+            // SAFETY: `buf` outlives this call.
+            Some((q, bstack_unsafe_reborrow_mut!(&mut buf[..n])))
+        })?;
+        Ok(hit)
+    }
+
+    /// First quantum-aligned offset in `[from, end)` whose overhead word is
+    /// non-zero, or `None` if every such word is zero. Reads
+    /// `ZERO_SCAN_CHUNK`-byte chunks.
+    #[cfg(not(feature = "atomic"))]
+    fn scan_nonzero_word(&self, mut q: u64, end: u64) -> io::Result<Option<u64>> {
+        let mut buf = [0u8; ZERO_SCAN_CHUNK];
+        while q < end {
+            let n = (end - q).min(ZERO_SCAN_CHUNK as u64) as usize;
+            self.stack.get_into(q, &mut buf[..n])?;
+            if let Some(i) = Self::nonzero_word_in_chunk(&buf[..n]) {
+                return Ok(Some(q + i));
+            }
+            q += n as u64;
+        }
+        Ok(None)
+    }
+
     /// Payload offset of the free-list head for `class`.
     #[inline]
     fn head_off(class: u64) -> u64 {
@@ -391,14 +479,15 @@ impl SegregatedBStackAllocator {
     /// arena's overhead words: a live block (high bit set) is strided over by its
     /// **recorded physical size** (the word's low 63 bits `<< 4`), read directly
     /// with no length-to-class derivation; a free block (high bit clear, non-zero)
-    /// is relinked by its stored physical `size` onto the head of the largest
-    /// class `≤ size` (`classify(largest_class_le(size))`, or the oversized head
-    /// above `MAX_CLASS`), which reclaims any block leaked by a crashed `alloc`
-    /// pop/claim (still free-tagged but reachable from no head) and degrades a
-    /// malformed non-class size to a leak rather than a head that would hand out
-    /// more bytes than the block holds. A fully-zeroed region — a crashed tail
-    /// `extend` whose overhead write never landed — is discarded as an orphaned
-    /// tail.
+    /// is relinked by its stored physical `size`, which reclaims any block leaked
+    /// by a crashed `alloc` pop/claim (still free-tagged but reachable from no
+    /// head). A classed list must hold exact class sizes, since a pop claims the
+    /// class size without reading the block's, so a non-class size (e.g. a
+    /// `coalesce`-merged run) is split into class blocks first; above `MAX_CLASS`
+    /// it goes to the oversized head whole. A region that is zero to EOF — a
+    /// crashed tail `extend` whose overhead write never landed — is discarded as an
+    /// orphaned tail; a zero gap followed by a header is left leaked and the scan
+    /// resumes at that header.
     ///
     /// Because the scan trusts only the overhead words (never the stored
     /// `next_free` links) and [`new`](Self::new) runs it before any live
@@ -437,33 +526,57 @@ impl SegregatedBStackAllocator {
             if word & Self::IN_USE_BIT != 0 {
                 // Live: stride by the recorded physical size (no derivation).
                 let size = (word & !Self::IN_USE_BIT) << 4;
-                if size < Self::QUANTUM || size % Self::QUANTUM != 0 || p + size > stack_len {
+                if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
                     unsure += (stack_len - p) / Self::QUANTUM;
                     break;
                 }
                 p += size;
             } else if word == 0 {
-                // Zeroed tail from a crashed `extend`: discard it (free blocks
-                // always store size >> 4 ≥ 1, so a zero word is never valid).
-                self.stack.discard(stack_len - p)?;
-                break;
+                // A zero word is never a valid header (free blocks store
+                // size >> 4 ≥ 1). Only an all-zero run to EOF is a crashed-extend
+                // tail; otherwise a mid-arena gap would take every block after it.
+                match self.scan_nonzero_word(p + Self::QUANTUM, stack_len)? {
+                    None => {
+                        self.stack.discard(stack_len - p)?;
+                        break;
+                    }
+                    Some(q) => {
+                        // Resync at the next header; the gap stays leaked.
+                        unsure += (q - p) / Self::QUANTUM;
+                        p = q;
+                    }
+                }
             } else {
                 // Free: relink by the stored physical size (reclaims leaks too).
                 let size = word << 4;
-                if size < Self::QUANTUM || size % Self::QUANTUM != 0 || p + size > stack_len {
+                if size < Self::QUANTUM || size % Self::QUANTUM != 0 || size > stack_len - p {
                     unsure += (stack_len - p) / Self::QUANTUM;
                     break;
                 }
-                // Relink by the largest class ≤ size so a malformed non-class
-                // size degrades to a leak, never a head that overruns the block.
-                let c = if size > Self::MAX_CLASS {
-                    Self::OVERSIZED_CLASS
-                } else {
-                    Self::classify(Self::largest_class_le(size))
-                } as usize;
-                // Prepend: next_free ← current head of this class, then head ← p.
-                self.stack.set(p + Self::OVERHEAD, heads[c].to_le_bytes())?;
-                heads[c] = p;
+                // Split a non-class size into exact class pieces, each staged
+                // as overhead ‖ next_free ← current head of its class.
+                let (pieces, k) = Self::carve_pieces(size);
+                let mut writes = [(0u64, [0u8; 16]); Self::MAX_CARVE_PIECES];
+                let mut off = p;
+                for (w, &ps) in writes.iter_mut().zip(&pieces[..k]) {
+                    let c = Self::classify(ps) as usize;
+                    write_buf!(ps >> 4 => w.1, 0);
+                    write_buf!(heads[c] => w.1, 8);
+                    w.0 = off;
+                    heads[c] = off;
+                    off += ps;
+                }
+                // One crash-atomic batch for all pieces.
+                #[cfg(feature = "atomic")]
+                self.stack
+                    .set_batched(writes[..k].iter().map(|(o, b)| (*o, b)))?;
+                // Back to front so `p`'s header shrinks last: until then the
+                // inner headers sit inside the block it still records, so a
+                // crash leaves a valid tiling and a re-run finishes the split.
+                #[cfg(not(feature = "atomic"))]
+                for (o, b) in writes[..k].iter().rev() {
+                    self.stack.set(*o, b)?;
+                }
                 p += size;
             }
         }
@@ -476,41 +589,41 @@ impl SegregatedBStackAllocator {
         Ok(unsure)
     }
 
-    /// Record one maximal free run as a single output free block: stage its
-    /// `[overhead | next_free]` edit at `run_start` and prepend it onto the class
-    /// for `run_size` (the largest class `≤ run_size`, or oversized above
-    /// `MAX_CLASS`, so a non-class merged size degrades to retained slack rather
-    /// than a head that overruns the block — the `recover` rule).
+    /// Record one maximal free run as exact class free blocks (the `recover`
+    /// split): stage each piece's `[overhead | next_free]` edit and prepend it
+    /// onto its class. Returns the piece count.
     #[cfg(feature = "atomic")]
     fn record_run(
         run_start: u64,
         run_size: u64,
         heads: &mut [u64],
         writes: &mut Vec<(u64, Box<[u8; 16]>)>,
-    ) {
-        let c = if run_size > Self::MAX_CLASS {
-            Self::OVERSIZED_CLASS
-        } else {
-            Self::classify(Self::largest_class_le(run_size))
-        } as usize;
-        let mut buf = Box::new([0u8; 16]);
-        write_buf!(run_size >> 4 => buf, 0); // overhead: free tag | merged size
-        write_buf!(heads[c] => buf, 8); // next_free ← current class head
-        writes.push((run_start, buf));
-        heads[c] = run_start;
+    ) -> usize {
+        let (pieces, k) = Self::carve_pieces(run_size);
+        let mut off = run_start;
+        for &ps in &pieces[..k] {
+            let c = Self::classify(ps) as usize;
+            let mut buf = Box::new([0u8; 16]);
+            write_buf!(ps >> 4 => buf, 0); // overhead: free tag | piece size
+            write_buf!(heads[c] => buf, 8); // next_free ← current class head
+            writes.push((off, buf));
+            heads[c] = off;
+            off += ps;
+        }
+        k
     }
 
-    /// Merge physically-adjacent free blocks, returning the number of blocks
-    /// fused into a neighbour (`0` ⇒ nothing to merge, nothing written).
+    /// Merge physically-adjacent free blocks, returning how many fewer free
+    /// blocks the arena holds (`0` ⇒ nothing to merge, nothing written).
     ///
     /// Freed blocks are only ever returned to their own class list, so adjacent
     /// free blocks accumulate without ever combining and no oversized request can
     /// reuse the contiguous run. This pass is the [`recover`](Self::recover) walk
     /// plus a merge: it strides the arena by the recorded physical sizes, and on
-    /// any run of two or more adjacent free blocks writes one merged free block in
-    /// place and rebuilds every free list from the scan (so no swallowed block is
-    /// left linked — the same wholesale rebuild `recover` uses, which needs no
-    /// per-block unlink).
+    /// any run of two or more adjacent free blocks writes the merged run in place,
+    /// split into exact class blocks as `recover` does, and rebuilds every free
+    /// list from the scan (so no swallowed block is left linked — the same
+    /// wholesale rebuild `recover` uses, which needs no per-block unlink).
     ///
     /// Unlike `recover`, this is a safe method: the whole scan-and-rewrite runs
     /// inside a single [`BStack::inplace_gen`] under the held write lock, and the
@@ -570,6 +683,10 @@ impl SegregatedBStackAllocator {
             NeedRun,
             /// `word_buf` = word at `j`; extend the run or close it.
             HaveRun,
+            /// Inside a zero gap: issue a `Read` of the next chunk at `p`.
+            NeedGap,
+            /// `chunk[..gap_n]` = bytes at `p`; resync at a header or keep skipping.
+            HaveGap,
             /// Scan done: drain the accumulated writes, then the head table.
             Flush,
         }
@@ -583,6 +700,8 @@ impl SegregatedBStackAllocator {
         let mut writes: Vec<(u64, Box<[u8; 16]>)> = Vec::new();
         let mut head_bytes = [0u8; Self::NUM_CLASSES as usize * 8];
         let mut word_buf = [0u8; 8];
+        let mut chunk = [0u8; ZERO_SCAN_CHUNK];
+        let mut gap_n = 0usize;
         // The arena length as seen under the lock; every bound below is expressed as
         // a subtraction against it, and the scan keeps `p <= stack_len`, `j <= stack_len`.
         let mut stack_len = 0u64;
@@ -591,6 +710,8 @@ impl SegregatedBStackAllocator {
         let mut p = Self::ARENA_START;
         let mut run_start = 0u64;
         let mut run_size = 0u64;
+        // Blocks absorbed into the current run.
+        let mut run_blocks = 0u64;
         let mut j = 0u64;
         let mut wi = 0usize;
         let mut state = Scan::NeedLen;
@@ -633,9 +754,11 @@ impl SegregatedBStackAllocator {
                     }
                     Scan::HaveBlock => {
                         let word = u64::from_le_bytes(word_buf);
-                        // Zeroed tail from a crashed extend: stop (tail unhandled).
+                        // Never a valid header: skip the gap as `recover` does
+                        // (zero to the end is a crashed-extend tail, left alone).
                         if word == 0 {
-                            state = Scan::Flush;
+                            p += Self::QUANTUM;
+                            state = Scan::NeedGap;
                             continue;
                         }
                         if word & Self::IN_USE_BIT != 0 {
@@ -661,6 +784,7 @@ impl SegregatedBStackAllocator {
                         // Free block: open a run and look ahead at the next block.
                         run_start = p;
                         run_size = size;
+                        run_blocks = 1;
                         j = p + size; // ≤ stack_len by the check above.
                         state = Scan::NeedRun;
                         continue;
@@ -668,7 +792,10 @@ impl SegregatedBStackAllocator {
                     Scan::NeedRun => {
                         // `j <= stack_len`; `j == stack_len` -> run reached the tail.
                         if Self::OVERHEAD > stack_len - j {
-                            Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                            let k = Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                            // Net merges only: a run that re-splits into as many
+                            // pieces as it had changes nothing.
+                            fused += run_blocks.saturating_sub(k as u64);
                             state = Scan::Flush;
                             continue;
                         }
@@ -688,15 +815,42 @@ impl SegregatedBStackAllocator {
                                 // `run_size == j - run_start ≤ stack_len`, so neither add overflows.
                                 run_size += s;
                                 j += s;
-                                fused += 1;
+                                run_blocks += 1;
                                 state = Scan::NeedRun;
                                 continue;
                             }
                         }
                         // Block at `j` is in-use / zero / malformed: the run ends.
-                        Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                        let k = Self::record_run(run_start, run_size, &mut heads, &mut writes);
+                        fused += run_blocks.saturating_sub(k as u64);
                         p = j;
                         state = Scan::NeedBlock;
+                        continue;
+                    }
+                    Scan::NeedGap => {
+                        if p >= stack_len {
+                            state = Scan::Flush;
+                            continue;
+                        }
+                        gap_n = (stack_len - p).min(ZERO_SCAN_CHUNK as u64) as usize;
+                        state = Scan::HaveGap;
+                        return Some(BStackGenOp::Read {
+                            offset: p,
+                            // SAFETY: `chunk` outlives this call.
+                            buf: bstack_unsafe_reborrow_mut!(&mut chunk[..gap_n]),
+                        });
+                    }
+                    Scan::HaveGap => {
+                        match Self::nonzero_word_in_chunk(&chunk[..gap_n]) {
+                            Some(i) => {
+                                p += i; // resync at the next header
+                                state = Scan::NeedBlock;
+                            }
+                            None => {
+                                p += gap_n as u64;
+                                state = Scan::NeedGap;
+                            }
+                        }
                         continue;
                     }
                     Scan::Flush => {
@@ -1081,23 +1235,14 @@ impl SegregatedBStackAllocator {
         let mut blockoff_bytes = [[0u8; 8]; N]; // block start LE, for head writes
         // Per-piece 16-byte buffer: [0..8]=overhead (free|size), [8..16]=next_free (old head)
         let mut overhead_next = [[0u8; 16]; N];
-        let mut k = 0usize;
+        let (pieces, k) = Self::carve_pieces(region_size);
         let mut off = region_start;
-        let mut rem = region_size;
-        while rem > 0 {
-            let ps = if rem > Self::MAX_CLASS {
-                rem // one oversized block absorbs the whole remainder
-            } else {
-                Self::largest_class_le(rem)
-            };
-            debug_assert!(k < N, "greedy carve exceeded MAX_CARVE_PIECES");
-            block_offs[k] = off;
-            head_offs[k] = Self::head_off(Self::classify(ps));
-            write_buf!(ps >> 4 => overhead_next[k], 0);
-            blockoff_bytes[k] = off.to_le_bytes();
+        for (i, &ps) in pieces[..k].iter().enumerate() {
+            block_offs[i] = off;
+            head_offs[i] = Self::head_off(Self::classify(ps));
+            write_buf!(ps >> 4 => overhead_next[i], 0);
+            blockoff_bytes[i] = off.to_le_bytes();
             off += ps;
-            rem -= ps;
-            k += 1;
         }
 
         // Non-atomic path: lay down every freed piece *before* the prefix. Until
@@ -1370,8 +1515,8 @@ impl SegregatedBStackAllocator {
     /// # Errors
     ///
     /// Any [`io::Error`] from the underlying [`BStack::get_batched_gen`]
-    /// call. A malformed overhead word, or a zeroed tail left by a crashed
-    /// `extend`, ends the scan at that point; the returned counts cover only
+    /// call. A zero gap is skipped uncounted. A malformed overhead word ends
+    /// the scan at that point; the returned counts cover only
     /// the arena prefix that parsed cleanly — run
     /// [`coalesce`](Self::coalesce) (or the `unsafe` [`recover`](Self::recover))
     /// first for an authoritative snapshot.
@@ -1408,46 +1553,65 @@ impl SegregatedBStackAllocator {
         let mut in_use_bytes = 0u64;
         let mut p = Self::ARENA_START;
         let mut word_buf = [0u8; 8];
+        let mut chunk = [0u8; ZERO_SCAN_CHUNK];
+        // Inside a zero gap, `chunk[..gap_n]` is read instead of `word_buf`
+        // until the next non-zero header.
+        let mut in_gap = false;
+        let mut gap_n = 0usize;
         // Set once a read has been issued; the *next* call processes the
         // buffer it filled before issuing (or declining) the next one.
         let mut pending = false;
         self.stack.get_batched_gen(|| {
             if pending {
                 pending = false;
-                let word = u64::from_le_bytes(word_buf);
-                if word == 0 {
-                    // Zeroed tail from a crashed `extend`: stop (recover()
-                    // and coalesce() both discard/skip this the same way).
-                    p = scan_end;
-                    return None;
-                }
-                // `size` comes off disk and may be arbitrary, so the fit test
-                // is `size > scan_end - p` (no underflow: `p < scan_end` here)
-                // rather than `p + size`, which could overflow. `<< 4` makes it
-                // a multiple of QUANTUM, so only the lower bound is left.
-                let size = (word & !Self::IN_USE_BIT) << 4;
-                if size < Self::QUANTUM || size > scan_end - p {
-                    p = scan_end; // malformed: stop the scan here
-                    return None;
-                }
-                if word & Self::IN_USE_BIT != 0 {
-                    in_use_blocks += 1;
-                    in_use_bytes += size;
+                if in_gap {
+                    match Self::nonzero_word_in_chunk(&chunk[..gap_n]) {
+                        Some(i) => {
+                            p += i; // resync at the next header
+                            in_gap = false;
+                        }
+                        None => p += gap_n as u64,
+                    }
                 } else {
-                    free_blocks += 1;
-                    free_bytes += size;
+                    let word = u64::from_le_bytes(word_buf);
+                    if word == 0 {
+                        // Never a valid header: skip the gap as `recover` does
+                        // (zero to the end is a crashed-`extend` tail).
+                        p += Self::QUANTUM;
+                        in_gap = true;
+                    } else {
+                        // `size` comes off disk and may be arbitrary, so the fit test
+                        // is `size > scan_end - p` (no underflow: `p < scan_end` here)
+                        // rather than `p + size`, which could overflow. `<< 4` makes it
+                        // a multiple of QUANTUM, so only the lower bound is left.
+                        let size = (word & !Self::IN_USE_BIT) << 4;
+                        if size < Self::QUANTUM || size > scan_end - p {
+                            p = scan_end; // malformed: stop the scan here
+                            return None;
+                        }
+                        if word & Self::IN_USE_BIT != 0 {
+                            in_use_blocks += 1;
+                            in_use_bytes += size;
+                        } else {
+                            free_blocks += 1;
+                            free_bytes += size;
+                        }
+                        p += size;
+                    }
                 }
-                p += size;
             }
             if p >= scan_end {
                 return None;
             }
             pending = true;
-            Some((
-                p,
+            if in_gap {
+                gap_n = (scan_end - p).min(ZERO_SCAN_CHUNK as u64) as usize;
+                // SAFETY: `chunk` outlives this call.
+                Some((p, bstack_unsafe_reborrow_mut!(&mut chunk[..gap_n])))
+            } else {
                 // SAFETY: `word_buf` outlives this call.
-                bstack_unsafe_reborrow_mut!(&mut word_buf[..]),
-            ))
+                Some((p, bstack_unsafe_reborrow_mut!(&mut word_buf[..])))
+            }
         })?;
         Ok(BStackAllocStats {
             free_blocks,
@@ -1558,17 +1722,17 @@ impl SegregatedBStackAllocator {
                         });
                     }
                     St::ConsumeNode(c, cursor) => {
-                        // A block on class `c`'s list must be free and belong on
-                        // it — matching how `recover` places blocks, so a
-                        // non-class size relinked onto a smaller class is reused
-                        // here just as `pop_class` reuses it. The `size >= QUANTUM`
-                        // guard precedes `classify` (which underflows on 0) via
-                        // `||` short-circuit.
+                        // A block on class `c`'s list must be free and exactly
+                        // class `c`'s size: the claim records the class size, so
+                        // a larger block would leave an untracked gap. The
+                        // bounds guards precede `largest_class_le`/`classify`
+                        // via `||` short-circuit.
                         let word = read_buf_le!(node_buf, 0 => u64);
                         let size = word << 4;
                         if word & Self::IN_USE_BIT != 0
-                            || size < Self::QUANTUM
-                            || Self::classify(Self::largest_class_le(size)) as usize != c
+                            || !(Self::QUANTUM..=Self::MAX_CLASS).contains(&size)
+                            || Self::largest_class_le(size) != size
+                            || Self::classify(size) as usize != c
                         {
                             err = Some(io_error!(
                                 InvalidData,
@@ -2698,16 +2862,27 @@ impl SegregatedBStackAllocator {
         if !grew {
             return Ok(false);
         }
-        // Old block's slack [start+old_len, old_end) may hold stale bytes
-        // from a prior shrink; the extension past old_end is already zero.
-        let slack = (old_size - Self::OVERHEAD) - old_len;
-        if slack > 0 && init {
-            self.stack.zero(start + old_len, slack)?;
-        }
-        self.stack.set(
-            block_start,
-            (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
-        )?;
+        (|| {
+            // Old block's slack [start+old_len, old_end) may hold stale bytes
+            // from a prior shrink; the extension past old_end is already zero.
+            let slack = (old_size - Self::OVERHEAD) - old_len;
+            if slack > 0 && init {
+                self.stack.zero(start + old_len, slack)?;
+            }
+            self.stack.set(
+                block_start,
+                (Self::IN_USE_BIT | (new_size >> 4)).to_le_bytes(),
+            )
+        })()
+        .inspect_err(|_| {
+            // Best-effort: drop the unrecorded extension, else it is a mid-arena
+            // zero gap once the next alloc extends past it.
+            let delta = new_size - old_size;
+            #[cfg(feature = "atomic")]
+            let _ = self.stack.try_discard(old_end + delta, delta);
+            #[cfg(not(feature = "atomic"))]
+            let _ = self.stack.discard(delta);
+        })?;
         Ok(true)
     }
 }
@@ -3042,6 +3217,33 @@ mod tests {
         let mut want = [s0, s2];
         want.sort_unstable();
         assert_eq!(got, want);
+    }
+
+    /// A non-class merged run is split into class blocks, and re-merging the
+    /// same pieces counts as no progress, so `coalesce` reaches a fixpoint.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_splits_non_class_run_and_reaches_fixpoint() {
+        let (a, _g) = new_alloc();
+        let b0 = a.alloc(100).unwrap(); // block 112
+        let b1 = a.alloc(100).unwrap();
+        let b2 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let base = b0.start();
+        a.dealloc(b0).unwrap();
+        a.dealloc(b1).unwrap();
+        a.dealloc(b2).unwrap();
+
+        // 3 × 112 = 336 is not a class: it becomes 320 + 16, a net drop of 1.
+        assert_eq!(a.coalesce().unwrap(), 1);
+        assert_eq!(
+            a.coalesce().unwrap(),
+            0,
+            "256+16-style re-split is not progress"
+        );
+        let r = a.alloc(300).unwrap(); // block 320
+        assert_eq!(r.start(), base);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
     }
 
     #[cfg(feature = "atomic")]
@@ -3764,6 +3966,124 @@ mod tests {
         );
     }
 
+    /// A non-class free size used to be linked whole onto a smaller class; the
+    /// pop then claimed only the class size, leaving an untracked gap.
+    #[test]
+    fn seg_recover_splits_non_class_free_block() {
+        let (a, _g) = new_alloc();
+        let x = a.alloc(300).unwrap(); // block 320
+        let xb = x.start() - Seg::OVERHEAD;
+        let mut pin = a.alloc(300).unwrap();
+        pin.write(b"pinned").unwrap();
+        a.dealloc(x).unwrap();
+        // Re-tile the free 320 as a free 272 (not a class size) + a free 48.
+        a.stack.set(xb, (272u64 >> 4).to_le_bytes()).unwrap();
+        a.stack.set(xb + 272, (48u64 >> 4).to_le_bytes()).unwrap();
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+        let word =
+            |off: u64| u64::from_le_bytes(a.stack.get(off, off + 8).unwrap().try_into().unwrap());
+        assert_eq!(word(xb), 256 >> 4, "272 splits into 256 ...");
+        assert_eq!(word(xb + 256), 16 >> 4, "... + 16");
+
+        let r = a.alloc(248).unwrap(); // block 256
+        assert_eq!(r.start() - Seg::OVERHEAD, xb);
+        assert_eq!(
+            unsafe { a.recover() }.unwrap(),
+            0,
+            "tiling intact after reuse"
+        );
+        assert_eq!(&pin.read().unwrap()[..6], b"pinned");
+    }
+
+    /// A zero word followed by a valid header is a gap, not a crashed-extend
+    /// tail; discarding from it used to drop every block after it.
+    #[test]
+    fn seg_recover_resyncs_past_mid_arena_zero_gap() {
+        let (a, _g) = new_alloc();
+        let x = a.alloc(24).unwrap(); // block 32
+        let xb = x.start() - Seg::OVERHEAD;
+        let mut y = a.alloc(100).unwrap();
+        y.write(b"after the gap").unwrap();
+        let len = a.stack().len().unwrap();
+        a.stack.set(xb, 0u64.to_le_bytes()).unwrap();
+
+        assert_eq!(
+            unsafe { a.recover() }.unwrap(),
+            2,
+            "the 32-byte gap stays leaked"
+        );
+        assert_eq!(a.stack().len().unwrap(), len, "nothing discarded");
+        assert_eq!(&y.read().unwrap()[..13], b"after the gap");
+    }
+
+    /// `coalesce` used to stop at a zero gap, republishing heads rebuilt from
+    /// the prefix only and so unlinking every free block past it.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_coalesce_resyncs_past_mid_arena_zero_gap() {
+        let (a, _g) = new_alloc();
+        let f0 = a.alloc(100).unwrap(); // block 112
+        let f1 = a.alloc(100).unwrap();
+        let x = a.alloc(24).unwrap(); // block 32, becomes the gap
+        let g0 = a.alloc(100).unwrap();
+        let g1 = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        let (f0_start, g0_start) = (f0.start(), g0.start());
+        a.stack
+            .set(x.start() - Seg::OVERHEAD, 0u64.to_le_bytes())
+            .unwrap();
+        for s in [f0, f1, g0, g1] {
+            a.dealloc(s).unwrap();
+        }
+
+        assert_eq!(a.coalesce().unwrap(), 2, "both pairs fuse");
+        let mut got = [a.alloc(216).unwrap().start(), a.alloc(216).unwrap().start()];
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            [f0_start, g0_start],
+            "the run past the gap stays linked"
+        );
+        assert_eq!(unsafe { a.recover() }.unwrap(), 2, "only the gap is leaked");
+    }
+
+    /// `stats` used to stop at a zero gap, dropping every block past it.
+    #[cfg(feature = "atomic")]
+    #[test]
+    fn seg_stats_skips_mid_arena_zero_gap() {
+        let (a, _g) = new_alloc();
+        let _before = a.alloc(100).unwrap(); // block 112
+        let x = a.alloc(24).unwrap(); // block 32, becomes the gap
+        let _after = a.alloc(100).unwrap();
+        let freed = a.alloc(100).unwrap();
+        let _pin = a.alloc(100).unwrap();
+        a.stack
+            .set(x.start() - Seg::OVERHEAD, 0u64.to_le_bytes())
+            .unwrap();
+        a.dealloc(freed).unwrap();
+
+        let s = a.stats().unwrap();
+        assert_eq!((s.in_use_blocks, s.in_use_bytes), (3, 3 * 112));
+        assert_eq!((s.free_blocks, s.free_bytes), (1, 112));
+    }
+
+    /// A crafted free size near `u64::MAX` wrapped `p + size` past the bound
+    /// check (release) or panicked in the automatic `recover` (debug).
+    #[test]
+    fn seg_recover_rejects_wrapping_free_size() {
+        let (a, _g) = new_alloc();
+        let x = a.alloc(24).unwrap();
+        let xb = x.start() - Seg::OVERHEAD;
+        let _pin = a.alloc(24).unwrap();
+        a.dealloc(x).unwrap();
+        a.stack
+            .set(xb, 0x0FFF_FFFF_FFFF_FFF0u64.to_le_bytes())
+            .unwrap();
+        assert!(unsafe { a.recover() }.unwrap() > 0);
+        let magic = a.stack.get(Seg::OFFSET_SIZE, Seg::OFFSET_SIZE + 8).unwrap();
+        assert_eq!(magic, super::ALSG_MAGIC, "header untouched");
+    }
+
     #[test]
     fn seg_recover_clean_arena_preserves_data_and_free_list() {
         let (a, _g) = new_alloc();
@@ -3953,8 +4273,8 @@ mod bulk_tests {
         (Seg::new(BStack::open(&path).unwrap()).unwrap(), g)
     }
 
-    /// `recover` relinks a non-class size onto the largest class `<= size`, so
-    /// `alloc_bulk` must accept it there too (`pop_class` already does).
+    /// `recover` splits a non-class size into exact class blocks, so
+    /// `alloc_bulk`'s exact-size check accepts the class piece.
     #[test]
     fn alloc_bulk_reuses_a_recovered_non_class_size() {
         let (a, _g) = new_alloc();
@@ -3969,7 +4289,7 @@ mod bulk_tests {
         a.stack.set(xb, (272u64 >> 4).to_le_bytes()).unwrap();
         a.stack.set(xb + 272, (48u64 >> 4).to_le_bytes()).unwrap();
         assert_eq!(unsafe { a.recover() }.unwrap(), 0);
-        // largest_class_le(272) == 256, so it lands on class 15.
+        // 272 splits into 256 (class 15) + 16 (class 0).
         let head = u64::from_le_bytes(
             a.stack
                 .get(Seg::head_off(15), Seg::head_off(15) + 8)
@@ -3981,6 +4301,7 @@ mod bulk_tests {
         // A class-15 request (block 256) reuses it instead of failing the batch.
         let r = a.alloc_bulk([248u64]).unwrap();
         assert_eq!(r[0].start() - Seg::OVERHEAD, xb);
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0, "tiling intact");
     }
 
     #[test]
@@ -4551,6 +4872,33 @@ mod bulk_fault_tests {
             vec![0x9Au8; 100],
             "old data intact after recover"
         );
+    }
+
+    // A fault at the tail grow's size-recording `set` drops the zero extension
+    // again, so the next alloc cannot leave a live block past a zero gap.
+    #[test]
+    fn realloc_tail_grow_set_fault_drops_extension() {
+        let path = temp_path("seg_tail_grow_set");
+        let _g = Guard(path.clone());
+        let alloc = Seg::new(BStack::open(&path).unwrap()).unwrap();
+
+        let mut s = alloc.alloc(104).unwrap(); // block 112, no slack to scrub
+        s.write([0x5Cu8; 104]).unwrap();
+        let len = alloc.stack().len().unwrap();
+
+        let policy: Arc<dyn FaultPolicy> = Arc::new(FailOpAt::new("set", 0, ErrorKind::Other));
+        alloc.stack().set_fault_policy(Some(policy));
+        let err = alloc
+            .realloc(s, 300)
+            .expect_err("size-recording set fault must fail the grow");
+        alloc.stack().set_fault_policy(None);
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        assert_eq!(alloc.stack().len().unwrap(), len, "extension dropped");
+
+        let s = err.into_handle().expect("old block handed back");
+        let _next = alloc.alloc(24).unwrap();
+        assert_eq!(unsafe { alloc.recover() }.unwrap(), 0, "no zero gap left");
+        assert_eq!(s.read().unwrap(), vec![0x5Cu8; 104], "old data intact");
     }
 
     #[test]

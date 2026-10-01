@@ -1615,8 +1615,11 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
 /*
  * Repair the allocator after an unclean shutdown: rebuild every free list from a
  * single linear scan of the arena's overhead words (reclaiming any block leaked
- * by a crashed alloc pop/claim), discard a fully-zeroed orphaned tail, and
- * publish the rebuilt head table as one crash-atomic bstack_set.  Idempotent and
+ * by a crashed alloc pop/claim), and publish the rebuilt head table as one
+ * crash-atomic bstack_set.  A classed list must hold exact class sizes, so a
+ * non-class free size (e.g. a merged run) is split into class blocks first.  A
+ * region zero to EOF (a crashed extend) is discarded; a zero gap followed by a
+ * header is left leaked, counted as unsure, and the scan resumes there.  Idempotent and
  * crash-safe by re-running.  Writes *out_unsure (if non-NULL) with the count of
  * blocks that could not be classified with certainty (0 = fully recovered).
  *
@@ -1639,11 +1642,11 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
  * own class list, so adjacent free blocks accumulate without merging and no
  * oversized request can reuse the contiguous run; coalesce fuses them.  It is the
  * recover walk plus a merge: it strides the arena by the recorded physical sizes
- * and, on any run of two or more adjacent free blocks, writes one merged free
- * block in place and rebuilds every free list from the scan (the same wholesale
- * rebuild recover uses, so no swallowed block needs a per-block unlink).  Writes
- * *out_fused (if non-NULL) with the number of blocks fused into a neighbour
- * (0 = nothing was adjacent, and nothing is written).
+ * and, on any run of two or more adjacent free blocks, writes the merged run in
+ * place, split into exact class blocks as recover does, and rebuilds every free
+ * list from the scan (the same wholesale rebuild recover uses, so no swallowed
+ * block needs a per-block unlink).  Writes *out_fused (if non-NULL) with the net
+ * drop in free blocks (0 = nothing merged, and nothing is written).
  *
  * Unlike recover, this needs no caller-guaranteed quiescence: the whole
  * scan-and-rewrite runs inside one bstack_inplace_gen and commits the merges as
@@ -1677,8 +1680,8 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * scans under a bstack_process_gen, this walk needs only the shared lock. No
  * allocator-level lock is taken.
  *
- * A malformed overhead word, or a zeroed tail left by a crashed extend, ends
- * the scan at that point; the returned counts cover only the arena prefix
+ * A zero gap is skipped uncounted. A malformed overhead word ends the scan at
+ * that point; the returned counts cover only the arena prefix
  * that parsed cleanly — run segregated_bstack_allocator_coalesce (or
  * segregated_bstack_allocator_recover) first for an authoritative snapshot.
  *

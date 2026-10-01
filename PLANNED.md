@@ -110,52 +110,6 @@ Free-block adjacency is only observable by striding the arena, so `coalescible()
 
 ---
 
-## `SegregatedBStackAllocator` whole-arena scan/rebuild trusts a consistent, quiescent arena
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** Only if `coalesce` is made `unsafe` (an API break); the window-fusing alternative and the `recover` / tiling / stride fixes are internal, with no on-disk format change.
-**Impact:** HIGH
-
-### Motivation
-
-`recover` and `coalesce` scan the whole arena and rebuild the free lists. Both assume a consistent tiling and a quiescent allocator. The multi-call `alloc` and `realloc` sequences and the classed-reuse path break those assumptions.
-
-**Double or overlapping allocation** (HIGH, concurrency). `coalesce` is a safe `pub fn` on a `Sync` type and documents itself as concurrency-safe. It rebuilds every free list from the on-disk overhead words and republishes the head table, so it requires a consistent snapshot of the arena. `alloc` breaks that snapshot across two lock acquisitions. `pop_class` advances the free-list head in one gen and leaves the popped block's overhead free-tagged on disk. A separate `set` later flips the block in-use. A `coalesce` that runs between the two reads the block as free and relinks it. The claim then marks it in-use. The block is now both live and on a free list, so a later `alloc` hands it out a second time. A `coalesce` that instead merges the block into a run starting at an earlier free neighbour records one free block spanning the live block. That produces overlapping allocations.
-
-**Silent user-data corruption** (HIGH, concurrency). The `realloc` move widens this window. `alloc_raw(new_len, .., in_use=false)` stages the destination block free-tagged and already holding the copied user data, and `commit_move` flips it in-use afterward. A concurrent `coalesce` reads the staged block as free, and its `record_run` writes an `[overhead | next_free]` pair over the block's first 16 bytes. The `next_free` half lands on the first 8 payload bytes and survives `commit_move`, so the moved data is corrupt.
-
-**Silent loss of durable allocations** (HIGH). `recover` reads the first zero overhead word as a crashed tail-extend and discards `[p, EOF)` on the strength of that one word. A zero gap earlier in the arena therefore takes every live allocation beyond it. Such a gap arises with no crash from the tiling failure below. It also arises from a torn `grow_tail_inplace`, where `try_extend_zeros` commits the zeroed growth and a separate `set` records the new size. A failure of that `set` followed by continued use lets the next `alloc` extend past the zeros and leave a live block beyond the gap.
-
-**Broken arena tiling** (MEDIUM). `recover` and `coalesce` relink a non-class-size free block, such as a coalesce-merged run, onto the largest class whose size is at most the block's. The classed `alloc` path then claims and records only the class size, which leaves the block's extra bytes as an unaccounted gap of stale data. The next scan reads that gap as an overhead word and misparses it, reaching one of three ends: a zero word triggers the discard-to-EOF above, a plausible free word produces a relink that overlaps a live block, and any other word aborts the scan and leaks the arena tail.
-
-**Metadata corruption and open-time denial of service** (MEDIUM, crafted file). `recover`'s stride check is `p + size > stack_len`, where `size = word << 4` comes from disk. A release build wraps the addition, so the check passes and `p` wraps below `ARENA_START`, and the free-branch `set` then writes into the header. A debug build panics inside the automatic `recover` in `new()`, so a crafted file blocks the open.
-
-### Design
-
-Three of the four fixes are settled.
-
-**`recover` zero-word discard.** Walk `[p, EOF)` and require every overhead word to be zero before the discard. On the first non-zero word, resynchronise from that block and parse it as the next block.
-
-**Classed reuse.** On a classed `alloc` hit, read the popped block's recorded size. When it exceeds the class size, carve the remainder into its own class-sized free block. The oversized path already performs this read-and-carve. The arena then stays fully tiled.
-
-**`recover` stride.** Replace `p + size > stack_len` with `size > stack_len - p`. `coalesce` (:577, :586) and `stats_scan` (:1400) already use that form.
-
-The `coalesce` concurrency fix remains open.
-
-### Open questions
-
-**Quiescence mechanism for `coalesce`.** `coalesce` rebuilds every free list from a whole-arena snapshot, so it requires the arena to be quiescent for the full scan. A concurrent `alloc` or `realloc` breaks that by leaving a detached free-tagged block or a free-tagged staged move block on disk.
-
-(a) Mark `coalesce` `unsafe` and require the caller to guarantee quiescence, as `recover` does.
-
-(b) Hold an `AtomicBool` for the duration of `coalesce`. A concurrent `alloc` or `realloc` reads it and returns `io::ErrorKind::ResourceBusy` while it is set.
-
-(c) Fuse the `pop_class`-then-claim and `alloc_raw`-then-`commit_move` sequences each into a single gen, so the arena always presents fully claimed or fully free blocks.
-
-Shape (c) also protects a future concurrent `recover` and is the most invasive. Shapes (a) and (b) mirror the checked_slab `recover` decision and settle with it.
-
----
-
 ## `GhostTreeBstackAllocator` has no in-process poison guard after a torn tree mutation
 
 **Feature flag:** `alloc` + `set`

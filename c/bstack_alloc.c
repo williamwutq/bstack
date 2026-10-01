@@ -9284,6 +9284,10 @@ int checked_slab_bstack_allocator_stats(
 static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,3,0};
 static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
 
+/* Bytes recover's zero-run scan reads per step, into a stack buffer; a multiple
+ * of the 16-byte quantum so every chunk starts on a word boundary. */
+#define ALSG_ZERO_SCAN_CHUNK 2048
+
 #define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)
 
 /* ---- classification math (no tables, no recursion) --------------------- */
@@ -9340,6 +9344,25 @@ static inline uint64_t alsg_largest_class_le(uint64_t v)
     k = alsg_ilog2_u64(v);                           /* 2^k <= v < 2^{k+1} */
     w = UINT64_C(1) << (k - ALSG_SUBCLASS_BITS);
     return v & ~(w - 1);
+}
+
+/* Greedily decompose a free region (multiple of 16) into exact class sizes: the
+ * largest class <= the remainder, repeated; a region > MAX_CLASS is one
+ * oversized piece.  Every classed free-list block must be exactly its class
+ * size — pops claim that size without reading the block's.  Returns the piece
+ * count (<= ALSG_MAX_CARVE_PIECES). */
+static inline size_t alsg_carve_pieces(uint64_t region,
+                                       uint64_t pieces[ALSG_MAX_CARVE_PIECES])
+{
+    size_t k = 0;
+    while (region > 0 && k < ALSG_MAX_CARVE_PIECES) {
+        uint64_t ps = (region > ALSG_MAX_CLASS) ? region : alsg_largest_class_le(region);
+        pieces[k++] = ps;
+        region -= ps;
+    }
+    /* region == 0 here: a greedy carve never needs more than
+     * ALSG_MAX_CARVE_PIECES, so the cap never drops a remainder. */
+    return k;
 }
 
 /* Validate a caller data pointer and return its block base offset. */
@@ -9732,8 +9755,9 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
                              uint64_t region_start, uint64_t region_size)
 {
     struct alsg_carve_ctx c;
-    uint64_t off = region_start, rem = region_size;
-    size_t   k = 0;
+    uint64_t off = region_start;
+    uint64_t pieces[ALSG_MAX_CARVE_PIECES];
+    size_t   k = alsg_carve_pieces(region_size, pieces), i;
 
 #ifdef BSTACK_FEATURE_ATOMIC
     c.step       = 0;
@@ -9742,20 +9766,18 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
     c.prefix_len = prefix_len;
 #endif
 
-    while (rem > 0) {
-        uint64_t ps = (rem > ALSG_MAX_CLASS) ? rem : alsg_largest_class_le(rem);
-        if (k >= ALSG_MAX_CARVE_PIECES) { errno = EINVAL; return -1; }
-        c.block_offs[k] = off;
-        c.head_offs[k]  = alsg_head_off(alsg_classify(ps));
-        write_le64(c.overhead_next[k], ps >> 4);
-        write_le64(c.overhead_next[k] + 8, 0); /* next_free half will be filled in by read */
-        write_le64(c.blockoff_bytes[k], off);
-        off += ps; rem -= ps; k++;
+    for (i = 0; i < k; i++) {
+        uint64_t ps = pieces[i];
+        c.block_offs[i] = off;
+        c.head_offs[i]  = alsg_head_off(alsg_classify(ps));
+        write_le64(c.overhead_next[i], ps >> 4);
+        write_le64(c.overhead_next[i] + 8, 0); /* next_free half will be filled in by read */
+        write_le64(c.blockoff_bytes[i], off);
+        off += ps;
     }
 
 #ifndef BSTACK_FEATURE_ATOMIC
     {
-        size_t i;
         for (i = 0; i < k; i++) {
             uint8_t shared[16];
             memcpy(shared, c.overhead_next[i], 16);
@@ -9854,6 +9876,83 @@ success:
 
 /* ---- recover ----------------------------------------------------------- */
 
+/* Offset within chunk of the first non-zero overhead word (one per quantum).
+ * Returns 1 and sets *out on a hit, 0 if none. */
+static inline int alsg_nonzero_word_in_chunk(const uint8_t *chunk, size_t n,
+                                             uint64_t *out)
+{
+    size_t i, b;
+    for (i = 0; i < n; i += (size_t)ALSG_QUANTUM)
+        for (b = i; b < i + (size_t)ALSG_OVERHEAD && b < n; b++)
+            if (chunk[b]) { *out = (uint64_t)i; return 1; }
+    return 0;
+}
+
+/* alsg_scan_nonzero_word: first quantum-aligned offset in [from, end) whose
+ * overhead word is non-zero.  Sets *found and *out on a hit; *found = 0 if every
+ * such word is zero.  Reads ALSG_ZERO_SCAN_CHUNK-byte chunks (all under one
+ * bstack_get_batched_gen lock with atomic). */
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Fields ordered widest-alignment-first (byte buffer sized in multiples of 8,
+ * then u64, then size_t, then the ints) so the struct has no internal padding. */
+struct alsg_nz_ctx {
+    uint8_t  buf[ALSG_ZERO_SCAN_CHUNK];
+    uint64_t q, end, hit;
+    size_t   n;
+    int      pending, found;
+};
+
+static int alsg_nz_gen(uint64_t *out_offset, uint8_t **out_buf,
+                       size_t *out_len, void *ctxp)
+{
+    struct alsg_nz_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t i;
+        if (alsg_nonzero_word_in_chunk(c->buf, c->n, &i)) {
+            c->found = 1; c->hit = c->q + i; return 0;
+        }
+        c->q += c->n;
+    }
+    if (c->q >= c->end) return 0;
+    c->n = (c->end - c->q < ALSG_ZERO_SCAN_CHUNK) ? (size_t)(c->end - c->q)
+                                                  : ALSG_ZERO_SCAN_CHUNK;
+    c->pending  = 1;
+    *out_offset = c->q;
+    *out_buf    = c->buf;
+    *out_len    = c->n;
+    return 1;
+}
+
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t from, uint64_t end,
+                                  int *found, uint64_t *out)
+{
+    struct alsg_nz_ctx c;
+    c.q = from; c.end = end; c.hit = 0; c.n = 0; c.pending = 0; c.found = 0;
+    if (bstack_get_batched_gen(bs, alsg_nz_gen, &c)) return -1;
+    *found = c.found;
+    *out   = c.hit;
+    return 0;
+}
+#else
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t q, uint64_t end,
+                                  int *found, uint64_t *out)
+{
+    uint8_t buf[ALSG_ZERO_SCAN_CHUNK];
+    while (q < end) {
+        size_t n = (end - q < ALSG_ZERO_SCAN_CHUNK) ? (size_t)(end - q)
+                                                   : ALSG_ZERO_SCAN_CHUNK;
+        uint64_t i;
+        if (bstack_get(bs, q, q + n, buf)) return -1;
+        if (alsg_nonzero_word_in_chunk(buf, n, &i)) {
+            *found = 1; *out = q + i; return 0;
+        }
+        q += n;
+    }
+    *found = 0;
+    return 0;
+}
+#endif
+
 int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
                                         uint64_t *out_unsure)
 {
@@ -9884,29 +9983,61 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
             }
             p += size;
         } else if (word == 0) {
-            /* Zeroed tail from a crashed extend: discard it. */
-            uint64_t dn = stack_len - p;
+            /* A zero word is never a valid header (free blocks store size >> 4
+             * >= 1).  Only an all-zero run to EOF is a crashed-extend tail;
+             * otherwise a mid-arena gap would take every block after it. */
+            int found;
+            uint64_t q;
+            if (alsg_scan_nonzero_word(bs, p + ALSG_QUANTUM, stack_len, &found, &q))
+                return -1;
+            if (!found) {
+                uint64_t dn = stack_len - p;
 #if UINT64_MAX > SIZE_MAX
-            if (dn > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                if (dn > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            if (bstack_discard(bs, (size_t)dn)) return -1;
-            break;
+                if (bstack_discard(bs, (size_t)dn)) return -1;
+                break;
+            }
+            /* Resync at the next header; the gap stays leaked. */
+            unsure += (q - p) / ALSG_QUANTUM;
+            p = q;
         } else {
             /* Free: relink by the stored physical size (reclaims leaks too). */
             uint64_t size = word << 4;
-            uint64_t cc;
+            uint64_t pieces[ALSG_MAX_CARVE_PIECES], off = p;
+            uint8_t  pbuf[ALSG_MAX_CARVE_PIECES][16];
+            size_t   k, i;
             if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > stack_len - p) {
                 unsure += (stack_len - p) / ALSG_QUANTUM; break;
             }
-            /* Relink by the largest class <= size so a malformed non-class size
-             * degrades to a leak, never a head that overruns the block. */
-            cc = (size > ALSG_MAX_CLASS)
-                 ? ALSG_OVERSIZED_CLASS
-                 : alsg_classify(alsg_largest_class_le(size));
-            /* Prepend: next_free <- current head of this class, head <- p. */
-            write_le64(wbuf, heads[cc]);
-            if (bstack_set(bs, p + ALSG_OVERHEAD, wbuf, 8)) return -1;
-            heads[cc] = p;
+            /* Split a non-class size into exact class pieces, each staged as
+             * overhead || next_free <- current head of its class. */
+            k = alsg_carve_pieces(size, pieces);
+            for (i = 0; i < k; i++) {
+                uint64_t cc = alsg_classify(pieces[i]);
+                write_le64(pbuf[i], pieces[i] >> 4);
+                write_le64(pbuf[i] + 8, heads[cc]);
+                heads[cc] = off;
+                off += pieces[i];
+            }
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                /* One crash-atomic batch for all pieces. */
+                bstack_iovec_t w[ALSG_MAX_CARVE_PIECES];
+                for (i = 0, off = p; i < k; off += pieces[i], i++) {
+                    w[i].offset = off; w[i].buf = pbuf[i]; w[i].len = 16;
+                }
+                if (bstack_set_batched(bs, w, k)) return -1;
+            }
+#else
+            /* Back to front so p's header shrinks last: until then the inner
+             * headers sit inside the block it still records, so a crash leaves
+             * a valid tiling and a re-run finishes the split. */
+            for (i = k; i-- > 0;) {
+                off -= pieces[i];
+                if (bstack_set(bs, off, pbuf[i], 16)) return -1;
+            }
+#endif
             p += size;
         }
     }
@@ -9934,6 +10065,8 @@ enum alsg_co_state {
     ALSG_CO_HAVEBLOCK,/* word_buf = word@p; classify (stride / free-run start) */
     ALSG_CO_NEEDRUN,  /* issue a READ of the run's next candidate at j */
     ALSG_CO_HAVERUN,  /* word_buf = word@j; extend the run or close it */
+    ALSG_CO_NEEDGAP,  /* inside a zero gap: issue a READ of the next chunk at p */
+    ALSG_CO_HAVEGAP,  /* chunk[..gap_n] = bytes@p; resync at a header or skip on */
     ALSG_CO_FLUSH     /* scan done: drain the writes, then the head table */
 };
 
@@ -9942,40 +10075,46 @@ enum alsg_co_state {
 struct alsg_co_ctx {
     uint64_t   stack_len;                    /* length seen under the lock */
     uint64_t   p, run_start, run_size, j;    /* cursor p; run being built [run_start, j) */
-    uint64_t   fused;                        /* blocks merged into a neighbour */
+    uint64_t   fused;                        /* net drop in free blocks */
+    uint64_t   run_blocks;                   /* blocks absorbed into the run */
     uint64_t   heads[ALSG_NUM_CLASSES];      /* rebuilt head table (SENTINEL == 0) */
     const int *prev;                         /* inplace_gen prev-status */
     struct alsg_co_write *writes;            /* plan, grown during the scan */
     size_t     nwrites, cap;                 /* plan length / capacity */
     size_t     wi;                           /* next write to emit in FLUSH */
+    size_t     gap_n;                        /* bytes read into chunk */
     int        state;                        /* scan state (enum alsg_co_state) */
     uint8_t    head_bytes[ALSG_NUM_CLASSES * 8];
     uint8_t    word_buf[8];                  /* reused across strides */
+    uint8_t    chunk[ALSG_ZERO_SCAN_CHUNK];  /* zero-gap scan buffer */
 };
 
-/* Record one maximal free run as a single output free block: stage its
- * [overhead || next_free] edit at run_start and prepend it onto the class for
- * run_size (largest class <= run_size, or oversized above MAX_CLASS, so a
- * non-class merged size degrades to retained slack — the recover rule).
- * Returns 0, or -1 on allocation failure (nothing mutated). */
+/* Record one maximal free run as exact class free blocks (the recover split):
+ * stage each piece's [overhead || next_free] edit and prepend it onto its class.
+ * Counts only net merges into fused, so a run that re-splits into as many
+ * pieces as it had changes nothing.  Returns 0, or -1 on allocation failure
+ * (nothing mutated). */
 static int alsg_co_record(struct alsg_co_ctx *c)
 {
-    uint64_t cls = (c->run_size > ALSG_MAX_CLASS)
-                   ? ALSG_OVERSIZED_CLASS
-                   : alsg_classify(alsg_largest_class_le(c->run_size));
-    struct alsg_co_write *w;
-    if (c->nwrites == c->cap) {
+    uint64_t pieces[ALSG_MAX_CARVE_PIECES], off = c->run_start;
+    size_t   k = alsg_carve_pieces(c->run_size, pieces), i;
+    if (c->cap - c->nwrites < k) {
         size_t newcap = c->cap ? c->cap * 2 : 16;
         struct alsg_co_write *nw = realloc(c->writes, newcap * sizeof *nw);
         if (!nw) return -1;
         c->writes = nw;
         c->cap = newcap;
     }
-    w = &c->writes[c->nwrites++];
-    w->off = c->run_start;
-    write_le64(w->buf, c->run_size >> 4);    /* overhead: free tag | merged size */
-    write_le64(w->buf + 8, c->heads[cls]);   /* next_free <- current class head */
-    c->heads[cls] = c->run_start;
+    for (i = 0; i < k; i++) {
+        uint64_t cls = alsg_classify(pieces[i]);
+        struct alsg_co_write *w = &c->writes[c->nwrites++];
+        w->off = off;
+        write_le64(w->buf, pieces[i] >> 4);  /* overhead: free tag | piece size */
+        write_le64(w->buf + 8, c->heads[cls]); /* next_free <- current class head */
+        c->heads[cls] = off;
+        off += pieces[i];
+    }
+    if (c->run_blocks > k) c->fused += c->run_blocks - k;
     return 0;
 }
 
@@ -10014,8 +10153,12 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
 
         case ALSG_CO_HAVEBLOCK: {
             uint64_t word = read_le64(c->word_buf);
-            /* Zeroed tail from a crashed extend: stop (tail unhandled). */
-            if (word == 0) { c->state = ALSG_CO_FLUSH; continue; }
+            /* Never a valid header: skip the gap as recover does (zero to the
+             * end is a crashed-extend tail, left alone). */
+            if (word == 0) {
+                c->p += ALSG_QUANTUM;
+                c->state = ALSG_CO_NEEDGAP; continue;
+            }
             if (word & ALSG_IN_USE_BIT) {
                 uint64_t size = (word & ~ALSG_IN_USE_BIT) << 4;
                 /* Malformed: stop; the remainder leaks until a recover. */
@@ -10032,8 +10175,9 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
                     c->state = ALSG_CO_FLUSH; continue;
                 }
                 /* Free block: open a run and look ahead at the next block. */
-                c->run_start = c->p;
-                c->run_size  = size;
+                c->run_start  = c->p;
+                c->run_size   = size;
+                c->run_blocks = 1;
                 c->j = c->p + size;          /* <= stack_len by the check above */
                 c->state = ALSG_CO_NEEDRUN; continue;
             }
@@ -10062,7 +10206,7 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
                      * <= stack_len, so neither add overflows. */
                     c->run_size += s;
                     c->j += s;
-                    c->fused += 1;
+                    c->run_blocks += 1;
                     c->state = ALSG_CO_NEEDRUN; continue;
                 }
             }
@@ -10072,6 +10216,27 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
             }
             c->p = c->j;
             c->state = ALSG_CO_NEEDBLOCK; continue;
+        }
+
+        case ALSG_CO_NEEDGAP:
+            if (c->p >= c->stack_len) { c->state = ALSG_CO_FLUSH; continue; }
+            c->gap_n = (c->stack_len - c->p < ALSG_ZERO_SCAN_CHUNK)
+                       ? (size_t)(c->stack_len - c->p) : ALSG_ZERO_SCAN_CHUNK;
+            c->state = ALSG_CO_HAVEGAP;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->p; op->u.read.buf = c->chunk; op->u.read.len = c->gap_n;
+            return 1;
+
+        case ALSG_CO_HAVEGAP: {
+            uint64_t i;
+            if (alsg_nonzero_word_in_chunk(c->chunk, c->gap_n, &i)) {
+                c->p += i;                   /* resync at the next header */
+                c->state = ALSG_CO_NEEDBLOCK;
+            } else {
+                c->p += c->gap_n;
+                c->state = ALSG_CO_NEEDGAP;
+            }
+            continue;
         }
 
         case ALSG_CO_FLUSH:
@@ -10153,49 +10318,72 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * arena length it sampled. */
 #define ALSG_STATS_SHRINK_RETRIES 4
 
+/* Fields ordered widest-alignment-first (u64, then size_t, then the ints, then
+ * the byte buffers) so the struct has no internal padding. */
 struct alsg_stats_ctx {
     uint64_t scan_end;
     uint64_t p;
     uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
-    int      pending; /* word_buf holds an unprocessed read from the last call */
+    size_t   gap_n;   /* bytes read into chunk */
+    int      pending; /* the last call's read is still unprocessed */
+    int      in_gap;  /* inside a zero gap: chunk is read instead of word_buf */
     uint8_t  word_buf[8];
+    uint8_t  chunk[ALSG_ZERO_SCAN_CHUNK];
 };
 
 static int alsg_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
                           size_t *out_len, void *ctxp)
 {
     struct alsg_stats_ctx *c = ctxp;
-    if (c->pending) {
+    if (c->pending && c->in_gap) {
+        uint64_t i;
+        c->pending = 0;
+        if (alsg_nonzero_word_in_chunk(c->chunk, c->gap_n, &i)) {
+            c->p += i;                       /* resync at the next header */
+            c->in_gap = 0;
+        } else {
+            c->p += c->gap_n;
+        }
+    } else if (c->pending) {
         uint64_t word = read_le64(c->word_buf);
         uint64_t size;
         c->pending = 0;
         if (word == 0) {
-            /* Zeroed tail from a crashed extend: stop (recover and coalesce
-             * both discard/skip this the same way). */
-            c->p = c->scan_end; return 0;
-        }
-        /* size comes off disk and may be arbitrary, so the fit test is
-         * `size > scan_end - p` (no underflow: p < scan_end here) rather than
-         * `p + size`, which could overflow.  << 4 makes it a multiple of
-         * ALSG_QUANTUM, so only the lower bound is left. */
-        size = (word & ~ALSG_IN_USE_BIT) << 4;
-        if (size < ALSG_QUANTUM || size > c->scan_end - c->p) {
-            c->p = c->scan_end; return 0; /* malformed: stop the scan here */
-        }
-        if (word & ALSG_IN_USE_BIT) {
-            c->in_use_blocks++;
-            c->in_use_bytes += size;
+            /* Never a valid header: skip the gap as recover does (zero to the
+             * end is a crashed-extend tail). */
+            c->p += ALSG_QUANTUM;
+            c->in_gap = 1;
         } else {
-            c->free_blocks++;
-            c->free_bytes += size;
+            /* size comes off disk and may be arbitrary, so the fit test is
+             * `size > scan_end - p` (no underflow: p < scan_end here) rather
+             * than `p + size`, which could overflow.  << 4 makes it a multiple
+             * of ALSG_QUANTUM, so only the lower bound is left. */
+            size = (word & ~ALSG_IN_USE_BIT) << 4;
+            if (size < ALSG_QUANTUM || size > c->scan_end - c->p) {
+                c->p = c->scan_end; return 0; /* malformed: stop the scan here */
+            }
+            if (word & ALSG_IN_USE_BIT) {
+                c->in_use_blocks++;
+                c->in_use_bytes += size;
+            } else {
+                c->free_blocks++;
+                c->free_bytes += size;
+            }
+            c->p += size;
         }
-        c->p += size;
     }
     if (c->p >= c->scan_end) return 0;
     c->pending  = 1;
     *out_offset = c->p;
-    *out_buf    = c->word_buf;
-    *out_len    = 8;
+    if (c->in_gap) {
+        c->gap_n = (c->scan_end - c->p < ALSG_ZERO_SCAN_CHUNK)
+                   ? (size_t)(c->scan_end - c->p) : ALSG_ZERO_SCAN_CHUNK;
+        *out_buf = c->chunk;
+        *out_len = c->gap_n;
+    } else {
+        *out_buf = c->word_buf;
+        *out_len = 8;
+    }
     return 1;
 }
 
@@ -10493,15 +10681,29 @@ static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
 #endif
         if (grew) {
             uint64_t slack = (old_size - ALSG_OVERHEAD) - old_len;
-            if (slack > 0) {
+            int saved;
 #if UINT64_MAX > SIZE_MAX
-                if (slack > (uint64_t)SIZE_MAX) goto fail_invalid;
+            if (slack > (uint64_t)SIZE_MAX) goto fail_invalid;
 #endif
-                if (bstack_zero(bs, start + old_len, (size_t)slack)) goto fail_recover;
+            if (slack == 0 || bstack_zero(bs, start + old_len, (size_t)slack) == 0) {
+                write_le64(buf, ALSG_IN_USE_BIT | (new_size >> 4));
+                if (bstack_set(bs, block_start, buf, 8) == 0) {
+                    result.offset = start; result.len = new_len; goto success;
+                }
             }
-            write_le64(buf, ALSG_IN_USE_BIT | (new_size >> 4));
-            if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
-            result.offset = start; result.len = new_len; goto success;
+            /* Best-effort: drop the unrecorded extension, else it is a
+             * mid-arena zero gap once the next alloc extends past it. */
+            saved = errno;
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                int ok;
+                (void)bstack_try_discard(bs, old_end + delta, (size_t)delta, &ok);
+            }
+#else
+            (void)bstack_discard(bs, (size_t)delta);
+#endif
+            errno = saved;
+            goto fail_recover;
         }
         /* Not at tail: fall through to the move. */
     }
@@ -10730,13 +10932,13 @@ static int alsg_popall_gen(bstack_gen_op_t *op, void *uc)
             uint64_t word = read_le64(c->node_buf);
             uint64_t size = word << 4;
             uint64_t next;
-            /* A block on class cls's list must be free and belong on it —
-             * matching how recover() places blocks, so a non-class size relinked
-             * onto a smaller class is reused here just as alsg_pop_class reuses
-             * it.  The size >= QUANTUM guard precedes alsg_classify (which
-             * underflows on 0). */
-            if ((word & ALSG_IN_USE_BIT) || size < ALSG_QUANTUM
-                || alsg_classify(alsg_largest_class_le(size)) != (uint64_t)c->cls) {
+            /* A block on class cls's list must be free and exactly class cls's
+             * size: the claim records the class size, so a larger block would
+             * leave an untracked gap.  The bounds guards precede
+             * alsg_largest_class_le / alsg_classify. */
+            if ((word & ALSG_IN_USE_BIT) || size < ALSG_QUANTUM || size > ALSG_MAX_CLASS
+                || alsg_largest_class_le(size) != size
+                || alsg_classify(size) != (uint64_t)c->cls) {
                 c->err = EINVAL;
                 return 0;
             }
