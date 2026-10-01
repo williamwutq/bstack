@@ -576,9 +576,10 @@ leave an untracked gap that desyncs the next scan.
 a live block is strided by its **recorded physical size** (no length-to-class
 derivation); a free block is relinked by its stored size, which reclaims leaked
 blocks. A non-class size (such as a merged run) is first split by the greedy
-carve into exact class blocks, back to front so the block's own header shrinks
-last and a crash mid-split still tiles; above 4096 it goes to the oversized head
-whole. A zero overhead word is never a valid header: if every word to EOF is
+carve into exact class blocks, written as one crash-atomic `set_batched`
+(without `atomic`, back to front so the block's own header shrinks last and a
+crash mid-split still tiles); above 4096 it goes to the oversized head whole.
+A zero overhead word is never a valid header: if every word to EOF is
 zero it is a crashed `extend` tail and is discarded, otherwise the gap is left
 leaked (counted as unsure) and the scan resumes at the next header. The rebuilt
 head table is published as one crash-atomic contiguous write. The scan trusts only the overhead words and is idempotent. In-use orphans

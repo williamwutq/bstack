@@ -71,6 +71,10 @@ const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x02\x00";
 /// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
 const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
+/// Bytes `recover`'s zero-run scan reads per step, into a stack buffer; a
+/// multiple of the 16-byte quantum so every chunk starts on a word boundary.
+const ZERO_SCAN_CHUNK: usize = 2048;
+
 /// A segregated free-list allocator implementing [`BStackAllocator`] on top of a
 /// [`BStack`].
 ///
@@ -271,22 +275,59 @@ impl SegregatedBStackAllocator {
         (pieces, k)
     }
 
+    /// Offset within `chunk` of the first non-zero overhead word (one per
+    /// quantum), if any.
+    #[inline]
+    fn first_nonzero_word(chunk: &[u8]) -> Option<u64> {
+        chunk
+            .chunks(Self::QUANTUM as usize)
+            .position(|w| w.iter().take(Self::OVERHEAD as usize).any(|&b| b != 0))
+            .map(|i| i as u64 * Self::QUANTUM)
+    }
+
     /// First quantum-aligned offset in `[from, end)` whose overhead word is
-    /// non-zero, or `None` if every such word is zero. Reads in chunks.
-    fn next_nonzero_word(&self, mut from: u64, end: u64) -> io::Result<Option<u64>> {
-        const CHUNK: u64 = 64 * 1024; // a multiple of QUANTUM
-        let mut buf = vec![0u8; CHUNK.min(end.saturating_sub(from)) as usize];
-        while from < end {
-            let n = CHUNK.min(end - from);
-            let chunk = &mut buf[..n as usize];
-            self.stack.get_into(from, chunk)?;
-            let hit = chunk
-                .chunks(Self::QUANTUM as usize)
-                .position(|w| w.iter().take(Self::OVERHEAD as usize).any(|&b| b != 0));
-            if let Some(i) = hit {
-                return Ok(Some(from + i as u64 * Self::QUANTUM));
+    /// non-zero, or `None` if every such word is zero. Reads
+    /// `ZERO_SCAN_CHUNK`-byte chunks, all under one [`BStack::get_batched_gen`] lock.
+    #[cfg(feature = "atomic")]
+    fn next_nonzero_word(&self, from: u64, end: u64) -> io::Result<Option<u64>> {
+        let mut buf = [0u8; ZERO_SCAN_CHUNK];
+        let mut q = from;
+        let mut n = 0usize;
+        let mut hit = None;
+        // Set once a read has been issued; the next call checks what it filled.
+        let mut pending = false;
+        self.stack.get_batched_gen(|| {
+            if pending {
+                if let Some(i) = Self::first_nonzero_word(&buf[..n]) {
+                    hit = Some(q + i);
+                    return None;
+                }
+                q += n as u64;
             }
-            from += n;
+            if q >= end {
+                return None;
+            }
+            n = (end - q).min(ZERO_SCAN_CHUNK as u64) as usize;
+            pending = true;
+            // SAFETY: `buf` outlives this call.
+            Some((q, bstack_unsafe_reborrow_mut!(&mut buf[..n])))
+        })?;
+        Ok(hit)
+    }
+
+    /// First quantum-aligned offset in `[from, end)` whose overhead word is
+    /// non-zero, or `None` if every such word is zero. Reads
+    /// `ZERO_SCAN_CHUNK`-byte chunks.
+    #[cfg(not(feature = "atomic"))]
+    fn next_nonzero_word(&self, mut q: u64, end: u64) -> io::Result<Option<u64>> {
+        let mut buf = [0u8; ZERO_SCAN_CHUNK];
+        while q < end {
+            let n = (end - q).min(ZERO_SCAN_CHUNK as u64) as usize;
+            self.stack.get_into(q, &mut buf[..n])?;
+            if let Some(i) = Self::first_nonzero_word(&buf[..n]) {
+                return Ok(Some(q + i));
+            }
+            q += n as u64;
         }
         Ok(None)
     }
@@ -464,21 +505,29 @@ impl SegregatedBStackAllocator {
                     unsure += (stack_len - p) / Self::QUANTUM;
                     break;
                 }
-                // Split a non-class size into exact class pieces. Link back to
-                // front so `p`'s header shrinks last: until then the inner
-                // headers sit inside the block it still records, so a crash
-                // leaves a valid tiling and a re-run finishes the split.
+                // Split a non-class size into exact class pieces, each staged
+                // as overhead ‖ next_free ← current head of its class.
                 let (pieces, k) = Self::carve_pieces(size);
-                let mut off = p + size;
-                for &ps in pieces[..k].iter().rev() {
-                    off -= ps;
+                let mut writes = [(0u64, [0u8; 16]); Self::MAX_CARVE_PIECES];
+                let mut off = p;
+                for (w, &ps) in writes.iter_mut().zip(&pieces[..k]) {
                     let c = Self::classify(ps) as usize;
-                    // overhead ‖ next_free ← current head of this class.
-                    let mut buf = [0u8; 16];
-                    write_buf!(ps >> 4 => buf, 0);
-                    write_buf!(heads[c] => buf, 8);
-                    self.stack.set(off, buf)?;
+                    write_buf!(ps >> 4 => w.1, 0);
+                    write_buf!(heads[c] => w.1, 8);
+                    w.0 = off;
                     heads[c] = off;
+                    off += ps;
+                }
+                // One crash-atomic batch for all pieces.
+                #[cfg(feature = "atomic")]
+                self.stack
+                    .set_batched(writes[..k].iter().map(|(o, b)| (*o, b)))?;
+                // Back to front so `p`'s header shrinks last: until then the
+                // inner headers sit inside the block it still records, so a
+                // crash leaves a valid tiling and a re-run finishes the split.
+                #[cfg(not(feature = "atomic"))]
+                for (o, b) in writes[..k].iter().rev() {
+                    self.stack.set(*o, b)?;
                 }
                 p += size;
             }
