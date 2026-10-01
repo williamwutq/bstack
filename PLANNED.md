@@ -110,88 +110,6 @@ Free-block adjacency is only observable by striding the arena, so `coalescible()
 
 ---
 
-## `SegregatedBStackAllocator` whole-arena scan/rebuild trusts a consistent, quiescent arena
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** Only if `coalesce` is made `unsafe` (an API break); the window-fusing alternative and the `recover` / tiling / stride fixes are internal, with no on-disk format change.
-**Impact:** HIGH
-
-### Motivation
-
-`recover` and `coalesce` scan the whole arena and rebuild the free lists. Both assume a consistent tiling and a quiescent allocator. The multi-call `alloc` and `realloc` sequences and the classed-reuse path break those assumptions.
-
-**Double or overlapping allocation** (HIGH, concurrency). `coalesce` is a safe `pub fn` on a `Sync` type and documents itself as concurrency-safe. It rebuilds every free list from the on-disk overhead words and republishes the head table, so it requires a consistent snapshot of the arena. `alloc` breaks that snapshot across two lock acquisitions. `pop_class` advances the free-list head in one gen and leaves the popped block's overhead free-tagged on disk. A separate `set` later flips the block in-use. A `coalesce` that runs between the two reads the block as free and relinks it. The claim then marks it in-use. The block is now both live and on a free list, so a later `alloc` hands it out a second time. A `coalesce` that instead merges the block into a run starting at an earlier free neighbour records one free block spanning the live block. That produces overlapping allocations.
-
-**Silent user-data corruption** (HIGH, concurrency). The `realloc` move widens this window. `alloc_raw(new_len, .., in_use=false)` stages the destination block free-tagged and already holding the copied user data, and `commit_move` flips it in-use afterward. A concurrent `coalesce` reads the staged block as free, and its `record_run` writes an `[overhead | next_free]` pair over the block's first 16 bytes. The `next_free` half lands on the first 8 payload bytes and survives `commit_move`, so the moved data is corrupt.
-
-**Silent loss of durable allocations** (HIGH). `recover` reads the first zero overhead word as a crashed tail-extend and discards `[p, EOF)` on the strength of that one word. A zero gap earlier in the arena therefore takes every live allocation beyond it. Such a gap arises with no crash from the tiling failure below. It also arises from a torn `grow_tail_inplace`, where `try_extend_zeros` commits the zeroed growth and a separate `set` records the new size. A failure of that `set` followed by continued use lets the next `alloc` extend past the zeros and leave a live block beyond the gap.
-
-**Broken arena tiling** (MEDIUM). `recover` and `coalesce` relink a non-class-size free block, such as a coalesce-merged run, onto the largest class whose size is at most the block's. The classed `alloc` path then claims and records only the class size, which leaves the block's extra bytes as an unaccounted gap of stale data. The next scan reads that gap as an overhead word and misparses it, reaching one of three ends: a zero word triggers the discard-to-EOF above, a plausible free word produces a relink that overlaps a live block, and any other word aborts the scan and leaks the arena tail.
-
-**Metadata corruption and open-time denial of service** (MEDIUM, crafted file). `recover`'s stride check is `p + size > stack_len`, where `size = word << 4` comes from disk. A release build wraps the addition, so the check passes and `p` wraps below `ARENA_START`, and the free-branch `set` then writes into the header. A debug build panics inside the automatic `recover` in `new()`, so a crafted file blocks the open.
-
-### Design
-
-Three of the four fixes are settled.
-
-**`recover` zero-word discard.** Walk `[p, EOF)` and require every overhead word to be zero before the discard. On the first non-zero word, resynchronise from that block and parse it as the next block.
-
-**Classed reuse.** On a classed `alloc` hit, read the popped block's recorded size. When it exceeds the class size, carve the remainder into its own class-sized free block. The oversized path already performs this read-and-carve. The arena then stays fully tiled.
-
-**`recover` stride.** Replace `p + size > stack_len` with `size > stack_len - p`. `coalesce` (:577, :586) and `stats_scan` (:1400) already use that form.
-
-The `coalesce` concurrency fix remains open.
-
-### Open questions
-
-**Quiescence mechanism for `coalesce`.** `coalesce` rebuilds every free list from a whole-arena snapshot, so it requires the arena to be quiescent for the full scan. A concurrent `alloc` or `realloc` breaks that by leaving a detached free-tagged block or a free-tagged staged move block on disk.
-
-(a) Mark `coalesce` `unsafe` and require the caller to guarantee quiescence, as `recover` does.
-
-(b) Hold an `AtomicBool` for the duration of `coalesce`. A concurrent `alloc` or `realloc` reads it and returns `io::ErrorKind::ResourceBusy` while it is set.
-
-(c) Fuse the `pop_class`-then-claim and `alloc_raw`-then-`commit_move` sequences each into a single gen, so the arena always presents fully claimed or fully free blocks.
-
-Shape (c) also protects a future concurrent `recover` and is the most invasive. Shapes (a) and (b) mirror the checked_slab `recover` decision and settle with it.
-
----
-
-## `CheckedSlabBStackAllocator` safe `recover()` treats in-flight states as leaks
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** Only if `recover` is made `unsafe` (an API break); the `AtomicBool` + `ResourceBusy` alternative is internal, with no on-disk format change.
-**Impact:** HIGH
-
-### Motivation
-
-`recover` is a safe `pub fn`. Its documentation permits overlap with a concurrent `alloc` or `dealloc` and grounds correctness on one claim: a reclaimed block is reachable by neither the free list nor a live handle, so its state holds between the scan and the splice.
-
-The multi-call windows break that claim. Each leaves a block that is zero-tagged and absent from the free list. That is the exact shape `recover` treats as a reclaimable leak, yet the mutator's next call changes it. Three windows exist.
-
-In `alloc`, the pop gen runs before the claim `set`. A `recover` between them splices the detached block back onto the free list. The claim then marks it in-use. The block is now live and free-listed, so a later `alloc` doubles it.
-
-Also in `alloc`, the tail `extend` runs before `write_overhead`. A `recover` between them splices the fresh zero blocks as free. The overhead write then forms an in-use block that contains those free-list nodes, so allocations overlap.
-
-In `dealloc`, `write_free_run` runs before the `cross_exchange`. A `recover` between them splices the same blocks that `dealloc` then splices again. That forms a doubly linked list or a cycle.
-
-The internal Mutex serialises `recover` against itself alone. `alloc` and `dealloc` run without it. This is the same class as segregated's `coalesce` race.
-
-### Design
-
-Each splice is one `cross_exchange` and is atomic on its own. The leak-shaped states persist across the whole scan, so the fix must make the entire scan exclusive of any in-flight `alloc` or `dealloc` sequence. Segregated already takes this stance: its `recover` is `unsafe` and requires quiescence. The mechanism is the open question below.
-
-### Open questions
-
-**Quiescence mechanism.**
-
-(a) Mark `recover` `unsafe` and require the caller to guarantee no concurrent `alloc` or `dealloc`, for example by running it right after `open` and before the handle is shared. This carries zero runtime cost and matches segregated.
-
-(b) Hold an `AtomicBool` for the duration of `recover`. `alloc` and `dealloc` read it on entry and return `io::ErrorKind::ResourceBusy` while it is set. This keeps `recover` safe at the cost of one atomic load per operation and a transient error the caller retries.
-
-Both shapes avoid a shared lock across `alloc` and `dealloc`. Shape (b) raises two follow-ups: whether it also guards the non-`atomic` `recover`, and whether `alloc` and `dealloc` surface `ResourceBusy` or retry internally. Settle with segregated's `coalesce`.
-
----
-
 ## `GhostTreeBstackAllocator` has no in-process poison guard after a torn tree mutation
 
 **Feature flag:** `alloc` + `set`
@@ -584,3 +502,69 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 - **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
 - **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
 - **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
+
+---
+
+## Avoidable I/O in `BStackSlice` and `BStackChunk` operations
+
+**Feature flag:** `alloc` + `atomic`.
+**Breaking change:** No.
+
+### Motivation
+
+Several `BStackSlice` and `BStackChunk` operations are correct but inefficient. The affected groups are:
+
+- Searching a slice (`contains`, `find`, `rfind`, `position`, `rposition`).
+- Mutations that turn out to be no-ops.
+- Reading a slice to its end through `io::Read`.
+- The out-of-core sort and select engine behind `sort_partial_by` and `select_nth_partial_by`.
+
+Durable commits are fsync-bound and slices can be large, so avoidable commits, reads and buffers cost real time and memory. Each item can be fixed independently and the results stay the same.
+
+### Design
+
+Only the `atomic` build changes. The `not(atomic)` paths stay as they are because restructuring them would give up the atomic-snapshot guarantee.
+
+#### Windowed slice scans
+
+`contains`, `find`, `rfind`, `position` and `rposition` read the whole slice into a `Vec` before scanning, so a hit at byte 0 still costs O(len) I/O and memory. Under `atomic`, scan in fixed windows inside one `get_batched_gen` call, as `BStackChunk::binary_search_by` does. The scan exits on the first hit and memory is bounded by the window. The single shared lock keeps the snapshot consistency of the current whole-slice read. `rfind` and `rposition` walk the windows from the end.
+
+#### No-op early-outs
+
+Each of these commits a durable operation that changes nothing. Return before the commit, using the check `BStackSlice::swap` already has for `self.start() == other.start()`.
+
+- `copy_from_bstack_slice` with identical source and destination.
+- `copy_within` with `src_range.start == dest`.
+- `BStackSlice::reverse` with `len < 2`, and `rotate_left`/`rotate_right` by `0` or `len`. Each reads and rewrites the whole region.
+- The `BStackChunk` equivalents of the previous item, with `chunk_count() < 2` or a no-op `k`.
+- `BStackChunk::sort_by`, `sort_by_key` and `select_nth_by*` with `chunk_count() <= 1`. They return early only inside the `process` closure, after the I/O.
+
+#### `BStackSliceReader::read_to_end`
+
+The std default issues repeated small reads with a growing probe buffer, so a large slice becomes many `get_into` calls. Override it to read the remaining `len - cursor` bytes in one `get` and advance the cursor to the end. `read_to_string` routes through it.
+
+#### `Records::reverse` and `rotate`
+
+Each record moves through its own durable `cross_exchange`, so rotating n records costs about n commits. `imerge` calls `rotate` on spans that are often far below `SORT_BUDGET`. When the span fits the budget, do the whole reversal or rotation in one `process` call. Larger spans keep the swap-per-record path.
+
+#### `Records::partition`
+
+It reads one record per step and swaps each record that compares less than the pivot, one durable swap each. It is Lomuto partitioning with a strict `<`, so a range of equal keys shrinks by one record per round, which is O(n²) reads in `select_nth_partial_by`. Replace it with two changes:
+
+- Read and permute budget-sized windows with `process`, instead of per-record reads and swaps.
+- Use a three-way partition, so records equal to the pivot are excluded from the next round.
+
+This is the largest change here. Benchmark it against the current Lomuto loop on a duplicate-heavy input before it replaces it.
+
+### Open questions
+
+- **Window size for scans.** `get_batched_gen` holds one lock for the whole scan, so the window size only trades read calls against buffer size. Options:
+  - Reuse `BULK_READ_BUDGET` (512 bytes) on the stack. This costs one read per 512 bytes.
+  - A larger scan-specific buffer on the stack.
+  - A constant-size heap buffer. This is still better than the current whole-slice `Vec`.
+  - A thread-local static buffer.
+- **Scanning the locked region in place.** Bytes in `[0, locked_len())` are immutable, and a cached stack (`open_cached`) mirrors them in an in-memory buffer. `get` and `get_into` already bypass the `RwLock` for ranges inside it. A scan or search whose range lies entirely inside the locked region could use a separate crate-internal `BStack` primitive instead of `get_batched_gen`, which keeps its single read lock for atomicity:
+  - On a cached stack, lend the cache buffer to the scanner with no copy and no window.
+  - On an uncached stack, `pread` windows with no lock, since immutability already gives the snapshot guarantee.
+
+  Ranges that reach past the locked region use `get_batched_gen` as designed above. Holding the cache `Mutex` for a whole scan would block other cached readers, which `get` avoids by copying out under it briefly.

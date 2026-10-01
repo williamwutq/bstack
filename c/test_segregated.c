@@ -1458,6 +1458,131 @@ static int test_stats_survives_concurrent_tail_discard(void)
     sg_unlink(tmp); return 0;
 }
 
+/* ---- coalesce excludes mutators ------------------------------------- */
+
+static int test_mutators_refuse_while_coalescing(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, out, bulk[1];
+    uint64_t len8 = 8, unsure = 999;
+    CHECK(bstack_allocator_alloc(base, 100, &s) == 0);
+
+    atomic_store(&a->coalescing, 1);
+    errno = 0;
+    CHECK(bstack_allocator_alloc(base, 8, &out) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_alloc_bulk(base, &len8, 1, bulk) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_realloc(base, s, 500, &out) == -1 && errno == EBUSY);
+    CHECK(out.offset == s.offset && out.len == s.len);
+    errno = 0;
+    CHECK(bstack_allocator_dealloc(base, s) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_dealloc_bulk(base, &s, 1) == -1 && errno == EBUSY);
+    atomic_store(&a->coalescing, 0);
+
+    CHECK(atomic_load(&a->in_flight) == 0);
+    CHECK(bstack_allocator_dealloc(base, s) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+#define SG_CO_THREADS 4
+#define SG_CO_ITERS   200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid, ok;
+    pthread_mutex_t    *live_lock;
+    uint64_t           *live;  /* one live offset per thread, 0 = none */
+    volatile int       *done;
+} sg_co_arg_t;
+
+static void sg_co_body(sg_co_arg_t *w)
+{
+    uint8_t wbuf[100], rbuf[100];
+    int i, t, r;
+    memset(wbuf, (uint8_t)w->tid, sizeof wbuf);
+    w->ok = 1;
+    for (i = 0; i < SG_CO_ITERS; i++) {
+        /* Two sizes so freed neighbours give coalesce work. */
+        uint64_t len = (i % 2 == 0) ? 100 : 24;
+        bstack_slice_t s;
+        while ((r = bstack_allocator_alloc(w->a, len, &s)) != 0 && errno == EBUSY) {}
+        if (r) { w->ok = 0; return; }
+
+        pthread_mutex_lock(w->live_lock);
+        for (t = 0; t < SG_CO_THREADS; t++)
+            if (w->live[t] == s.offset) w->ok = 0;   /* handed out twice */
+        w->live[w->tid] = s.offset;
+        pthread_mutex_unlock(w->live_lock);
+        if (!w->ok) return;
+
+        if (bstack_slice_write(s, wbuf, (size_t)len) || bstack_slice_read(s, rbuf)
+            || memcmp(wbuf, rbuf, (size_t)len)) {
+            w->ok = 0; return;
+        }
+
+        pthread_mutex_lock(w->live_lock);
+        w->live[w->tid] = 0;
+        pthread_mutex_unlock(w->live_lock);
+
+        while ((r = bstack_allocator_dealloc(w->a, s)) != 0 && errno == EBUSY) {}
+        if (r) { w->ok = 0; return; }
+    }
+}
+
+static void *sg_co_worker(void *raw)
+{
+    sg_co_arg_t *w = raw;
+    sg_co_body(w);
+    __atomic_fetch_add((int *)w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* coalesce racing alloc/dealloc used to relink a popped-but-unclaimed block,
+ * handing it to two callers. */
+static int test_concurrent_coalesce_never_doubles_blocks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t        live[SG_CO_THREADS] = {0};
+    volatile int    done = 0;
+    pthread_t       threads[SG_CO_THREADS];
+    sg_co_arg_t     args[SG_CO_THREADS];
+    int i, coalesce_ok = 1;
+    uint64_t unsure = 999;
+
+    for (i = 0; i < SG_CO_THREADS; i++) {
+        args[i].a = (bstack_allocator_t *)a; args[i].tid = i; args[i].ok = 1;
+        args[i].live_lock = &live_lock; args[i].live = live; args[i].done = &done;
+        pthread_create(&threads[i], NULL, sg_co_worker, &args[i]);
+    }
+    while (__atomic_load_n((int *)&done, __ATOMIC_ACQUIRE) < SG_CO_THREADS)
+        if (segregated_bstack_allocator_coalesce(a, NULL) != 0) coalesce_ok = 0;
+    for (i = 0; i < SG_CO_THREADS; i++) pthread_join(threads[i], NULL);
+    CHECK(coalesce_ok);
+    for (i = 0; i < SG_CO_THREADS; i++) CHECK(args[i].ok);
+
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1509,6 +1634,8 @@ int main(void)
     T(test_stats_oversized_block_counts_physical_size);
     T(test_stats_clamps_tail_that_is_not_a_whole_quantum);
     T(test_stats_survives_concurrent_tail_discard);
+    T(test_mutators_refuse_while_coalescing);
+    T(test_concurrent_coalesce_never_doubles_blocks);
 #endif
 
     printf("\n%d/%d tests passed\n", g_passed, g_total);

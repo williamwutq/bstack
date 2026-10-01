@@ -59,15 +59,16 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(feature = "atomic"))]
 use std::marker::PhantomData;
+#[cfg(feature = "atomic")]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{fmt, io};
 
-/// Magic: `ALSG` + major 0 + minor 2 + patch 2; the version encodes the fixed
+/// Magic: `ALSG` + major 0 + minor 2 + patch 3; the version encodes the fixed
 /// class scheme and the in-use overhead recording the block's physical size
 /// (minor 1 recorded the caller's length instead — a minor-`\x01` file fails
-/// `new` with `InvalidData`). The patch byte stamps the writer (bumped `\x01` →
-/// `\x02` at the 0.4.5 stabilisation); it is not checked on open, so `\x01` and
-/// `\x02` files interoperate.
-const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x02\x00";
+/// `new` with `InvalidData`). The patch byte stamps the writer. It is not
+/// checked on open, so all minor-2 files interoperate.
+const ALSG_MAGIC: [u8; 8] = *b"ALSG\x00\x02\x03\x00";
 /// Compatibility prefix checked on open (`ALSG` + major 0 + minor 2).
 const ALSG_MAGIC_PREFIX: [u8; 6] = *b"ALSG\x00\x02";
 
@@ -82,7 +83,7 @@ const ZERO_SCAN_CHUNK: usize = 2048;
 ///
 /// ```text
 /// offset  0  reserved (user)                24 B
-/// offset 24  magic  "ALSG\x00\x02\x02\x00"   8 B
+/// offset 24  magic  "ALSG\x00\x02\x03\x00"   8 B
 /// offset 32  _reserved                       8 B
 /// offset 40  free_head[NUM_CLASSES] : u64          # last entry = oversized list
 /// arena start (16-B aligned; header ends 16-aligned already)
@@ -113,6 +114,8 @@ const ZERO_SCAN_CHUNK: usize = 2048;
 /// dependent read/modify/write, so no allocator-level lock is taken.
 /// [`recover`](Self::recover) is the one exception — it is `unsafe` and shifts the
 /// no-concurrent-access obligation to the caller (see its `# Safety`).
+/// [`coalesce`](Self::coalesce) is exclusive: while it runs, every mutator fails
+/// with [`io::ErrorKind::ResourceBusy`].
 ///
 /// Without `atomic` the type is `!Sync` (this fails to compile); with `atomic`
 /// it is `Sync` via its [`BStack`] (this compiles):
@@ -125,8 +128,44 @@ const ZERO_SCAN_CHUNK: usize = 2048;
 #[cfg(feature = "set")]
 pub struct SegregatedBStackAllocator {
     stack: BStack,
+    /// Set while [`coalesce`](Self::coalesce) runs; mutators refuse with
+    /// `ResourceBusy`. Required: the scan misreads an in-flight op's detached
+    /// free-tagged block as free and relinks it (double allocation).
+    #[cfg(feature = "atomic")]
+    coalescing: AtomicBool,
+    /// Mutators in flight; `coalesce` waits for it to drain. The flag alone
+    /// misses an op that checked it just before `coalesce` set it.
+    #[cfg(feature = "atomic")]
+    in_flight: AtomicUsize,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
+}
+
+/// Holds one [`in_flight`](SegregatedBStackAllocator::in_flight) count.
+#[cfg(feature = "atomic")]
+struct OpGuard<'a>(&'a AtomicUsize);
+
+#[cfg(feature = "atomic")]
+impl Drop for OpGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(feature = "atomic"))]
+struct OpGuard<'a>(PhantomData<&'a ()>);
+
+/// Clears [`coalescing`](SegregatedBStackAllocator::coalescing) on every exit.
+#[cfg(feature = "atomic")]
+struct CoalesceGuard<'a>(&'a AtomicBool);
+
+#[cfg(feature = "atomic")]
+impl Drop for CoalesceGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// `Sync` is removed deliberately by `_not_sync`; `RefUnwindSafe` is collateral.
@@ -380,6 +419,10 @@ impl SegregatedBStackAllocator {
             let _ = stack.extend_sparse(hdr, Self::ARENA_START)?;
             return Ok(Self {
                 stack,
+                #[cfg(feature = "atomic")]
+                coalescing: AtomicBool::new(false),
+                #[cfg(feature = "atomic")]
+                in_flight: AtomicUsize::new(0),
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
@@ -415,6 +458,10 @@ impl SegregatedBStackAllocator {
         }
         let allocator = Self {
             stack,
+            #[cfg(feature = "atomic")]
+            coalescing: AtomicBool::new(false),
+            #[cfg(feature = "atomic")]
+            in_flight: AtomicUsize::new(0),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
@@ -578,11 +625,18 @@ impl SegregatedBStackAllocator {
     /// wholesale rebuild `recover` uses, which needs no per-block unlink).
     ///
     /// Unlike `recover`, this is a safe method: the whole scan-and-rewrite runs
-    /// inside a single [`BStack::inplace_gen`], which strides the overhead words
-    /// one at a time under the held write lock and accumulates the merges, so a
-    /// concurrent `alloc`/`dealloc` can neither observe an intermediate state nor
-    /// be clobbered. The batch commits crash-atomically; a torn commit re-parses
-    /// as a valid arena and is reclaimed by `recover`, so the pass is restartable.
+    /// inside a single [`BStack::inplace_gen`] under the held write lock, and the
+    /// batch commits crash-atomically; a torn commit re-parses as a valid arena
+    /// and is reclaimed by `recover`, so the pass is restartable.
+    ///
+    /// # Concurrency
+    ///
+    /// An in-flight `alloc`/`realloc` passes through states (a detached or staged
+    /// block still free-tagged) that the scan would relink, so `coalesce` excludes
+    /// mutators for the whole call: it waits for in-flight ones to finish, and any
+    /// mutator entered meanwhile (including the bulk, `_uninit` and in-place
+    /// variants) fails with [`io::ErrorKind::ResourceBusy`] and may be retried.
+    /// Concurrent `coalesce` calls run one at a time.
     /// A run reaching the tail is merged like any other — tail discard is not
     /// attempted.
     ///
@@ -591,6 +645,22 @@ impl SegregatedBStackAllocator {
     /// Requires `atomic` (the merge rides [`BStack::inplace_gen`]).
     #[cfg(feature = "atomic")]
     pub fn coalesce(&self) -> io::Result<u64> {
+        // Exclude mutators for the whole scan: an in-flight op's detached
+        // free-tagged block reads as free. Taken by CAS so a second `coalesce`
+        // waits rather than clearing this one's flag. SeqCst pairs with
+        // `enter_op` (store flag, then load count).
+        while self
+            .coalescing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        let _coalescing = CoalesceGuard(&self.coalescing);
+        while self.in_flight.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+
         // Cheap pre-check to skip the gen on an obviously-empty arena; the length
         // is re-read under the write lock inside the gen (it may be stale here).
         if self.stack.len()? <= Self::ARENA_START {
@@ -1333,6 +1403,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
     /// fresh class block; oversized requests reuse an exact-size head or extend.
     #[inline]
     fn alloc(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        let _op = self.enter_op()?;
         self.alloc_impl(len, true)
     }
 
@@ -1361,6 +1432,7 @@ impl BStackAllocator for SegregatedBStackAllocator {
         slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // `realloc_impl` takes the `enter_op` guard itself.
         self.realloc_impl(slice, new_len, true)
     }
 
@@ -1381,58 +1453,11 @@ impl BStackAllocator for SegregatedBStackAllocator {
         slice: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
         let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::dealloc")?;
-        let start = slice.start();
-        let len = slice.len();
-        if slice.is_empty() {
-            return Ok(());
-        }
-        // Set once a free-list splice is attempted: a torn/failed atomic push
-        // must not hand back a handle that could double-free.
-        let mut lost = false;
-        let result = (|| -> io::Result<()> {
-            let block_start = Self::block_start_of(start)?;
-            let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
-            if word & Self::IN_USE_BIT == 0 {
-                return Err(io_error!(
-                    InvalidInput,
-                    "double free: block is already free"
-                ));
-            }
-            let size = (word & !Self::IN_USE_BIT) << 4;
-            if Self::phys_need(len)? > size {
-                return Err(io_error!(InvalidInput, "cannot free a mismatched slice"));
-            }
-            let class = Self::classify(size);
-
-            if size > Self::MAX_CLASS {
-                let end = block_start
-                    .checked_add(size)
-                    .ok_or_else(|| io_error!(InvalidInput, "block end overflows u64"))?;
-                // Oversized tail block: hand its bytes back to the stack instead of
-                // the free list. Under `atomic`, `try_discard` fuses the tail check
-                // and the drop; otherwise check `len` then `discard`.
-                #[cfg(feature = "atomic")]
-                if self.stack.try_discard(end, size)? {
-                    return Ok(());
-                }
-                #[cfg(not(feature = "atomic"))]
-                if end == self.stack.len()? {
-                    self.stack.discard(size)?;
-                    return Ok(());
-                }
-            }
-            lost = true;
-            self.push(block_start, size, class)
-        })();
-        result.map_err(|source| BStackAllocError {
-            source,
-            handle: if lost {
-                None
-            } else {
-                // SAFETY: (start, len) still describes the caller's live block.
-                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
-            },
-        })
+        let _op = match self.enter_op() {
+            Ok(op) => op,
+            Err(source) => return Err(BStackAllocError::with_handle(source, slice)),
+        };
+        self.dealloc_impl(slice)
     }
 }
 
@@ -2004,6 +2029,7 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
         if lengths.is_empty() {
             return Ok(Vec::new());
         }
+        let _op = self.enter_op()?;
         let n = lengths.len();
         let num = Self::NUM_CLASSES as usize;
 
@@ -2254,6 +2280,10 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
     ) -> Result<(), BStackBulkAllocError<'a, Self>> {
         let slices: Vec<BStackOwnedSlice<'a, Self>> = handles.into_iter().collect();
         let slices = ensure_own_handles(self, slices, "SegregatedBStackAllocator::dealloc_bulk")?;
+        let _op = match self.enter_op() {
+            Ok(op) => op,
+            Err(source) => return Err(BStackBulkAllocError::with_handles(source, slices)),
+        };
 
         let mut freeing = false;
         let result = (|| -> io::Result<()> {
@@ -2394,6 +2424,90 @@ impl BStackBulkAllocator for SegregatedBStackAllocator {
 /// live block's payload.
 #[cfg(feature = "set")]
 impl SegregatedBStackAllocator {
+    /// Register a public mutator for the rest of its scope, or fail with
+    /// [`io::ErrorKind::ResourceBusy`] while [`coalesce`](Self::coalesce) runs.
+    /// Internal paths must not call it (a nested call could fail mid-op).
+    #[cfg(feature = "atomic")]
+    #[inline]
+    fn enter_op(&self) -> io::Result<OpGuard<'_>> {
+        // Increment before checking (SeqCst): `coalesce` then either sees the
+        // count or we see its flag.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let guard = OpGuard(&self.in_flight);
+        if self.coalescing.load(Ordering::SeqCst) {
+            return Err(io_error!(ResourceBusy, "coalesce is in progress; retry"));
+        }
+        Ok(guard)
+    }
+
+    /// Non-`atomic` builds have no `coalesce` and are `!Sync`.
+    #[cfg(not(feature = "atomic"))]
+    #[inline]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn enter_op(&self) -> io::Result<OpGuard<'_>> {
+        Ok(OpGuard(PhantomData))
+    }
+
+    /// Body of [`dealloc`](BStackAllocator::dealloc), for internal callers
+    /// already inside [`enter_op`](Self::enter_op).
+    fn dealloc_impl<'a>(
+        &'a self,
+        slice: BStackOwnedSlice<'a, Self>,
+    ) -> Result<(), BStackAllocError<'a, Self>> {
+        let start = slice.start();
+        let len = slice.len();
+        if slice.is_empty() {
+            return Ok(());
+        }
+        // Set once a free-list splice is attempted: a torn/failed atomic push
+        // must not hand back a handle that could double-free.
+        let mut lost = false;
+        let result = (|| -> io::Result<()> {
+            let block_start = Self::block_start_of(start)?;
+            let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
+            if word & Self::IN_USE_BIT == 0 {
+                return Err(io_error!(
+                    InvalidInput,
+                    "double free: block is already free"
+                ));
+            }
+            let size = (word & !Self::IN_USE_BIT) << 4;
+            if Self::phys_need(len)? > size {
+                return Err(io_error!(InvalidInput, "cannot free a mismatched slice"));
+            }
+            let class = Self::classify(size);
+
+            if size > Self::MAX_CLASS {
+                let end = block_start
+                    .checked_add(size)
+                    .ok_or_else(|| io_error!(InvalidInput, "block end overflows u64"))?;
+                // Oversized tail block: hand its bytes back to the stack instead of
+                // the free list. Under `atomic`, `try_discard` fuses the tail check
+                // and the drop; otherwise check `len` then `discard`.
+                #[cfg(feature = "atomic")]
+                if self.stack.try_discard(end, size)? {
+                    return Ok(());
+                }
+                #[cfg(not(feature = "atomic"))]
+                if end == self.stack.len()? {
+                    self.stack.discard(size)?;
+                    return Ok(());
+                }
+            }
+            lost = true;
+            self.push(block_start, size, class)
+        })();
+        result.map_err(|source| BStackAllocError {
+            source,
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, len) still describes the caller's live block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
+            },
+        })
+    }
+
     /// Shared body of [`alloc`](BStackAllocator::alloc) and
     /// [`alloc_uninit`](BStackUninitAllocator::alloc_uninit); the two differ only
     /// in the length of the claim buffer [`alloc_raw`](Self::alloc_raw) writes.
@@ -2424,6 +2538,11 @@ impl SegregatedBStackAllocator {
         init: bool,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
         let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::realloc")?;
+        // Unlike `alloc_impl`/`dealloc_impl`, this takes the `enter_op` guard itself.
+        let _op = match self.enter_op() {
+            Ok(op) => op,
+            Err(source) => return Err(BStackAllocError::with_handle(source, slice)),
+        };
         if slice.is_empty() {
             // Nothing backs an empty handle: realloc is just a fresh alloc.
             return self.alloc_impl(new_len, init).map_err(|source| {
@@ -2432,7 +2551,7 @@ impl SegregatedBStackAllocator {
         }
         if new_len == 0 {
             // dealloc consumes `slice`; its BStackAllocError propagates unchanged.
-            self.dealloc(slice)?;
+            self.dealloc_impl(slice)?;
             return Ok(BStackOwnedSlice::empty(self));
         }
         let start = slice.start();
@@ -2522,7 +2641,7 @@ impl SegregatedBStackAllocator {
                 recovered = (new_ptr, new_len);
                 // SAFETY: (start, old_len) still names the caller's live old block.
                 let old = unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) };
-                self.dealloc(old).map_err(|e| e.source)?;
+                self.dealloc_impl(old).map_err(|e| e.source)?;
                 new_ptr
             };
 
@@ -2707,6 +2826,7 @@ impl SegregatedBStackAllocator {
 impl BStackUninitAllocator for SegregatedBStackAllocator {
     #[inline]
     fn alloc_uninit(&self, len: u64) -> io::Result<BStackOwnedSlice<'_, Self>> {
+        let _op = self.enter_op()?;
         self.alloc_impl(len, false)
     }
 
@@ -2716,6 +2836,7 @@ impl BStackUninitAllocator for SegregatedBStackAllocator {
         slice: BStackOwnedSlice<'a, Self>,
         new_len: u64,
     ) -> Result<BStackOwnedSlice<'a, Self>, BStackAllocError<'a, Self>> {
+        // `realloc_impl` takes the `enter_op` guard itself.
         self.realloc_impl(slice, new_len, false)
     }
 }
@@ -2759,6 +2880,10 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         // Reject a handle from another allocator instance before any logic runs
         // (see the module's "Foreign handles" section).
         let slice = ensure_own_handle(self, slice, "SegregatedBStackAllocator::realloc_inplace")?;
+        let _op = match self.enter_op() {
+            Ok(op) => op,
+            Err(source) => return Err(BStackAllocError::with_handle(source, slice)),
+        };
         // An empty handle anchors no block; resizing it in place is never
         // supported for any `(prepend, append)` (see the trait's "Empty handles").
         if slice.is_empty() {
@@ -2806,7 +2931,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         // Shrinking to nothing frees the region; delegate to dealloc, which owns
         // the handle-return contract on failure.
         if new_len == 0 {
-            return self.dealloc(slice).map(|()| BStackOwnedSlice::empty(self));
+            return self
+                .dealloc_impl(slice)
+                .map(|()| BStackOwnedSlice::empty(self));
         }
 
         let start = slice.start();
@@ -4264,6 +4391,104 @@ mod bulk_tests {
             h.join().unwrap();
         }
         assert_eq!(unsafe { alloc.recover() }.unwrap(), 0);
+    }
+
+    #[test]
+    fn mutators_refuse_while_coalescing() {
+        use crate::alloc::{BStackInPlaceResizeAllocator, BStackUninitAllocator};
+        use std::io::ErrorKind::ResourceBusy;
+
+        let (a, _g) = new_alloc();
+        let s = a.alloc(100).unwrap();
+
+        a.coalescing.store(true, Ordering::SeqCst);
+        assert_eq!(a.alloc(8).unwrap_err().kind(), ResourceBusy);
+        assert_eq!(a.alloc_uninit(8).unwrap_err().kind(), ResourceBusy);
+        assert_eq!(a.alloc_bulk([8u64]).unwrap_err().kind(), ResourceBusy);
+        let e = a.realloc(s, 500).unwrap_err();
+        assert_eq!(e.source.kind(), ResourceBusy);
+        let e = a.realloc_uninit(e.into_handle().unwrap(), 500).unwrap_err();
+        assert_eq!(e.source.kind(), ResourceBusy);
+        let e = a
+            .realloc_inplace(e.into_handle().unwrap(), 0, 8)
+            .unwrap_err();
+        assert_eq!(e.source.kind(), ResourceBusy);
+        let e = a.dealloc(e.into_handle().unwrap()).unwrap_err();
+        assert_eq!(e.source.kind(), ResourceBusy);
+        let e = a.dealloc_bulk([e.into_handle().unwrap()]).unwrap_err();
+        assert_eq!(e.source.kind(), ResourceBusy);
+        let s = e.into_handles().pop().unwrap();
+        a.coalescing.store(false, Ordering::SeqCst);
+
+        assert_eq!(a.in_flight.load(Ordering::SeqCst), 0);
+        a.dealloc(s).unwrap();
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_coalesce_never_doubles_blocks() {
+        use std::collections::HashSet;
+        use std::io::ErrorKind::ResourceBusy;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // `coalesce` racing alloc/dealloc used to relink a popped-but-unclaimed
+        // block, handing it to two callers.
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 200;
+
+        let (a, _g) = new_alloc();
+        let a = Arc::new(a);
+        let live: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let coalescer = {
+            let a = Arc::clone(&a);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    a.coalesce().unwrap();
+                }
+            })
+        };
+        let workers: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let a = Arc::clone(&a);
+                let live = Arc::clone(&live);
+                thread::spawn(move || {
+                    for i in 0..ROUNDS {
+                        // Two sizes so freed neighbours give coalesce work.
+                        let len = if i % 2 == 0 { 100 } else { 24 };
+                        let mut slice = loop {
+                            match a.alloc(len) {
+                                Ok(s) => break s,
+                                Err(e) => assert_eq!(e.kind(), ResourceBusy),
+                            }
+                        };
+                        let off = slice.start();
+                        assert!(
+                            live.lock().unwrap().insert(off),
+                            "duplicate live offset {off}"
+                        );
+                        slice.write(vec![tid as u8; len as usize]).unwrap();
+                        assert_eq!(slice.read().unwrap(), vec![tid as u8; len as usize]);
+                        live.lock().unwrap().remove(&off);
+                        while let Err(e) = a.dealloc(slice) {
+                            assert_eq!(e.source.kind(), ResourceBusy);
+                            slice = e.into_handle().unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for w in workers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        coalescer.join().unwrap();
+        assert_eq!(unsafe { a.recover() }.unwrap(), 0);
     }
 
     #[test]
