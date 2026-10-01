@@ -9281,7 +9281,7 @@ int checked_slab_bstack_allocator_stats(
 /* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
  * and the in-use overhead recording the block's physical size (minor 1 recorded
  * the caller's length instead — a \x01 file fails new() with EINVAL). */
-static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,1,0};
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,3,0};
 static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
 
 #define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)

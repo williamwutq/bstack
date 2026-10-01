@@ -1502,7 +1502,7 @@ int checked_slab_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x02\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x03\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)

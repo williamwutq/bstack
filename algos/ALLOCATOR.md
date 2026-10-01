@@ -489,7 +489,7 @@ round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
 
 ```text
 offset  0  reserved (user)                24 B
-offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
+offset 24  magic  "ALSG\x00\x02\x03\x00"   8 B
 offset 32  _reserved                       8 B
 offset 40  free_head[33] : u64           264 B   # last entry = oversized list
 offset 304 arena start (16-B aligned)
