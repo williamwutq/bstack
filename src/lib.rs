@@ -555,7 +555,9 @@
 //!   ([`open`](CheckedSlabBStackAllocator::open) runs
 //!   [`recover`](CheckedSlabBStackAllocator::recover) automatically).
 //!   Requires both `alloc` and `set` features; with `atomic` additionally
-//!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`).
+//!   implements [`BStackBulkAllocator`] (`alloc_bulk`/`dealloc_bulk`), and
+//!   mutators called while `recover` runs fail with
+//!   [`ResourceBusy`](std::io::ErrorKind::ResourceBusy).
 //!
 //! * [`SegregatedBStackAllocator`] — segregated (binned) free-list allocator,
 //!   the **recommended general-purpose allocator** (the fastest built-in).

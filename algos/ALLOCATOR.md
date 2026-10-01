@@ -383,7 +383,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x01\x00"` (version 0.1.1).
+* **`magic`** — `"ALCK\x00\x01\x04\x00"` (version 0.1.4).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 
@@ -441,7 +441,9 @@ Free-list mutations write block payloads before updating `free_head`. The overhe
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access.
 
-With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). The one retained `Mutex` is held only by `recover`, to keep recovery single-flight (two concurrent runs could otherwise reclaim the same leaked block twice); the recovery scan itself is serialised against alloc/dealloc/realloc by the `BStack` write lock it holds across one `process_gen` sequence, not by the `Mutex`.
+With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). 
+
+`recover` is exclusive of every mutator. An in-flight `alloc`, `dealloc`, or `realloc` passes through states that look exactly like leaks. A `recover` overlapping one would relink such a block and hand it out twice. An `AtomicBool` (`recovering`) and an in-flight counter (`in_flight`) exclude them. Each mutator, including the bulk and `_uninit` variants, increments `in_flight` and then checks the flag. `recover` sets the flag and then waits for `in_flight` to drain. Both sides use `SeqCst`, so either the mutator sees the flag or `recover` sees the count. A mutator refused this way fails with `ResourceBusy` before touching anything and hands back its handles for a retry. Internal paths such as `realloc`'s nested alloc and dealloc skip the check, so an operation already under way is never refused halfway through. A retained `Mutex` keeps `recover` single-flight.
 
 ### Constructors
 
@@ -487,7 +489,7 @@ round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
 
 ```text
 offset  0  reserved (user)                24 B
-offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
+offset 24  magic  "ALSG\x00\x02\x03\x00"   8 B
 offset 32  _reserved                       8 B
 offset 40  free_head[33] : u64           264 B   # last entry = oversized list
 offset 304 arena start (16-B aligned)
@@ -603,11 +605,21 @@ counts as no progress and repeated calls reach a fixpoint.
 
 Unlike `recover`, `coalesce` is a **safe** method. The whole scan-and-rewrite
 runs inside one `BStack::inplace_gen`, striding the overhead words one at a time
-under the held write lock and committing the merges as one journalled batch, so
-a concurrent `alloc`/`dealloc` can neither observe an intermediate state nor be
-clobbered, with no allocator-level lock. A torn commit re-parses as a valid arena
-and is reclaimed by `recover`, so the pass is restartable; the scan follows only
-physical sizes, never `next_free`, so a corrupt free list cannot cycle it.
+under the held write lock and committing the merges as one journalled batch. A
+torn commit re-parses as a valid arena and is reclaimed by `recover`, so the pass
+is restartable; the scan follows only physical sizes, never `next_free`, so a
+corrupt free list cannot cycle it.
+
+The write lock alone does not make it safe: an in-flight `alloc` or `realloc`
+leaves a popped or staged block free-tagged between its own calls, and the scan
+would relink it, handing it out twice. `coalesce` therefore excludes every
+mutator for the whole call, the same way `CheckedSlabBStackAllocator::recover`
+does: each mutator increments an in-flight counter and then checks an
+`AtomicBool`; `coalesce` takes the flag by compare-and-swap (so concurrent
+`coalesce` calls run one at a time) and waits for the counter to drain. A mutator
+refused this way fails with `ResourceBusy` before touching anything and hands
+back its handles for a retry. Internal paths, such as `realloc`'s nested
+`dealloc`, skip the check.
 
 ### Thread safety
 
