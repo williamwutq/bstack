@@ -10700,7 +10700,8 @@ static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
                 (void)bstack_try_discard(bs, old_end + delta, (size_t)delta, &ok);
             }
 #else
-            (void)bstack_discard(bs, (size_t)delta);
+            int ignore = bstack_discard(bs, (size_t)delta);
+            (void)ignore;
 #endif
             errno = saved;
             goto fail_recover;
