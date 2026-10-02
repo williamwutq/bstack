@@ -166,6 +166,8 @@ help:
 	@echo '  libbstack-set-atomic.a -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC'
 	@echo '  libbstack-alloc.a      base + alloc layer'
 	@echo '  libbstack-alloc-set.a  -DBSTACK_FEATURE_SET + alloc layer'
+	@echo '  libbstack-alloc-set-atomic.a'
+	@echo '                         -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC + alloc layer'
 
 all: release zip
 
@@ -182,6 +184,7 @@ c: $(C_PHONY)
 #         $(BUILD)/<target>/rust/libbstack-alloc-set.rlib
 #         $(BUILD)/<target>/rust/libbstack-atomic.rlib
 #         $(BUILD)/<target>/rust/libbstack-set-atomic.rlib
+#         $(BUILD)/<target>/rust/libbstack-alloc-set-atomic.rlib
 define rust_rule
 rust-$(1):
 	@echo "==> rust $(1)"
@@ -198,6 +201,8 @@ rust-$(1):
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-atomic.rlib
 	cargo zigbuild --target $(1) --release --features "set,atomic"
 	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-set-atomic.rlib
+	cargo zigbuild --target $(1) --release --features "alloc,set,atomic"
+	cp target/$(1)/release/libbstack.rlib $(BUILD)/$(1)/rust/libbstack-alloc-set-atomic.rlib
 endef
 
 $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
@@ -209,6 +214,7 @@ $(foreach t,$(RUST_TARGETS),$(eval $(call rust_rule,$(t))))
 #         $(BUILD)/<target>/c/libbstack-set-atomic.a
 #         $(BUILD)/<target>/c/libbstack-alloc.a
 #         $(BUILD)/<target>/c/libbstack-alloc-set.a
+#         $(BUILD)/<target>/c/libbstack-alloc-set-atomic.a
 #         $(BUILD)/<target>/c/bstack.h
 #         $(BUILD)/<target>/c/bstack_alloc.h
 define c_rule
@@ -241,6 +247,10 @@ c-$(1):
 	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc-set.o $(C_ALLOC_SRC)
 	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc-set.a \
 	    $(BUILD)/$(1)/c/bstack-set.o $(BUILD)/$(1)/c/bstack_alloc-set.o
+	$(call cc_for,$(1)) $(C_FLAGS) -DBSTACK_FEATURE_SET -DBSTACK_FEATURE_ATOMIC \
+	    -I $(C_INC) -c -o $(BUILD)/$(1)/c/bstack_alloc-set-atomic.o $(C_ALLOC_SRC)
+	$(call ar_for,$(1)) rcs $(BUILD)/$(1)/c/libbstack-alloc-set-atomic.a \
+	    $(BUILD)/$(1)/c/bstack-set-atomic.o $(BUILD)/$(1)/c/bstack_alloc-set-atomic.o
 endef
 
 $(foreach t,$(RUST_TARGETS),$(eval $(call c_rule,$(t))))
