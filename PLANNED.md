@@ -505,66 +505,33 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 
 ---
 
-## Avoidable I/O in `BStackSlice` and `BStackChunk` operations
+## Remaining avoidable I/O in `BStackChunk` and `BStackSlice` scans
 
 **Feature flag:** `alloc` + `atomic`.
 **Breaking change:** No.
 
 ### Motivation
 
-Several `BStackSlice` and `BStackChunk` operations are correct but inefficient. The affected groups are:
+The windowed scans, no-op early-outs, single-read `read_to_end`, and budget-sized `Records::reverse`/`rotate` have landed. Two items remain:
 
-- Searching a slice (`contains`, `find`, `rfind`, `position`, `rposition`).
-- Mutations that turn out to be no-ops.
-- Reading a slice to its end through `io::Read`.
-- The out-of-core sort and select engine behind `sort_partial_by` and `select_nth_partial_by`.
-
-Durable commits are fsync-bound and slices can be large, so avoidable commits, reads and buffers cost real time and memory. Each item can be fixed independently and the results stay the same.
+- `Records::partition`, behind `select_nth_partial_by`, still reads one record per step and does one durable swap per moved record.
+- Scans read the locked region through `get_batched_gen` like any other range.
 
 ### Design
 
-Only the `atomic` build changes. The `not(atomic)` paths stay as they are because restructuring them would give up the atomic-snapshot guarantee.
-
-#### Windowed slice scans
-
-`contains`, `find`, `rfind`, `position` and `rposition` read the whole slice into a `Vec` before scanning, so a hit at byte 0 still costs O(len) I/O and memory. Under `atomic`, scan in fixed windows inside one `get_batched_gen` call, as `BStackChunk::binary_search_by` does. The scan exits on the first hit and memory is bounded by the window. The single shared lock keeps the snapshot consistency of the current whole-slice read. `rfind` and `rposition` walk the windows from the end.
-
-#### No-op early-outs
-
-Each of these commits a durable operation that changes nothing. Return before the commit, using the check `BStackSlice::swap` already has for `self.start() == other.start()`.
-
-- `copy_from_bstack_slice` with identical source and destination.
-- `copy_within` with `src_range.start == dest`.
-- `BStackSlice::reverse` with `len < 2`, and `rotate_left`/`rotate_right` by `0` or `len`. Each reads and rewrites the whole region.
-- The `BStackChunk` equivalents of the previous item, with `chunk_count() < 2` or a no-op `k`.
-- `BStackChunk::sort_by`, `sort_by_key` and `select_nth_by*` with `chunk_count() <= 1`. They return early only inside the `process` closure, after the I/O.
-
-#### `BStackSliceReader::read_to_end`
-
-The std default issues repeated small reads with a growing probe buffer, so a large slice becomes many `get_into` calls. Override it to read the remaining `len - cursor` bytes in one `get` and advance the cursor to the end. `read_to_string` routes through it.
-
-#### `Records::reverse` and `rotate`
-
-Each record moves through its own durable `cross_exchange`, so rotating n records costs about n commits. `imerge` calls `rotate` on spans that are often far below `SORT_BUDGET`. When the span fits the budget, do the whole reversal or rotation in one `process` call. Larger spans keep the swap-per-record path.
-
 #### `Records::partition`
 
-It reads one record per step and swaps each record that compares less than the pivot, one durable swap each. It is Lomuto partitioning with a strict `<`, so a range of equal keys shrinks by one record per round, which is O(n²) reads in `select_nth_partial_by`. Replace it with two changes:
+It is Lomuto partitioning with a strict `<`, so a range of equal keys shrinks by one record per round, which is O(n²) reads in `select_nth_partial_by`. Replace it with two changes:
 
 - Read and permute budget-sized windows with `process`, instead of per-record reads and swaps.
 - Use a three-way partition, so records equal to the pivot are excluded from the next round.
 
-This is the largest change here. Benchmark it against the current Lomuto loop on a duplicate-heavy input before it replaces it.
+Benchmark it against the current Lomuto loop on a duplicate-heavy input before it replaces it.
 
 ### Open questions
 
-- **Window size for scans.** `get_batched_gen` holds one lock for the whole scan, so the window size only trades read calls against buffer size. Options:
-  - Reuse `BULK_READ_BUDGET` (512 bytes) on the stack. This costs one read per 512 bytes.
-  - A larger scan-specific buffer on the stack.
-  - A constant-size heap buffer. This is still better than the current whole-slice `Vec`.
-  - A thread-local static buffer.
 - **Scanning the locked region in place.** Bytes in `[0, locked_len())` are immutable, and a cached stack (`open_cached`) mirrors them in an in-memory buffer. `get` and `get_into` already bypass the `RwLock` for ranges inside it. A scan or search whose range lies entirely inside the locked region could use a separate crate-internal `BStack` primitive instead of `get_batched_gen`, which keeps its single read lock for atomicity:
   - On a cached stack, lend the cache buffer to the scanner with no copy and no window.
   - On an uncached stack, `pread` windows with no lock, since immutability already gives the snapshot guarantee.
 
-  Ranges that reach past the locked region use `get_batched_gen` as designed above. Holding the cache `Mutex` for a whole scan would block other cached readers, which `get` avoids by copying out under it briefly.
+  Ranges that reach past the locked region keep using `get_batched_gen`. Holding the cache `Mutex` for a whole scan would block other cached readers, which `get` avoids by copying out under it briefly.

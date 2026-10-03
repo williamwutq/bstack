@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`BStackSlice` searches stop reading at the first hit (Rust, `alloc` + `atomic`).** `contains`, `find`, `rfind`, `position`, and `rposition` scan 512-byte windows under one `get_batched_gen` read lock instead of reading the whole slice into a `Vec`, so memory is bounded and the snapshot stays consistent. Without `atomic` they still read the whole slice.
+- **No-op mutations skip their durable commit (Rust and C, `set` + `atomic`).** `BStackSlice::copy_from_bstack_slice` onto itself, `copy_within` with `src == dest`, `reverse` under 2 bytes, and `rotate_left`/`rotate_right` by `0` or `len` now return without I/O. The same applies to `BStackChunk::reverse`, `rotate_left`/`rotate_right`, `sort_by`/`sort_by_key`, and `select_nth_by`/`select_nth_by_key` on fewer than 2 chunks or with a no-op `k`, and to C's `bstack_slice_reverse_chunks`, `bstack_slice_rotate_left`/`_right`, `bstack_slice_sort`, and `bstack_slice_partition`.
+- **`BStackSliceReader::read_to_end` and `read_to_string` read the rest of the slice in one `get_into` (Rust).** std's defaults issued repeated growing-probe reads.
+- **`sort_partial_by` and `select_nth_partial_by` rotate and reverse small spans in one commit (Rust and C, `set` + `atomic`).** A rotation or reversal that fits the sort budget is one `process` (C: `bstack_process`) instead of one `cross_exchange` per record pair. Wider spans keep the per-record swaps.
+
 ## [0.4.6] - 2026-10-01
 
 ### Added
