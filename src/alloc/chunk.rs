@@ -565,6 +565,9 @@ impl<'a> BStackChunk<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
+        if self.chunk_count() < 2 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -594,6 +597,9 @@ impl<'a> BStackChunk<'a> {
             k <= self.chunk_count(),
             "rotate_left: k must be <= chunk_count"
         );
+        if k == 0 || k == self.chunk_count() {
+            return Ok(());
+        }
         let mid = (k * self.chunk_len) as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -621,6 +627,9 @@ impl<'a> BStackChunk<'a> {
             k <= self.chunk_count(),
             "rotate_right: k must be <= chunk_count"
         );
+        if k == 0 || k == self.chunk_count() {
+            return Ok(());
+        }
         let mid = (k * self.chunk_len) as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -687,6 +696,9 @@ impl<'a> BStackChunk<'a> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn sort_by(&mut self, mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering) -> io::Result<()> {
+        if self.chunk_count() <= 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -704,6 +716,9 @@ impl<'a> BStackChunk<'a> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn sort_by_key<K: Ord>(&mut self, mut key: impl FnMut(&[u8]) -> K) -> io::Result<()> {
+        if self.chunk_count() <= 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1101,6 +1116,9 @@ impl<'a> BStackChunk<'a> {
             n < self.chunk_count(),
             "select_nth_by: n must be < chunk_count"
         );
+        if self.chunk_count() == 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1135,6 +1153,9 @@ impl<'a> BStackChunk<'a> {
             n < self.chunk_count(),
             "select_nth_by_key: n must be < chunk_count"
         );
+        if self.chunk_count() == 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1485,9 +1506,17 @@ impl<'s, 'a> Records<'s, 'a> {
         self.aligned.stack().process(self.off(lo), self.off(hi), f)
     }
 
-    /// Reverse the records in `[x, y)` via single-record atomic swaps.
+    /// Reverse the records in `[x, y)`: one atomic `process` when the span
+    /// fits [`SORT_BUDGET`], else single-record atomic swaps.
     #[inline(always)] // only called by `rotate`
     fn reverse(&self, mut x: u64, mut y: u64) -> io::Result<()> {
+        if y - x < 2 {
+            return Ok(());
+        }
+        if (y - x) * self.c <= SORT_BUDGET {
+            let cu = self.cu;
+            return self.process(x, y, |buf| reverse_chunks(buf, cu));
+        }
         while y > x + 1 {
             let b = y - 1;
             self.swap(x, b)?;
@@ -1497,11 +1526,16 @@ impl<'s, 'a> Records<'s, 'a> {
         Ok(())
     }
 
-    /// Rotate: swap the adjacent record blocks `[a, b)` and `[b, d)` via three
-    /// reversals. Crash-safe: each underlying swap is atomic, so any crash
+    /// Rotate: swap the adjacent record blocks `[a, b)` and `[b, d)` — one
+    /// atomic `process` when the span fits [`SORT_BUDGET`], else three
+    /// reversals. Crash-safe: each underlying step is atomic, so any crash
     /// leaves a valid permutation.
     #[inline(always)] // only called by `imerge`
     fn rotate(&self, a: u64, b: u64, d: u64) -> io::Result<()> {
+        if (d - a) * self.c <= SORT_BUDGET {
+            let mid = (b - a) as usize * self.cu;
+            return self.process(a, d, |buf| buf.rotate_left(mid));
+        }
         self.reverse(a, b)?;
         self.reverse(b, d)?;
         self.reverse(a, d)

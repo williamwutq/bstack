@@ -799,6 +799,8 @@ static int reverse_cb(uint8_t *buf, size_t len, void *ctxp)
 int bstack_slice_reverse_chunks(bstack_slice_t s, uint64_t chunk_len)
 {
     struct reverse_ctx ctx;
+    if (s.len / chunk_len < 2)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     return bstack_slice_process(s, reverse_cb, &ctx);
 }
@@ -827,6 +829,8 @@ int bstack_slice_rotate_left(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
         errno = EINVAL;
         return -1;
     }
+    if (k == 0 || k == count)
+        return 0;
     ctx.mid = (size_t)(k * chunk_len);
     return bstack_slice_process(s, rotate_cb, &ctx);
 }
@@ -839,6 +843,8 @@ int bstack_slice_rotate_right(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
         errno = EINVAL;
         return -1;
     }
+    if (k == 0 || k == count)
+        return 0;
     /* Right by k records == left by (len - k*chunk_len) bytes. */
     ctx.mid = (size_t)(s.len - k * chunk_len);
     return bstack_slice_process(s, rotate_cb, &ctx);
@@ -863,6 +869,8 @@ int bstack_slice_sort(bstack_slice_t s, uint64_t chunk_len,
                       int (*cmp)(const void *a, const void *b))
 {
     struct sort_ctx ctx;
+    if (s.len / chunk_len < 2)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     ctx.cmp = cmp;
     return bstack_slice_process(s, sort_cb, &ctx);
@@ -936,6 +944,8 @@ int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
         errno = EINVAL;
         return -1;
     }
+    if (count == 1)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     ctx.n   = (size_t)n;
     ctx.cmp = cmp;
@@ -1014,9 +1024,17 @@ static inline int rec_process(const struct records *r, uint64_t lo, uint64_t hi,
     return bstack_process(r->bs, REC_OFF(r, lo), REC_OFF(r, hi), cb, ctx);
 }
 
-/* Reverse the records in [x, y) via single-record atomic swaps. */
+/* Reverse the records in [x, y): one atomic rec_process when the span fits
+ * the budget, else single-record atomic swaps. */
 static inline int rec_reverse(const struct records *r, uint64_t x, uint64_t y)
 {
+    if (y - x < 2)
+        return 0;
+    if (y - x <= BSTACK_SORT_BUDGET / r->c) {
+        struct reverse_ctx rc;
+        rc.chunk_len = r->cu;
+        return rec_process(r, x, y, reverse_cb, &rc);
+    }
     while (y > x + 1) {
         uint64_t b = y - 1;
         if (rec_swap(r, x, b)) return -1;
@@ -1026,9 +1044,15 @@ static inline int rec_reverse(const struct records *r, uint64_t x, uint64_t y)
     return 0;
 }
 
-/* Swap the adjacent record blocks [a, b) and [b, d) by three reversals. */
+/* Swap the adjacent record blocks [a, b) and [b, d): one atomic rec_process
+ * when the span fits the budget, else three reversals. */
 static inline int rec_rotate(const struct records *r, uint64_t a, uint64_t b, uint64_t d)
 {
+    if (d - a <= BSTACK_SORT_BUDGET / r->c) {
+        struct rotate_ctx rc;
+        rc.mid = (size_t)(b - a) * r->cu;
+        return rec_process(r, a, d, rotate_cb, &rc);
+    }
     if (rec_reverse(r, a, b)) return -1;
     if (rec_reverse(r, b, d)) return -1;
     return rec_reverse(r, a, d);
