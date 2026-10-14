@@ -129,6 +129,73 @@ The compact form advances the on-disk format wherever it lives — a new encodin
 
 ---
 
+## A `BStack` write returns `Err` only before its commit point (0.5.0)
+
+**Feature flag:** None (core) + `atomic`.
+**Breaking change:** Yes (0.5.0). No API change, but the documented meaning of `Err` changes. The crate docs and README (*Deferred replay*), `bstack.h` ("Deferred replay"), and `algos/WIP.md` (*Deferred replay*) all say that a write failing after its first mutating I/O can leave an armed journal, which the next write replays. Replaying an armed journal rolls the write forward, so today an `Err` can follow the commit point and the write still takes effect.
+
+### Motivation
+
+Callers assume an `Err` means the change was not written. bstack does not promise that: the error is returned wherever the function stops, which can be after the commit point `algos/WIP.md` documents.
+
+- `journaled_set` returns `Err` from the in-place write, the disarm, or the truncate, all after the synced arm. The deferred replay merged in #69, or the next `open`, then rolls the write forward.
+- `commit_shrink` returns `Err` from the header write after the truncation that commits the shrink, so `pop` can fail with the bytes already gone.
+- Allocators work around this. `GhostTreeBstackAllocator`'s atomic tail shrink must report a failed `Atrunc` as lost, because it cannot tell a fault before the commit from one after it.
+
+Only bstack knows where each commit point is. Fixing the contract there fixes it for every caller. The `replay_needed` flag from #69 already finishes a write after a failure, so a failure past the commit point no longer needs to surface as an `Err`.
+
+### Design
+
+New contract, in Rust and C:
+
+- **`Err`:** the write did not commit. Recovery (the deferred replay or `open`) rolls it back.
+- **`Ok`:** the write committed. Steps after the commit point may still be pending; a failure among them sets `replay_needed`, and the next write, `recover`, or `open` completes them.
+
+Each commit helper in `io_core.rs` / `bstack.c` splits at its commit point. A failure before it keeps today's rollback and returns `Err`. A failure after it sets `replay_needed` and returns `Ok`. The commit points:
+
+| Strategy                                                 | Commit point                    |
+|----------------------------------------------------------|---------------------------------|
+| Aligned-block write                                      | the synced block write          |
+| Single-region journal (`Set`, `Repeat`, `Copy`, splice)  | the synced arm                  |
+| Multi-write journal                                      | the synced `MultiWrite` arm     |
+| Append or grow (`push`, `extend`, the sparse extends)    | the synced `clen` header write  |
+| Shrink (`pop`, `discard`, `try_discard`)                 | the truncation                  |
+
+Document the contract once, in the crate docs' *Durability* and *Deferred replay*, the README, `bstack.h`, and `algos/WIP.md`, and point each method's `# Errors` at it.
+
+### Open questions
+
+- **When the commit write itself fails.** The commit point is a write followed by a sync, for example the arm in `journaled_set`. If that sync fails, the arm may or may not be on disk. The contract requires `Err`, since the call never passed its commit point. But if the arm did land, the next write, `recover`, or `open` sees an armed journal and replays it, so the write takes effect after an `Err`. To prevent that, the repair after this failure must discard the journal instead of replaying it, which `replay_needed` cannot express today. A crash before the next write performs the discard still leaves the armed journal for `open` to replay. Decide whether `Err` must mean "not written" only while the process keeps running, or also across a crash in that window.
+- **Reads after an `Ok`.** While `replay_needed` is set, reads such as `get` and `len` fail with `InterruptedWrite` (C: `BSTACK_EREPLAY`). Today that only follows a failed write. After this change, a failure past the commit point returns `Ok` and still sets the flag, so `set` can return `Ok` and the next `get` fail. Decide whether reads run the repair themselves, or keep failing with this documented.
+
+---
+
+## Allocators' `lost` reporting when a single `BStack` call fails (0.5.0)
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No.
+**Related:** *A `BStack` write returns `Err` only before its commit point* (above). This entry is needed whichever way that one is decided.
+
+### Motivation
+
+Allocators disagree on what a failed `BStack` call means for the caller's handle:
+
+- **Worst case assumed.** `GhostTreeBstackAllocator`'s atomic tail shrink reports any error after its `Atrunc` is issued as lost (`handle: None`, C: `-2`), even when the fault came before the commit.
+- **Not-committed assumed.** Every allocator's tail discard (`try_discard` / `discard` in `dealloc`, `dealloc_bulk`, and the realloc shrinks) returns the original handle on `Err`. Today `commit_shrink` can return `Err` after the truncation that commits the shrink, so that handle names bytes no longer in the stack.
+
+### Design
+
+- **If the commit-point entry lands:** an `Err` from a single call means it did not commit. The tail discards are already correct; return the original handle from the worst-case paths too, starting with the ghost-tree tail shrink.
+- **If it is dismissed:** an `Err` may follow the commit. Every allocator's tail discard must then report the handle lost on any error that can follow the truncation, the same worst-case rule the ghost-tree tail shrink uses.
+
+Either way, the audit covers every site in `src/alloc/*.rs` and `c/bstack_alloc.c` where a `BStack` error decides the handle outcome:
+
+- **Outcome:** `BStackAllocError::handle` (`Some` or `None`) and `BStackBulkAllocError::handles` in Rust, and the vtable `realloc`/`dealloc` return of `-1` (survived) or `-2` (lost) in C.
+- **Calls:** each tail-changing call (`discard`, `try_discard`, `atrunc`, and the `Discard`/`Atrunc` steps of `process_gen`) gets the `lost` value its commit point implies.
+- **Tests:** each site gets a `FailOpAt` fault test that pins the outcome.
+
+---
+
 ## Enabling the `atomic` feature by default (0.5.0)
 
 **Feature flag:** N/A — this changes which features are enabled by default, not a new one.
