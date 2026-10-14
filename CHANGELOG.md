@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **No-op `BStackSlice` mutations skip their durable commit (Rust, `set` + `atomic`).** `reverse` under 2 bytes and `rotate_left`/`rotate_right` by `0` or `len` now return without I/O, as do `copy_from_bstack_slice` onto itself and `copy_within` with `src == dest`. Backported from the 0.4.x line.
 - **`BStackSliceReader::read_to_end` and `read_to_string` read the rest of the slice in one `get_into` (Rust).** std's defaults issued repeated growing-probe reads. Backported from the 0.4.x line.
 
+### Fixed
+
+- **`GhostTreeBstackAllocator` kept serving a torn free tree after an I/O error, so two allocations could receive overlapping regions (Rust and C).** A tree mutation that failed partway could leave a node reachable from two parents until the next reopen. The allocator now poisons itself in memory on such a failure. Until a reopen rebuilds the tree, every non-empty `alloc`, `realloc`, `dealloc`, and bulk call fails with `InvalidData` (C: `EINVAL`, returning `-1`). C's `ghost_tree_bstack_allocator_t` gains a `poisoned` field; callers that only create it through `ghost_tree_bstack_allocator_new` are unaffected.
+
 ## [0.2.9] - 2026-09-30
 
 ### Added

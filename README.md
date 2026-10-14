@@ -1123,6 +1123,12 @@ No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
 imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
 
+A tree mutation can fail partway on an I/O error, with no crash. That can leave
+a node reachable from two parents, so two later allocations could share a
+region. The allocator then poisons itself. Every later non-empty `alloc`,
+`realloc`, `dealloc`, and bulk call fails with `InvalidData` (C: `EINVAL`)
+until a reopen rebuilds the tree.
+
 #### Thread safety
 
 `GhostTreeBstackAllocator` is always **`Send`** — ownership can be transferred
