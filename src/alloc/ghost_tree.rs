@@ -14,6 +14,7 @@ use std::io;
 use std::marker::PhantomData;
 #[cfg(feature = "atomic")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x04\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
@@ -160,6 +161,16 @@ struct PathEntry {
 ///   but GhostTree carries no per-block `is_free` flag, making such a scan
 ///   unreliable; the leak is therefore accepted by design.
 ///
+/// # Poisoning
+///
+/// A tree mutation that fails partway on an I/O error can leave a node
+/// reachable from two parents, so two later allocations could share a region.
+/// The allocator then poisons itself: every non-empty `alloc`, `realloc`,
+/// `realloc_inplace`, `dealloc`, and bulk call fails with
+/// [`io::ErrorKind::InvalidData`] until a reopen
+/// ([`into_stack`](BStackAllocator::into_stack), then [`new`](Self::new))
+/// rebuilds the tree. A call refused on entry hands back its handle.
+///
 /// # Thread safety
 ///
 /// `GhostTreeBstackAllocator` is always **`Send`** — ownership can be
@@ -191,6 +202,9 @@ pub struct GhostTreeBstackAllocator {
     stack: BStack,
     #[cfg(feature = "atomic")]
     lock: Mutex<()>,
+    /// Set when a tree mutation fails partway, leaving the tree possibly torn.
+    /// Every mutating op then refuses until a reopen rebuilds the tree.
+    poisoned: AtomicBool,
     #[cfg(not(feature = "atomic"))]
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -234,6 +248,7 @@ impl GhostTreeBstackAllocator {
                 stack,
                 #[cfg(feature = "atomic")]
                 lock: Mutex::new(()),
+                poisoned: AtomicBool::new(false),
                 #[cfg(not(feature = "atomic"))]
                 _not_sync: PhantomData,
             });
@@ -270,6 +285,7 @@ impl GhostTreeBstackAllocator {
             stack,
             #[cfg(feature = "atomic")]
             lock: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
             #[cfg(not(feature = "atomic"))]
             _not_sync: PhantomData,
         };
@@ -279,6 +295,32 @@ impl GhostTreeBstackAllocator {
 }
 
 impl GhostTreeBstackAllocator {
+    /// Refuse while a prior tree mutation is torn. Under `atomic`, the check
+    /// that gates a tree access runs under `self.lock`.
+    #[inline]
+    fn guard_not_poisoned(&self) -> io::Result<()> {
+        if self.poisoned.load(Ordering::Relaxed) {
+            Err(io_error!(
+                InvalidData,
+                "GhostTreeBstackAllocator: free tree torn by a failed mutation; reopen to recover"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Poison on `Err`: `result` is a tree write sequence that may have torn.
+    #[inline]
+    fn poison_on_err<T>(&self, result: io::Result<T>) -> io::Result<T> {
+        result.inspect_err(|_| self.poisoned.store(true, Ordering::Relaxed))
+    }
+
+    /// Test hook: force the poison, simulating a torn tree mutation.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        self.poisoned.store(true, Ordering::Relaxed);
+    }
+
     /// Read the AVL root pointer from the header.
     #[inline]
     fn read_root(&self) -> io::Result<u64> {
@@ -553,6 +595,7 @@ impl GhostTreeBstackAllocator {
         }
 
         // Write the new leaf (height 1, null children → cached child heights 0).
+        // The leaf is not yet linked, so a fault here leaves the tree intact.
         self.write_node(ptr, size, 0, 1, 0, 0, NULL_PTR, NULL_PTR)?;
 
         // Up-pass: install the new child pointer in each ancestor and rebalance.
@@ -561,20 +604,24 @@ impl GhostTreeBstackAllocator {
         // way down — so `avl_write_h` reads neither.  The `(bf, height)` it
         // returns is handed to `avl_rebalance`, so the in-balance case does no
         // further I/O: one write per level, zero reads.
-        let mut child = ptr;
-        let mut child_h = 1u8; // leaf height
-        for entry in path[..path_len].iter().rev() {
-            let (new_left, new_right, lh, rh) = if entry.went_left {
-                (child, entry.right, Some(child_h), Some(entry.rh))
-            } else {
-                (entry.left, child, Some(entry.lh), Some(child_h))
-            };
-            let (bf, h) = self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
-            let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
-            child = new_root;
-            child_h = new_h;
-        }
-        self.write_root(child)
+        let up_pass = || -> io::Result<()> {
+            let mut child = ptr;
+            let mut child_h = 1u8; // leaf height
+            for entry in path[..path_len].iter().rev() {
+                let (new_left, new_right, lh, rh) = if entry.went_left {
+                    (child, entry.right, Some(child_h), Some(entry.rh))
+                } else {
+                    (entry.left, child, Some(entry.lh), Some(child_h))
+                };
+                let (bf, h) =
+                    self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
+                let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
+                child = new_root;
+                child_h = new_h;
+            }
+            self.write_root(child)
+        };
+        self.poison_on_err(up_pass())
     }
 
     /// Remove the minimum-key (leftmost) node from the subtree rooted at `root`,
@@ -699,41 +746,46 @@ impl GhostTreeBstackAllocator {
         let found_lh = path[fit_idx].lh;
         let found_rh = path[fit_idx].rh;
 
-        // Remove the best-fit node.  The left subtree (path[fit_idx+1..]) was
-        // searched and yielded nothing, so found_left is returned unchanged.
-        // `repl_h` is the replacement subtree's height, seeding the up-pass —
-        // known in every case now (single child from the cache, successor from
-        // its rebalance).
-        let (replacement, repl_h): (u64, u8) = if found_left == NULL_PTR {
-            (found_right, found_rh)
-        } else if found_right == NULL_PTR {
-            (found_left, found_lh)
-        } else {
-            // Two children: replace with in-order successor (min of right subtree).
-            let (succ, succ_sz, new_right) = self.avl_remove_min(found_right)?;
-            let (bf, h) = self.avl_write_and_update(succ, succ_sz, found_left, new_right)?;
-            let (new_root, new_h) = self.avl_rebalance(succ, bf, h)?;
-            (new_root, new_h)
-        };
-
-        // Up-pass: update path[0..fit_idx] (path[fit_idx] was removed).  Both
-        // child heights are known each step — the modified child threaded from
-        // below, the untouched sibling from this node's cache — so `avl_write_h`
-        // reads neither and the in-balance case does no further I/O.
-        let mut child = replacement;
-        let mut child_h = repl_h;
-        for entry in path[..fit_idx].iter().rev() {
-            let (new_left, new_right, lh, rh) = if entry.went_left {
-                (child, entry.right, Some(child_h), Some(entry.rh))
+        // Everything from here writes the tree, so a fault may tear it.
+        let remove = || -> io::Result<()> {
+            // Remove the best-fit node.  The left subtree (path[fit_idx+1..]) was
+            // searched and yielded nothing, so found_left is returned unchanged.
+            // `repl_h` is the replacement subtree's height, seeding the up-pass —
+            // known in every case now (single child from the cache, successor from
+            // its rebalance).
+            let (replacement, repl_h): (u64, u8) = if found_left == NULL_PTR {
+                (found_right, found_rh)
+            } else if found_right == NULL_PTR {
+                (found_left, found_lh)
             } else {
-                (entry.left, child, Some(entry.lh), Some(child_h))
+                // Two children: replace with in-order successor (min of right subtree).
+                let (succ, succ_sz, new_right) = self.avl_remove_min(found_right)?;
+                let (bf, h) = self.avl_write_and_update(succ, succ_sz, found_left, new_right)?;
+                let (new_root, new_h) = self.avl_rebalance(succ, bf, h)?;
+                (new_root, new_h)
             };
-            let (bf, h) = self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
-            let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
-            child = new_root;
-            child_h = new_h;
-        }
-        self.write_root(child)?;
+
+            // Up-pass: update path[0..fit_idx] (path[fit_idx] was removed).  Both
+            // child heights are known each step — the modified child threaded from
+            // below, the untouched sibling from this node's cache — so `avl_write_h`
+            // reads neither and the in-balance case does no further I/O.
+            let mut child = replacement;
+            let mut child_h = repl_h;
+            for entry in path[..fit_idx].iter().rev() {
+                let (new_left, new_right, lh, rh) = if entry.went_left {
+                    (child, entry.right, Some(child_h), Some(entry.rh))
+                } else {
+                    (entry.left, child, Some(entry.lh), Some(child_h))
+                };
+                let (bf, h) =
+                    self.avl_write_h(entry.ptr, entry.size, new_left, new_right, lh, rh)?;
+                let (new_root, new_h) = self.avl_rebalance(entry.ptr, bf, h)?;
+                child = new_root;
+                child_h = new_h;
+            }
+            self.write_root(child)
+        };
+        self.poison_on_err(remove())?;
         Ok(Some((found_ptr, found_size)))
     }
 
@@ -959,6 +1011,8 @@ impl GhostTreeBstackAllocator {
         {
             #[cfg(feature = "atomic")]
             let guard = self.lock.lock().unwrap();
+            // Under the lock, so it also covers the `extend` fallback below.
+            self.guard_not_poisoned()?;
             if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(aligned)? {
                 let remainder = block_size - aligned;
                 if remainder >= MIN_ALLOC {
@@ -1022,6 +1076,9 @@ impl GhostTreeBstackAllocator {
                 BStackAllocError::with_handle(source, BStackOwnedSlice::empty(self))
             });
         }
+        if let Err(source) = self.guard_not_poisoned() {
+            return Err(BStackAllocError::with_handle(source, slice));
+        }
         let start = slice.start();
         let old_len = slice.len();
         if start < ARENA_START || start != Self::align_up_ptr(start) {
@@ -1067,7 +1124,8 @@ impl GhostTreeBstackAllocator {
         // the freed tail. Once that begins, a torn insert means the block can no
         // longer be safely returned for a retry (which would re-insert an
         // already-linked node and corrupt the free tree), so `lost` is set and
-        // the error carries `None`.
+        // the error carries `None`. Likewise any shrink whose commit may have
+        // landed: when in doubt, report `None`.
         let mut lost = false;
         let inplace_result = (|| -> io::Result<Option<BStackOwnedSlice<'a, Self>>> {
             if aligned_new == aligned_old {
@@ -1096,9 +1154,9 @@ impl GhostTreeBstackAllocator {
                 // stack yet still returns `old_len` — an out-of-bounds handle.
                 // `Len` confirms the tail under `process_gen`'s held write lock,
                 // then `Atrunc` cuts `[start+new_len, start+aligned_old)` and
-                // re-appends `aligned_new - new_len` zeros. The fault policy is
-                // consulted before any mutation, so a fault leaves the block
-                // intact and `map_err` returns `Some(start, old_len)`.
+                // re-appends `aligned_new - new_len` zeros. An `Atrunc` error may
+                // land after arming, and a replay then commits the cut, so it
+                // reports the block lost. A `Len` error precedes any mutation.
                 #[cfg(feature = "atomic")]
                 {
                     // Padding is `aligned_new - new_len`, always < MIN_ALLOC (32,
@@ -1109,7 +1167,7 @@ impl GhostTreeBstackAllocator {
                     let cur_ptr: *mut u64 = &mut cur_len;
                     let mut phase = 0u8;
                     let mut truncated = false;
-                    self.stack.process_gen(|| match phase {
+                    let result = self.stack.process_gen(|| match phase {
                         0 => {
                             phase = 1;
                             // SAFETY: `process_gen` invokes this closure strictly
@@ -1133,7 +1191,9 @@ impl GhostTreeBstackAllocator {
                             }
                         }
                         _ => None,
-                    })?;
+                    });
+                    lost = truncated;
+                    result?;
                     if truncated {
                         return Ok(Some(unsafe {
                             BStackOwnedSlice::from_raw_parts(self, start, new_len)
@@ -1162,11 +1222,13 @@ impl GhostTreeBstackAllocator {
                 }
 
                 // Not tail: zero gap + freed tail before taking the lock, then insert.
+                // Past the zero the original is no longer intact, and past the
+                // insert a torn AVL insert cannot be safely retried.
                 self.stack.zero(start + new_len, aligned_old - new_len)?;
+                lost = true;
                 #[cfg(feature = "atomic")]
                 let _guard = self.lock.lock().unwrap();
-                // Past this point a torn AVL insert cannot be safely retried.
-                lost = true;
+                self.guard_not_poisoned()?;
                 self.avl_insert(tail_ptr, freed_tail)?;
                 return Ok(Some(unsafe {
                     BStackOwnedSlice::from_raw_parts(self, start, new_len)
@@ -1345,6 +1407,7 @@ impl GhostTreeBstackAllocator {
 
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
+            self.guard_not_poisoned()?;
             if pf > 0 {
                 self.avl_insert(start, pf)?;
             }
@@ -1403,6 +1466,9 @@ impl BStackInPlaceResizeAllocator for GhostTreeBstackAllocator {
                 ),
                 slice,
             ));
+        }
+        if let Err(source) = self.guard_not_poisoned() {
+            return Err(BStackAllocError::with_handle(source, slice));
         }
         let start = slice.start();
         let old_len = slice.len();
@@ -1541,6 +1607,7 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             if slice.is_empty() {
                 return Ok(());
             }
+            self.guard_not_poisoned()?;
             if slice.start() < ARENA_START || slice.start() != Self::align_up_ptr(slice.start()) {
                 return Err(io_error!(
                     InvalidInput,
@@ -1579,6 +1646,9 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             self.stack.zero(ptr, true_len)?;
             #[cfg(feature = "atomic")]
             let _guard = self.lock.lock().unwrap();
+            // A refusal here returns the handle; its bytes are already zero,
+            // but the caller was freeing them.
+            self.guard_not_poisoned()?;
             lost = true;
             self.avl_insert(ptr, true_len)
         })();
@@ -1696,6 +1766,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
         let block_ptr = {
             #[cfg(feature = "atomic")]
             let guard = self.lock.lock().unwrap();
+            self.guard_not_poisoned()?;
             if let Some((ptr, block_size)) = self.avl_find_best_fit_and_remove(total)? {
                 let remainder = block_size - total;
                 if remainder >= MIN_ALLOC {
@@ -1781,6 +1852,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             if entries.is_empty() {
                 return Ok(());
             }
+            self.guard_not_poisoned()?;
 
             // Sort by address so adjacent slices are neighbours.
             entries.sort_by_key(|&(ptr, _)| ptr);
@@ -1836,6 +1908,7 @@ impl BStackBulkAllocator for GhostTreeBstackAllocator {
             if !merged.is_empty() {
                 #[cfg(feature = "atomic")]
                 let _guard = self.lock.lock().unwrap();
+                self.guard_not_poisoned()?;
                 for (ptr, size) in merged {
                     self.avl_insert(ptr, size)?;
                 }
@@ -2520,6 +2593,60 @@ mod tests {
                 in_use_bytes: 64,
             }
         );
+    }
+
+    // ── poisoning ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn poisoned_allocator_refuses_every_op_until_reopen() {
+        let (alloc, path) = open_fresh();
+        let _g = Guard(path.clone());
+        let mut a = alloc.alloc(64).unwrap();
+        a.write([3u8; 64]).unwrap();
+        let tail = alloc.alloc(64).unwrap(); // keeps `a` non-tail
+        let (a_start, tail_start) = (a.start(), tail.start());
+
+        alloc.poison_for_test();
+        let poisoned = |e: &io::Error| e.kind() == ErrorKind::InvalidData;
+
+        assert!(poisoned(&alloc.alloc(64).unwrap_err()));
+        assert!(poisoned(&alloc.alloc_uninit(64).unwrap_err()));
+        assert!(poisoned(&alloc.alloc_bulk([32, 32]).unwrap_err()));
+        assert!(
+            alloc.alloc(0).unwrap().is_empty(),
+            "zero-length stays a no-op"
+        );
+
+        let e = alloc.realloc(a, 128).unwrap_err();
+        assert!(poisoned(&e.source));
+        let e = alloc
+            .realloc_inplace(e.handle.unwrap(), 0, -32)
+            .unwrap_err();
+        assert!(poisoned(&e.source));
+        let e = alloc.dealloc(e.handle.unwrap()).unwrap_err();
+        assert!(poisoned(&e.source));
+        let a = e.handle.unwrap();
+        assert_eq!((a.start(), a.len()), (a_start, 64));
+        // The tail paths never touch the tree but are refused all the same.
+        let e = alloc.dealloc(tail).unwrap_err();
+        assert!(poisoned(&e.source));
+        let e = alloc.dealloc_bulk(vec![a, e.handle.unwrap()]).unwrap_err();
+        assert!(poisoned(&e.source));
+        assert_eq!(e.handles.len(), 2, "a refused bulk free keeps every handle");
+        drop(e);
+        assert!(
+            alloc.stats().is_ok(),
+            "stats is read-only and stays available"
+        );
+
+        // A reopen rebuilds the tree and clears the poison.
+        let alloc = GhostTreeBstackAllocator::new(alloc.into_stack()).unwrap();
+        assert_eq!(
+            alloc.stack().get(a_start, a_start + 64).unwrap(),
+            vec![3u8; 64]
+        );
+        let c = alloc.alloc(64).unwrap();
+        assert_eq!(c.start(), tail_start + 64);
     }
 
     // ── new() error cases ──────────────────────────────────────────────────────
@@ -3223,6 +3350,56 @@ mod fault_tests {
         let mut c = alloc.alloc(96).unwrap();
         c.write([6u8; 96]).unwrap();
         assert_eq!(c.read().unwrap(), vec![6u8; 96]);
+    }
+
+    // A fault on the insert's first up-pass write tears the tree, so the
+    // allocator poisons itself: later ops refuse rather than descend a node that
+    // may be reachable from two parents. A fault on the unlinked leaf write
+    // tears nothing and must not poison. A reopen clears it.
+    #[test]
+    fn torn_avl_insert_poisons_until_reopen() {
+        let path = temp_path("gt_poison");
+        let _g = Guard(path.clone());
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+
+        let a = alloc.alloc(64).unwrap();
+        let b = alloc.alloc(64).unwrap();
+        let c = alloc.alloc(64).unwrap();
+        let mut d = alloc.alloc(64).unwrap(); // keeps a..c non-tail
+        d.write([4u8; 64]).unwrap();
+        let d_start = d.start();
+        alloc.dealloc(a).unwrap(); // the tree is non-empty: the next insert has an up-pass
+
+        // set#0 is the leaf write: the block is lost but the tree is intact.
+        arm(&alloc, FailOpAt::new("set", 0, ErrorKind::Other));
+        let b_lost = alloc.dealloc(b).expect_err("leaf write faults");
+        disarm(&alloc);
+        assert!(b_lost.handle.is_none());
+        drop(b_lost);
+        let split = alloc.alloc(32).expect("a leaf-write fault must not poison");
+
+        // set#1 is the first ancestor write.
+        arm(&alloc, FailOpAt::new("set", 1, ErrorKind::Other));
+        let c_lost = alloc.dealloc(c).expect_err("up-pass write faults");
+        disarm(&alloc);
+        assert!(c_lost.handle.is_none());
+        drop(c_lost);
+
+        assert_eq!(
+            alloc.alloc(32).expect_err("poisoned").kind(),
+            ErrorKind::InvalidData
+        );
+        let err = alloc.dealloc(split).expect_err("poisoned");
+        assert_eq!(err.source.kind(), ErrorKind::InvalidData);
+        assert!(err.handle.is_some());
+        drop(err);
+
+        let alloc = GhostTreeBstackAllocator::new(alloc.into_stack()).unwrap();
+        assert_eq!(
+            alloc.stack().get(d_start, d_start + 64).unwrap(),
+            vec![4u8; 64]
+        );
+        alloc.alloc(64).expect("a reopen clears the poison");
     }
 
     // `dealloc` reads the payload size to decide truncate-the-tail versus recycle
