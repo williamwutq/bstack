@@ -1289,6 +1289,10 @@ free block; grows are `Unsupported`, as a headerless exact-size block has no
 neighbour tag to grow into without moving).  Without `atomic`: `Send` only.
 With `atomic`: `Send + Sync` via an internal `Mutex`.
 
+A tree mutation that fails partway poisons the allocator. Every later non-empty
+mutating call then fails with `InvalidData` (C: `EINVAL`) and hands back its
+handle, until a reopen rebuilds the tree.
+
 `stats` counts maximal contiguous live spans: a live allocation carries no
 header, leaving adjacent ones to read as a single span.
 

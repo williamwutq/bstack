@@ -264,6 +264,23 @@ No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
 imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
 
+A tree mutation that fails partway on an I/O error, with no crash, can leave a
+node reachable from two parents. Two later best-fit descents could then hand out
+overlapping regions. An in-memory `poisoned` flag guards this:
+
+- **Arming:** an error in an insert's or removal's write phase sets the flag.
+  - The write phase is the up-pass and `write_root`.
+  - Down-pass reads and the unlinked leaf write cannot tear the tree, so they
+    don't arm it.
+- **Checks:**
+  - every mutating call checks the flag on entry;
+  - under `atomic`, it's checked again under the mutex right before each tree
+    access.
+- **Clearing:** a reopen clears it, since `new` always rebuilds the tree.
+
+There is no on-disk flag, because every open already runs
+`coalesce_and_rebalance`.
+
 ### Thread safety
 
 `GhostTreeBstackAllocator` is always **`Send`** — ownership can be transferred
