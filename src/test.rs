@@ -3223,6 +3223,96 @@ mod alloc_tests {
         assert_eq!(s.rposition(|b| b == 7).unwrap(), None);
     }
 
+    // Spans several 512-byte scan windows, at a non-zero stack offset.
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_search_across_windows() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _pad = alloc.alloc(3).unwrap();
+        let s = alloc.alloc(1500).unwrap();
+        assert_eq!(s.find(7).unwrap(), None);
+        assert_eq!(s.rfind(7).unwrap(), None);
+        assert!(!s.contains(7).unwrap());
+        for hits in [
+            vec![0u64],
+            vec![511],
+            vec![512],
+            vec![1023, 1024],
+            vec![1499],
+            vec![0, 1499],
+            vec![5, 700, 1200],
+        ] {
+            let mut bytes = vec![0u8; 1500];
+            for &h in &hits {
+                bytes[h as usize] = 7;
+            }
+            s.write(&bytes).unwrap();
+            let (first, last) = (hits[0], *hits.last().unwrap());
+            assert!(s.contains(7).unwrap());
+            assert_eq!(s.find(7).unwrap(), Some(first), "{hits:?}");
+            assert_eq!(s.rfind(7).unwrap(), Some(last), "{hits:?}");
+            assert_eq!(s.position(|b| b == 7).unwrap(), Some(first));
+            assert_eq!(s.rposition(|b| b == 7).unwrap(), Some(last));
+            // A sub-view not aligned to the window grid.
+            let sub = s.subslice(first + 1, 1500);
+            let expect = hits.get(1).map(|&h| h - first - 1);
+            assert_eq!(sub.find(7).unwrap(), expect, "{hits:?}");
+        }
+        let empty = s.subslice(10, 10);
+        assert_eq!(empty.find(0).unwrap(), None);
+        assert_eq!(empty.rfind(0).unwrap(), None);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_reader_read_to_end_and_string() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _pad = alloc.alloc(3).unwrap();
+        let s = alloc.alloc(5).unwrap();
+        s.write(b"hello").unwrap();
+        let mut r = s.reader_at(1);
+        let mut out = b"x".to_vec();
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 4);
+        assert_eq!(out, b"xello");
+        assert_eq!(r.position(), 5);
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 0);
+        r.seek(SeekFrom::Start(9)).unwrap();
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 0);
+        assert_eq!(r.position(), 9);
+
+        let mut text = String::from(">");
+        let mut r = s.reader();
+        assert_eq!(r.read_to_string(&mut text).unwrap(), 5);
+        assert_eq!(text, ">hello");
+
+        s.write([0xffu8, b'a', b'b', b'c', b'd']).unwrap();
+        let mut text = String::from(">");
+        let err = s.reader().read_to_string(&mut text).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(text, ">");
+    }
+
+    // The no-op early-outs leave the bytes untouched.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_noop_mutations() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        let same = s;
+        s.copy_from_bstack_slice(&same).unwrap();
+        s.copy_within(1..3, 1).unwrap();
+        s.rotate_left(0).unwrap();
+        s.rotate_left(4).unwrap();
+        s.rotate_right(0).unwrap();
+        s.rotate_right(4).unwrap();
+        s.subslice(2, 3).reverse().unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 3, 4]);
+    }
+
     // Stronger read-only coverage over non-trivial written data.
     #[cfg(feature = "set")]
     #[test]

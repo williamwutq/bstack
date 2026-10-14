@@ -5,6 +5,10 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::ops::Range;
 
+/// Window size in bytes of the `atomic` slice searches (`find`, …).
+#[cfg(feature = "atomic")]
+const SCAN_WINDOW: usize = 512;
+
 /// A lifetime-coupled handle to a contiguous region of a [`BStack`] payload.
 ///
 /// `BStackSlice<'a, A>` is a lightweight `Copy` value that holds a shared
@@ -355,9 +359,14 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     }
 
     /// Returns `true` if the slice contains `needle`.
+    ///
+    /// With `atomic`, scans in windows under one read lock and stops at the
+    /// first hit; otherwise reads the whole slice. The same holds for
+    /// [`find`](Self::find), [`rfind`](Self::rfind),
+    /// [`position`](Self::position), and [`rposition`](Self::rposition).
     #[inline]
     pub fn contains(&self, needle: u8) -> io::Result<bool> {
-        Ok(self.read()?.contains(&needle))
+        Ok(self.find(needle)?.is_some())
     }
 
     /// Returns `true` if the slice begins with `prefix`.
@@ -382,42 +391,100 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     /// found.
     #[inline]
     pub fn find(&self, needle: u8) -> io::Result<Option<u64>> {
-        Ok(self
-            .read()?
-            .iter()
-            .position(|&b| b == needle)
-            .map(|i| i as u64))
+        self.scan(false, |w| w.iter().position(|&b| b == needle))
     }
 
     /// Returns the index of the last occurrence of `needle`, or `None` if not
     /// found.
     #[inline]
     pub fn rfind(&self, needle: u8) -> io::Result<Option<u64>> {
-        Ok(self
-            .read()?
-            .iter()
-            .rposition(|&b| b == needle)
-            .map(|i| i as u64))
+        self.scan(true, |w| w.iter().rposition(|&b| b == needle))
     }
 
     /// Returns the index of the first byte satisfying `predicate`, or `None`.
     #[inline]
     pub fn position(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
-        Ok(self
-            .read()?
-            .iter()
-            .position(|&b| predicate(b))
-            .map(|i| i as u64))
+        self.scan(false, |w| w.iter().position(|&b| predicate(b)))
     }
 
     /// Returns the index of the last byte satisfying `predicate`, or `None`.
     #[inline]
     pub fn rposition(&self, predicate: impl Fn(u8) -> bool) -> io::Result<Option<u64>> {
-        Ok(self
-            .read()?
-            .iter()
-            .rposition(|&b| predicate(b))
-            .map(|i| i as u64))
+        self.scan(true, |w| w.iter().rposition(|&b| predicate(b)))
+    }
+
+    /// Shared engine of the search methods: feed the slice to `hit` front to
+    /// back (`rev`: back to front), returning the slice-relative index of the
+    /// first window position `hit` reports.
+    ///
+    /// Windows of [`SCAN_WINDOW`] bytes are read inside one
+    /// [`BStack::get_batched_gen`], so the scan sees one snapshot and stops
+    /// reading at the first hit.
+    #[cfg(feature = "atomic")]
+    fn scan(
+        &self,
+        rev: bool,
+        mut hit: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> io::Result<Option<u64>> {
+        const W: u64 = SCAN_WINDOW as u64;
+        let len = self.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        // The generator holds only a raw pointer to the window, never a slice
+        // across a read.
+        let mut window = [0u8; SCAN_WINDOW];
+        let ptr = window.as_mut_ptr();
+        let start = self.start();
+        // The current window is `[lo, lo + n)`, slice-relative; `n == 0`
+        // before the first read.
+        let mut lo = if rev { len } else { 0 };
+        let mut n = 0usize;
+        let mut found = None;
+        self.stack().get_batched_gen(|| {
+            if n > 0 {
+                // SAFETY: the previous read filled `n` bytes at `ptr` and has
+                // completed; this slice dies before the next read is issued.
+                let w = unsafe { core::slice::from_raw_parts(ptr, n) };
+                if let Some(i) = hit(w) {
+                    found = Some(lo + i as u64);
+                    return None;
+                }
+            }
+            let m = if rev {
+                if lo == 0 {
+                    return None;
+                }
+                let m = lo.min(W);
+                lo -= m;
+                m
+            } else {
+                lo += n as u64;
+                if lo == len {
+                    return None;
+                }
+                (len - lo).min(W)
+            };
+            // `m <= W`, so the cast is lossless.
+            n = m as usize;
+            // SAFETY: `window` outlives the call, and the shared slice above
+            // is dead, so this is the only live reference into it.
+            Some((start + lo, unsafe {
+                core::slice::from_raw_parts_mut(ptr, n)
+            }))
+        })?;
+        Ok(found)
+    }
+
+    /// `not(atomic)` engine: one whole-slice read, searched in memory.
+    #[cfg(not(feature = "atomic"))]
+    #[inline]
+    fn scan(
+        &self,
+        _rev: bool,
+        mut hit: impl FnMut(&[u8]) -> Option<usize>,
+    ) -> io::Result<Option<u64>> {
+        Ok(hit(&self.read()?).map(|i| i as u64))
     }
 
     /// Read the entire slice into a newly allocated `Vec<u8>`.
@@ -655,7 +722,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
                 "BStackSlice::copy_from_bstack_slice: source belongs to a different BStack",
             ));
         }
-        if self.is_empty() {
+        if self.is_empty() || src.start() == self.start() {
             return Ok(());
         }
         self.stack().copy(src.start(), self.start(), self.len())
@@ -693,7 +760,7 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
             dest_end <= self.len(),
             "copy_within: dest range exceeds slice length"
         );
-        if n == 0 {
+        if n == 0 || src_range.start == dest {
             return Ok(());
         }
         self.stack()
@@ -885,6 +952,9 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
+        if self.len() < 2 {
+            return Ok(());
+        }
         self.stack()
             .process(self.start(), self.end(), |buf| buf.reverse())
     }
@@ -906,6 +976,9 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
             mid <= self.len(),
             "rotate_left: mid must be <= slice length"
         );
+        if mid == 0 || mid == self.len() {
+            return Ok(());
+        }
         self.stack().process(self.start(), self.end(), |buf| {
             buf.rotate_left(mid as usize)
         })
@@ -925,6 +998,9 @@ impl<'a, A: BStackAllocator> BStackSlice<'a, A> {
     #[track_caller]
     pub fn rotate_right(&mut self, k: u64) -> io::Result<()> {
         assert!(k <= self.len(), "rotate_right: k must be <= slice length");
+        if k == 0 || k == self.len() {
+            return Ok(());
+        }
         self.stack()
             .process(self.start(), self.end(), |buf| buf.rotate_right(k as usize))
     }
@@ -1112,6 +1188,48 @@ impl<'a, A: BStackAllocator> io::Read for BStackSliceReader<'a, A> {
         let abs_start = self.slice.offset + self.cursor;
         self.slice.stack().get_into(abs_start, &mut buf[..n])?;
         self.cursor += n as u64;
+        Ok(n)
+    }
+
+    /// Reads the rest of the slice in one [`BStack::get_into`], rather than
+    /// the default's repeated growing-probe reads.
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let rem = self.slice.len.saturating_sub(self.cursor);
+        if rem == 0 {
+            return Ok(0);
+        }
+        let n = usize::try_from(rem).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "read_to_end: slice exceeds usize",
+            )
+        })?;
+        let old = buf.len();
+        buf.try_reserve_exact(n).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "read_to_end: allocation failed")
+        })?;
+        buf.resize(old + n, 0);
+        let abs_start = self.slice.offset + self.cursor;
+        if let Err(e) = self.slice.stack().get_into(abs_start, &mut buf[old..]) {
+            buf.truncate(old);
+            return Err(e);
+        }
+        self.cursor += rem;
+        Ok(n)
+    }
+
+    /// Routes through [`read_to_end`](Self::read_to_end); std's default
+    /// does not.
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        let mut bytes = Vec::new();
+        let n = self.read_to_end(&mut bytes)?;
+        let s = std::str::from_utf8(&bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        buf.push_str(s);
         Ok(n)
     }
 }
