@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BStackSliceReader::read_to_end` and `read_to_string` read the rest of the slice in one `get_into` (Rust).** std's defaults issued repeated growing-probe reads.
 - **`sort_partial_by` and `select_nth_partial_by` rotate and reverse small spans in one commit (Rust and C, `set` + `atomic`).** A rotation or reversal that fits the sort budget is one `process` (C: `bstack_process`) instead of one `cross_exchange` per record pair. Wider spans keep the per-record swaps.
 
+### Fixed
+
+- **`GhostTreeBstackAllocator` kept serving a torn free tree after an I/O error, so two allocations could receive overlapping regions (Rust and C).** A tree mutation that failed partway could leave a node reachable from two parents until the next reopen. The allocator now poisons itself in memory on such a failure. Until a reopen rebuilds the tree, every non-empty `alloc`, `realloc`, `realloc_inplace` (Rust), `dealloc`, and bulk call fails with `InvalidData` (C: `EINVAL`) and hands back its handle (C: returns `-1`). C's `ghost_tree_bstack_allocator_t` gains a `poisoned` field; callers that only create it through `ghost_tree_bstack_allocator_new` are unaffected.
+- **`GhostTreeBstackAllocator::realloc`'s `atomic` tail shrink could return an out-of-bounds handle on error (Rust and C).** A failed tail-replace that had already armed is rolled forward by the next replay, yet the original handle was returned. An error after the tail-replace is issued now reports the block lost (`handle: None`; C: `-2`).
+
 ## [0.4.6] - 2026-10-01
 
 ### Added
