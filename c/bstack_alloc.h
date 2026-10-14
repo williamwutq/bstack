@@ -1123,6 +1123,13 @@ int first_fit_bstack_allocator_stats(
  * mutations; tail operations use bstack_try_discard / bstack_try_extend_zeros,
  * which check-and-act atomically under bstack's own write lock without holding
  * the allocator mutex.
+ *
+ * Poisoning: a tree mutation that fails partway on an I/O error can leave a
+ * node reachable from two parents, so two later allocations could share a
+ * region.  The allocator then poisons itself: every non-empty alloc, realloc,
+ * dealloc, and bulk call fails with errno = EINVAL until a reopen
+ * (ghost_tree_bstack_allocator_into_stack, then _new) rebuilds the tree.  A
+ * call refused on entry leaves its slice intact (-1).
  * ====================================================================== */
 
 typedef struct {
@@ -1132,6 +1139,10 @@ typedef struct {
     /* Opaque platform mutex; serialises AVL tree mutations so a single handle
      * may be shared across threads. */
     void              *lock;
+    /* Set when a tree mutation fails partway (see "Poisoning" above). */
+    atomic_int         poisoned;
+#else
+    int                poisoned;
 #endif
 } ghost_tree_bstack_allocator_t;
 

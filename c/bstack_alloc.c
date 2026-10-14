@@ -4431,10 +4431,21 @@ static int algt_avl_rebalance(bstack_t *bs, uint64_t node, int8_t bf, uint8_t he
     return 0;
 }
 
+/* ---- poisoning --------------------------------------------------------- */
+
+/* Refuse while a prior tree mutation is torn.  Under BSTACK_FEATURE_ATOMIC the
+ * check that gates a tree access runs under a->lock. */
+static inline int algt_guard_not_poisoned(ghost_tree_bstack_allocator_t *a)
+{
+    if (a->poisoned) { errno = EINVAL; return -1; }
+    return 0;
+}
+
 /* ---- AVL insert -------------------------------------------------------- */
 
-static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
+static int algt_avl_insert(ghost_tree_bstack_allocator_t *a, uint64_t ptr, uint64_t size)
 {
+    bstack_t *bs = a->bs;
     algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
     size_t   path_len = 0;
     uint64_t root, current, child;
@@ -4467,6 +4478,7 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
         memset(buf, 0, 32); /* null children → cached child heights [10],[11] = 0 */
         write_le64(buf, size);
         buf[9] = 1;
+        /* The leaf is not yet linked, so a failure here leaves the tree intact. */
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
     }
 
@@ -4492,13 +4504,18 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
             }
             if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
                                  new_left, new_right, known_lh, known_rh, &bf, &h) != 0)
-                return -1;
-            if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+                goto torn;
+            if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) goto torn;
             child   = new_child;
             child_h = new_h;
         }
     }
-    return algt_write_root(bs, child);
+    if (algt_write_root(bs, child) != 0) goto torn;
+    return 0;
+
+torn:
+    a->poisoned = 1; /* the up-pass may have torn the tree */
+    return -1;
 }
 
 /* ---- AVL remove-min ---------------------------------------------------- */
@@ -4559,9 +4576,10 @@ static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
 
 /* Find and remove the best-fit (smallest block >= min_size) in one O(log n)
  * pass.  Sets *out_found_ptr = ALGT_NULL_PTR when no block fits. */
-static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
-    uint64_t *out_found_ptr, uint64_t *out_found_size)
+static int algt_avl_find_best_fit_and_remove(ghost_tree_bstack_allocator_t *a,
+    uint64_t min_size, uint64_t *out_found_ptr, uint64_t *out_found_size)
 {
+    bstack_t *bs = a->bs;
     algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
     size_t   path_len    = 0;
     int      fit_found   = 0;
@@ -4618,7 +4636,9 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     found_lh    = path[last_fit_idx].lh; /* cached found_left  height */
     found_rh    = path[last_fit_idx].rh; /* cached found_right height */
 
-    /* Seed the up-pass directly with the best-fit node's replacement.  child_h
+    /* Everything from here writes the tree, so a failure may tear it (torn).
+     *
+     * Seed the up-pass directly with the best-fit node's replacement.  child_h
      * is the replacement subtree's height — known in every case now (single
      * child from the cache, successor from its rebalance). */
     if (found_left == ALGT_NULL_PTR) {
@@ -4631,10 +4651,10 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
         uint64_t succ, succ_sz, new_right;
         int8_t   bf; uint8_t h, rh;
         if (algt_avl_remove_min(bs, found_right, &succ, &succ_sz, &new_right) != 0)
-            return -1;
+            goto torn;
         if (algt_avl_write_h(bs, succ, succ_sz, found_left, new_right, -1, -1, &bf, &h) != 0)
-            return -1;
-        if (algt_avl_rebalance(bs, succ, bf, h, &child, &rh) != 0) return -1;
+            goto torn;
+        if (algt_avl_rebalance(bs, succ, bf, h, &child, &rh) != 0) goto torn;
         child_h = (int)rh;
     }
 
@@ -4653,16 +4673,20 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
             known_lh  = (int)path[i].lh; known_rh  = child_h;
         }
         if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
-                             new_left, new_right, known_lh, known_rh, &bf, &h) != 0) return -1;
-        if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+                             new_left, new_right, known_lh, known_rh, &bf, &h) != 0) goto torn;
+        if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) goto torn;
         child   = new_child;
         child_h = (int)new_h;
     }
-    if (algt_write_root(bs, child) != 0) return -1;
+    if (algt_write_root(bs, child) != 0) goto torn;
 
     *out_found_ptr  = found_ptr;
     *out_found_size = found_size;
     return 0;
+
+torn:
+    a->poisoned = 1;
+    return -1;
 }
 
 /* ---- coalesce and rebalance -------------------------------------------- */
@@ -4907,10 +4931,12 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
     if (aligned == UINT64_MAX) { errno = EINVAL; return -1; }
 
     /* Lock covers AVL search and conditional insert (split case).
-     * Released before bstack_zero (no-split) and before bstack_extend. */
+     * Released before bstack_zero (no-split) and before bstack_extend.  The
+     * poison check is under the lock, so it also covers the extend fallback. */
     MUTEX_LOCK(a);
-    if (algt_avl_find_best_fit_and_remove(a->bs, aligned,
-                                           &found_ptr, &found_size) != 0) {
+    if (algt_guard_not_poisoned(a) != 0 ||
+        algt_avl_find_best_fit_and_remove(a, aligned,
+                                          &found_ptr, &found_size) != 0) {
         MUTEX_UNLOCK(a);
         return -1;
     }
@@ -4920,7 +4946,7 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
         if (remainder >= ALGT_MIN_ALLOC) {
             /* Split: leading remainder becomes a new free block;
              * allocated block is at the back (tail of the found region). */
-            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+            if (algt_avl_insert(a, found_ptr, remainder) != 0) {
                 MUTEX_UNLOCK(a);
                 return -1;
             }
@@ -4964,6 +4990,8 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 
     if (slice.len == 0) return 0;
 
+    if (algt_guard_not_poisoned(a) != 0) return -1;
+
     if (slice.offset < ALGT_ARENA_START ||
         slice.offset != algt_align_up_ptr(slice.offset)) {
         errno = EINVAL;
@@ -4991,10 +5019,13 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     {
         int r;
         MUTEX_LOCK(a);
+        /* A refusal here keeps the slice (-1); its bytes are already zero, but
+         * the caller was freeing them. */
+        if (algt_guard_not_poisoned(a) != 0) { MUTEX_UNLOCK(a); return -1; }
         /* Past this point a torn (non-atomic) AVL insert cannot be safely
          * retried — GhostTree has no is_free flag to repair it in-process, so
          * a failure here can no longer hand the original back (-2). */
-        r = algt_avl_insert(a->bs, slice.offset, true_len);
+        r = algt_avl_insert(a, slice.offset, true_len);
         MUTEX_UNLOCK(a);
         return r == 0 ? 0 : -2;
     }
@@ -5012,7 +5043,7 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
          * torn AVL insert cannot be safely retried (-2), same reasoning as the
          * atomic path above. */
         if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
-        return algt_avl_insert(a->bs, slice.offset, true_len) == 0 ? 0 : -2;
+        return algt_avl_insert(a, slice.offset, true_len) == 0 ? 0 : -2;
     }
 #endif
 }
@@ -5045,6 +5076,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         }
         return 0;
     }
+
+    if (algt_guard_not_poisoned(a) != 0) { *out = recovered; return -1; }
 
     if (slice.offset < ALGT_ARENA_START ||
         slice.offset != algt_align_up_ptr(slice.offset)) {
@@ -5108,8 +5141,9 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
          * crash-atomic splice. As two calls (try_discard then zero) a crash
          * between them shrinks the stack yet leaves the padding un-zeroed —
          * violating the zeroed-memory invariant. bstack_process_gen holds one
-         * write lock across the LEN tail-check and the SPLICE, so a fault is
-         * consulted before any mutation and leaves the block fully intact. */
+         * write lock across the LEN tail-check and the SPLICE. A SPLICE error
+         * may land after arming, and a replay then commits the cut, so it
+         * reports the block lost (-2). A LEN error precedes any mutation. */
         {
             bstack_alloc_tail_shrink_ctx_t ctx;
             uint8_t pad[ALGT_MIN_ALLOC];   /* zeros re-appended in the cut's place */
@@ -5125,6 +5159,7 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             ctx.new_buf       = pad;
             ctx.new_len       = (size_t)(aligned_new - new_len);
             if (bstack_process_gen(a->bs, bstack_alloc_tail_shrink_gen, &ctx) != 0) {
+                if (ctx.truncated) return -2;
                 *out = recovered;
                 return -1;
             }
@@ -5163,8 +5198,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
         /* Non-tail: zero gap + freed tail (no lock), insert freed tail under
          * lock. The zero leaves the block intact on failure (-1); past that
-         * point a torn (non-atomic) AVL insert cannot be safely retried, so a
-         * failure there is a genuine loss (-2). */
+         * point the original is no longer intact and a torn (non-atomic) AVL
+         * insert cannot be safely retried, so any failure is a loss (-2). */
         {
             uint64_t zero_n = aligned_old - new_len;
 #if UINT64_MAX > SIZE_MAX
@@ -5178,7 +5213,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         {
             int r;
             MUTEX_LOCK(a);
-            r = algt_avl_insert(a->bs, tail_ptr, freed_tail);
+            r = algt_guard_not_poisoned(a) != 0 ? -1
+                : algt_avl_insert(a, tail_ptr, freed_tail);
             MUTEX_UNLOCK(a);
             if (r != 0) return -2;
         }
@@ -5318,8 +5354,9 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
      * insert (split); released before bstack_zero and before bstack_extend. */
     block_ptr = ALGT_NULL_PTR; /* sentinel: no free block found */
     MUTEX_LOCK(a);
-    if (algt_avl_find_best_fit_and_remove(a->bs, total,
-                                           &found_ptr, &found_size) != 0) {
+    if (algt_guard_not_poisoned(a) != 0 ||
+        algt_avl_find_best_fit_and_remove(a, total,
+                                          &found_ptr, &found_size) != 0) {
         MUTEX_UNLOCK(a);
         free(aligned);
         return -1;
@@ -5330,7 +5367,7 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
         if (remainder >= ALGT_MIN_ALLOC) {
             /* Split: recycle the leading remainder as a new free block;
              * use the trailing `total` bytes for the allocation. */
-            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+            if (algt_avl_insert(a, found_ptr, remainder) != 0) {
                 MUTEX_UNLOCK(a);
                 free(aligned);
                 return -1;
@@ -5419,6 +5456,8 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
 
     if (pairs_n == 0) { free(pairs); return 0; }
 
+    if (algt_guard_not_poisoned(a) != 0) { free(pairs); return -1; }
+
     /* Sort by address so contiguous blocks are adjacent. */
     qsort(pairs, pairs_n, sizeof *pairs, algt_cmp_pair_by_ptr);
 
@@ -5487,8 +5526,13 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
     /* Insert all zeroed blocks under the lock. */
     if (pairs_n > 0) {
         MUTEX_LOCK(a);
+        if (algt_guard_not_poisoned(a) != 0) {
+            MUTEX_UNLOCK(a);
+            free(pairs);
+            return -1;
+        }
         for (i = 0; i < pairs_n; i++) {
-            if (algt_avl_insert(a->bs, pairs[i].ptr, pairs[i].size) != 0) {
+            if (algt_avl_insert(a, pairs[i].ptr, pairs[i].size) != 0) {
                 MUTEX_UNLOCK(a);
                 free(pairs);
                 return -1;
@@ -5521,6 +5565,7 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
     a->base.vtbl      = &gt_bulk_vtbl.base;
     a->base.bulk_vtbl = &gt_bulk_vtbl;
     a->bs             = bs;
+    a->poisoned       = 0;
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }

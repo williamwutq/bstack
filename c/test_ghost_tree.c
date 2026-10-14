@@ -1992,6 +1992,58 @@ static int test_foreign_slice_is_rejected(void)
  * main
  * ====================================================================== */
 
+/* A torn tree mutation poisons the allocator: every non-empty op refuses with
+ * EINVAL and keeps its slice (-1) until a reopen rebuilds the tree. */
+static int test_poisoned_allocator_refuses_until_reopen(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    {
+        bstack_t *bs = bstack_open(tmp); CHECK(bs);
+        ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+        CHECK(a);
+        bstack_allocator_t *al = (bstack_allocator_t *)a;
+        bstack_slice_t s, tail, out, bulk[2];
+        uint64_t lens[2] = {32, 32};
+        uint8_t fill[64], buf[64];
+
+        memset(fill, 0x3C, sizeof fill);
+        CHECK(bstack_allocator_alloc(al, 64, &s) == 0);
+        CHECK(bstack_slice_write(s, fill, 64) == 0);
+        CHECK(bstack_allocator_alloc(al, 64, &tail) == 0); /* keeps s non-tail */
+
+        a->poisoned = 1;
+
+        errno = 0; CHECK(bstack_allocator_alloc(al, 64, &out) == -1); CHECK(errno == EINVAL);
+        errno = 0; CHECK(bstack_allocator_alloc_bulk(al, lens, 2, bulk) == -1);
+        CHECK(errno == EINVAL);
+        CHECK(bstack_allocator_alloc(al, 0, &out) == 0); /* zero-length stays a no-op */
+
+        errno = 0; CHECK(bstack_allocator_realloc(al, s, 128, &out) == -1);
+        CHECK(errno == EINVAL);
+        CHECK(out.offset == s.offset && out.len == s.len);
+        errno = 0; CHECK(bstack_allocator_dealloc(al, s) == -1); CHECK(errno == EINVAL);
+        /* The tail paths never touch the tree but are refused all the same. */
+        errno = 0; CHECK(bstack_allocator_dealloc(al, tail) == -1); CHECK(errno == EINVAL);
+        bulk[0] = s; bulk[1] = tail;
+        errno = 0; CHECK(bstack_allocator_dealloc_bulk(al, bulk, 2) == -1);
+        CHECK(errno == EINVAL);
+        CHECK(ghost_tree_bstack_allocator_stats(a, NULL, NULL, NULL, NULL) == 0);
+
+        /* A reopen rebuilds the tree and clears the poison. */
+        bs = ghost_tree_bstack_allocator_into_stack(a);
+        a = ghost_tree_bstack_allocator_new(bs); CHECK(a);
+        al = (bstack_allocator_t *)a;
+        s.allocator = al;
+        CHECK(bstack_slice_read(s, buf) == 0);
+        CHECK(memcmp(buf, fill, 64) == 0);
+        CHECK(bstack_allocator_alloc(al, 64, &out) == 0);
+        CHECK(out.offset == tail.offset + 64);
+        bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    }
+    gt_unlink(tmp);
+    return 0;
+}
+
 int main(void)
 {
     /* Unit */
@@ -2053,6 +2105,7 @@ int main(void)
     T(test_stats_dedups_a_node_reachable_from_two_parents);
 
     T(test_foreign_slice_is_rejected);
+    T(test_poisoned_allocator_refuses_until_reopen);
 
     printf("\n%d/%d passed\n", g_passed, g_total);
     return (g_passed == g_total) ? 0 : 1;
