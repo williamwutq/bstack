@@ -110,32 +110,6 @@ Free-block adjacency is only observable by striding the arena, so `coalescible()
 
 ---
 
-## `GhostTreeBstackAllocator` has no in-process poison guard after a torn tree mutation
-
-**Feature flag:** `alloc` + `set`
-**Breaking change:** No
-**Impact:** HIGH
-
-### Motivation
-
-A tree mutation writes several AVL nodes as a sequence of individually durable ops. The removal up-pass and a `dealloc` insert both do this. A real I/O error partway commits the earlier writes and drops the rest. The on-disk tree is then structurally torn: a node becomes reachable from two parents.
-
-A reopen repairs the tree, since `coalesce_and_rebalance` dedups it. Between the error and a reopen the allocator keeps serving calls. Two later allocations descend the two paths of a double-parented node and receive **overlapping regions**. Ghost_tree's own comments record this state and warn that one region can reach two allocations.
-
-`FirstFitBStackAllocator` guards this class with an in-memory `poisoned` flag armed by an on-disk CAS and checked at every entry. Ghost_tree keeps serving a torn tree for want of the same guard. The overlap needs only a real I/O error and continued use in the same session, with no crash or concurrency.
-
-### Design
-
-Add an in-memory `poisoned: AtomicBool` that mirrors first_fit's `poisoned` and `guard_not_poisoned`. `alloc`, `dealloc`, and `realloc` each read the flag on entry and return an error while it is set. Any error raised after a tree mutation begins sets the flag. A torn tree then refuses further work until a reopen rebuilds a consistent tree with `coalesce_and_rebalance` and produces a fresh handle. The in-memory flag suffices for the in-process overlap, since a reopen reconciles the on-disk tree.
-
-### Open questions
-
-**On-disk arming.** first_fit arms an on-disk CAS flag alongside the in-memory bool. Ghost_tree's reopen already repairs the tree, so an on-disk arm duplicates that repair. Decide whether the on-disk flag earns its extra write.
-
-**The atomic tail-shrink `lost` half** (lower impact). The atomic branch returns `handle: Some(old_len)` and leaves `lost` clear. A `SpliceShrink` deferred replay rolls the truncation forward, so after a reopen the handle's tail lies out of bounds. The harm needs a real I/O error mid-splice, a crash, and a caller that persisted the extent. Setting `lost = true` may be wrong. The atomic `Atrunc` is one opaque call, and it reports the same error for a fault before arming and a fault after arming. A fault before arming keeps `old_len` valid. A fault after arming moves the durable length to `new_len`. Ghost_tree cannot separate the two, so it cannot know which handle to return. Decide whether ghost_tree fixes this locally or needs a richer error signal from the `Atrunc` and journal primitive.
-
----
-
 ## Compact `Repeat` staging within a batched commit (0.5.0)
 
 **Feature flag:** `set` + `atomic`.
