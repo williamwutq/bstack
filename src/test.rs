@@ -5060,6 +5060,19 @@ mod alloc_tests {
             .collect()
     }
 
+    // 22b. A stride too large for the engines' in-memory scratch is rejected
+    //      before any I/O rather than truncated to `usize`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_rejects_stride_too_large_for_usize() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks((usize::MAX / 4) as u64 + 1);
+        let err = view.sort_partial_by(|a, b| a.cmp(b)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+    }
+
     // 23. A region that fits the budget is fully sorted in one process pass.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]

@@ -1194,8 +1194,9 @@ impl<'a> BStackChunk<'a> {
     /// re-running from any such permutation completes the sort, so as long as
     /// I/O eventually succeeds, repeated calls converge to fully sorted.
     ///
-    /// Returns `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
-    /// I/O failure. Not guaranteed stable — the out-of-core merge may reorder
+    /// Returns `Err` on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure, or [`io::ErrorKind::OutOfMemory`] before any I/O when
+    /// `chunk_len` is too large for this platform's `usize`. Not guaranteed stable — the out-of-core merge may reorder
     /// records that compare equal (use [`sort_by`](Self::sort_by) when the whole
     /// region fits memory and stability is required).
     ///
@@ -1245,8 +1246,10 @@ impl<'a> BStackChunk<'a> {
     /// Every step is crash-atomic and permutation-preserving, so a crash or an
     /// early I/O-error return leaves the region as a valid permutation (never
     /// lost or duplicated data) and re-running completes the selection. Returns
-    /// `Err` only on a genuine [`BStack::process`]/[`BStack::inplace_gen`] I/O
-    /// failure. See `algos/SORTSELECT.md`.
+    /// `Err` on a genuine [`BStack::process`]/[`BStack::inplace_gen`] I/O
+    /// failure, or [`io::ErrorKind::OutOfMemory`] before any I/O when
+    /// `chunk_len` is too large for this platform's `usize`. See
+    /// `algos/SORTSELECT.md`.
     ///
     /// Requires the `set` and `atomic` features.
     ///
@@ -1467,13 +1470,16 @@ struct Records<'s, 'a> {
 
 #[cfg(all(feature = "set", feature = "atomic"))]
 impl<'s, 'a> Records<'s, 'a> {
+    /// Rejects a stride whose four-record scratch would not fit `usize`, as
+    /// C's `records_init` does: on a 32-bit target `c as usize` would truncate,
+    /// and the engines would then move partial records.
     #[inline]
-    fn new(aligned: &'s BStackSlice<'a>, c: u64) -> Self {
-        Records {
-            aligned,
-            c,
-            cu: c as usize,
-        }
+    fn new(aligned: &'s BStackSlice<'a>, c: u64) -> io::Result<Self> {
+        let cu = usize::try_from(c)
+            .ok()
+            .filter(|&cu| cu <= usize::MAX / 4)
+            .ok_or_else(|| io_error!(OutOfMemory, "chunk_len too large for this platform"))?;
+        Ok(Records { aligned, c, cu })
     }
 
     /// Number of whole records in the region.
@@ -1877,7 +1883,7 @@ fn merge_sort(
     c: u64,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<()> {
-    let r = Records::new(aligned, c);
+    let r = Records::new(aligned, c)?;
     let count = r.count();
     if count <= 1 {
         return Ok(());
@@ -1939,7 +1945,7 @@ fn select_nth(
     n: u64,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<()> {
-    let r = Records::new(aligned, c);
+    let r = Records::new(aligned, c)?;
     let count = r.count();
     if count <= 1 {
         return Ok(());

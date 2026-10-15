@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`sort_partial_by` rotates and reverses small spans in one commit (Rust and C, `set` + `atomic`).** A rotation or reversal that fits the sort budget is one `process` (C: `bstack_process`) instead of one `cross_exchange` per record pair. Wider spans keep the per-record swaps.
 - **`select_nth_partial_by`/`_key` and C's `bstack_slice_partition_partial` use a three-way windowed partition (`set` + `atomic`).** Each round splits a budget-sized window from each end of the range in memory and commits both in one `inplace_gen` (C: `bstack_inplace_gen`), instead of one `cross_exchange` per moved record; a round that moves nothing does not touch disk. Records equal to the pivot now drop out of the range in a single round, making selection far more efficient on regions with many duplicate keys.
 
+### Fixed
+
+- **`BStackChunk::sort_partial_by`/`_key` could corrupt records longer than `usize::MAX` bytes on 32-bit targets (Rust).** The record length was truncated to `usize`, so a merge step could move only part of each record. A `chunk_len` too large for the engine's scratch now fails with `io::ErrorKind::OutOfMemory` before any I/O, matching C's `ENOMEM`; `select_nth_partial_by`/`_key` check it too.
+
 ## [0.4.6] - 2026-10-01
 
 ### Added
