@@ -1267,15 +1267,15 @@ static inline uint64_t rec_window(const struct records *r)
 }
 
 /* One partition step (bstack_inplace_gen generator): read the record ranges at
- * a_off and, when nb != 0, at b_off into win, move every left record of their
- * concatenation ahead of the rest, and write back only the windows that
+ * a_off and, when b_len != 0, at b_off into win, move every left record of
+ * their concatenation ahead of the rest, and write back only the windows that
  * changed.  A record is left when cmp(x, piv) < 0, or <= 0 when le is set. */
 struct part_round {
     uint64_t       a_off, b_off;
-    size_t         na, nb;     /* window lengths in bytes */
+    size_t         a_len, b_len; /* window lengths in bytes */
     size_t         cu;
     size_t         nleft;      /* out: left records in the concatenation */
-    uint8_t       *win;        /* na + nb bytes */
+    uint8_t       *win;        /* a_len + b_len bytes */
     uint8_t       *tmp;        /* one record of swap scratch */
     const uint8_t *piv;
     int          (*cmp)(const void *, const void *);
@@ -1295,20 +1295,20 @@ static int part_is_left(const struct part_round *c, size_t t)
 /* Hoare split of the concatenation in memory, noting which windows it moved. */
 static void part_split(struct part_round *c)
 {
-    size_t cu = c->cu, ka = c->na / cu;
-    size_t i = 0, j = (c->na + c->nb) / cu;
+    size_t cu = c->cu, ka = c->a_len / cu;
+    size_t i = 0, j = (c->a_len + c->b_len) / cu;
     for (;;) {
         while (i < j && part_is_left(c, i)) i++;
         while (i < j && !part_is_left(c, j - 1)) j--;
         if (i == j) break; /* the scans met: every record is classified */
-        j--;
+        /* Record i is right and record j - 1 is left: swap them through tmp. */
         memcpy(c->tmp, c->win + i * cu, cu);
-        memcpy(c->win + i * cu, c->win + j * cu, cu);
-        memcpy(c->win + j * cu, c->tmp, cu);
-        /* i < j: window a moved iff i lies in it, window b iff j does. */
-        c->write_a |= i < ka;
-        c->write_b |= j >= ka;
-        i++;
+        memcpy(c->win + i * cu, c->win + (j - 1) * cu, cu);
+        memcpy(c->win + (j - 1) * cu, c->tmp, cu);
+        /* i < j - 1: window a moved iff record i lies in it, window b iff
+         * record j - 1 does. */
+        c->write_a |= i++ < ka;
+        c->write_b |= j-- > ka;
     }
     c->nleft = i;
 }
@@ -1328,15 +1328,15 @@ static int part_round_gen(bstack_gen_op_t *op, void *ctxp)
         op->kind = BSTACK_GEN_READ;
         op->u.read.offset = c->a_off;
         op->u.read.buf    = c->win;
-        op->u.read.len    = c->na;
+        op->u.read.len    = c->a_len;
         return 1;
     case 1:
         c->step = 2;
-        if (c->nb) {
+        if (c->b_len) {
             op->kind = BSTACK_GEN_READ;
             op->u.read.offset = c->b_off;
-            op->u.read.buf    = c->win + c->na;
-            op->u.read.len    = c->nb;
+            op->u.read.buf    = c->win + c->a_len;
+            op->u.read.len    = c->b_len;
             return 1;
         }
         /* fall through */
@@ -1349,7 +1349,7 @@ static int part_round_gen(bstack_gen_op_t *op, void *ctxp)
             op->kind = BSTACK_GEN_WRITE;
             op->u.write.offset = c->a_off;
             op->u.write.data   = c->win;
-            op->u.write.len    = c->na;
+            op->u.write.len    = c->a_len;
             return 1;
         }
         /* fall through */
@@ -1358,8 +1358,8 @@ static int part_round_gen(bstack_gen_op_t *op, void *ctxp)
         if (c->write_b) {
             op->kind = BSTACK_GEN_WRITE;
             op->u.write.offset = c->b_off;
-            op->u.write.data   = c->win + c->na;
-            op->u.write.len    = c->nb;
+            op->u.write.data   = c->win + c->a_len;
+            op->u.write.len    = c->b_len;
             return 1;
         }
         /* fall through */
@@ -1373,30 +1373,22 @@ static int part_round_gen(bstack_gen_op_t *op, void *ctxp)
  * each round splits the k-record windows at both frontiers of the unsettled
  * range in one crash-atomic bstack_inplace_gen, so the left window ends all
  * left or the right window ends all right — at least k records settle per
- * round.  A residue under two windows is settled by one single-window round. */
+ * round.  A residue under two windows is settled by one single-window round.
+ * base supplies cu, win, tmp, piv, cmp, and le; its per-round fields are 0. */
 static int rec_partition_by(const struct records *r, uint64_t lo, uint64_t hi,
-                            const uint8_t *piv, int le, uint8_t *win, uint8_t *tmp,
-                            int (*cmp)(const void *, const void *), uint64_t *out)
+                            const struct part_round *base, uint64_t *out)
 {
     uint64_t k = rec_window(r);
     while (lo < hi) {
-        int two = hi - lo >= 2 * k;
-        uint64_t ka = two ? k : hi - lo;
-        /* Unnamed fields (step, prev_status, nleft, write flags) start at 0. */
-        struct part_round c = {
-            .a_off = REC_OFF(r, lo),
-            .b_off = two ? REC_OFF(r, hi - k) : 0,
-            .na    = (size_t)ka * r->cu,
-            .nb    = two ? (size_t)k * r->cu : 0,
-            .cu    = r->cu,
-            .win   = win,
-            .tmp   = tmp,
-            .piv   = piv,
-            .cmp   = cmp,
-            .le    = le,
-        };
+        int win_fit = hi - lo >= 2 * k; /* two whole windows fit the range */
+        uint64_t ka = win_fit ? k : hi - lo;
+        struct part_round c = *base;
+        c.a_off = REC_OFF(r, lo);
+        c.b_off = win_fit ? REC_OFF(r, hi - k) : 0;
+        c.a_len = (size_t)ka * r->cu;
+        c.b_len = win_fit ? (size_t)k * r->cu : 0;
         if (bstack_inplace_gen(r->bs, part_round_gen, &c, &c.prev_status)) return -1;
-        if (!two) {
+        if (!win_fit) {
             lo += c.nleft;
             break;
         }
@@ -1432,7 +1424,13 @@ static int rec_select_nth(const struct records *r, uint64_t n,
     /* a record wider than the budget still samples one */
     if (max_samples == 0) max_samples = 1;
     /* One allocation: two partition windows (which also host the pivot
-     * sample), the pivot copy, and one record of swap scratch. */
+     * sample), the pivot copy, and one record of swap scratch.  The window
+     * product does not undo rec_window's / 2 / c: the integer division rounds
+     * down, so this is the budget trimmed to whole window pairs, or two records
+     * when one is wider than half the budget.  Nothing here overflows size_t,
+     * even on 32-bit: max_samples * cu is at most the budget (or cu when
+     * max_samples was raised to 1), and records_init caps cu at SIZE_MAX / 4,
+     * so the malloc size is at most budget + 2 * cu or 4 * cu. */
     win_len = (size_t)(2 * rec_window(r)) * cu;
     if (win_len < (size_t)max_samples * cu)
         win_len = (size_t)max_samples * cu;
@@ -1444,6 +1442,14 @@ static int rec_select_nth(const struct records *r, uint64_t n,
     win  = scratch;
     pbuf = scratch + win_len;
     tmp  = pbuf + cu;
+    /* Partition template; each pass sets le.  Unnamed fields start at 0. */
+    struct part_round base = {
+        .cu  = cu,
+        .win = win,
+        .tmp = tmp,
+        .piv = pbuf,
+        .cmp = cmp,
+    };
     for (;;) {
         uint64_t piv, lt, gt, nlo, nhi;
         /* A single-record band already holds the answer. */
@@ -1464,13 +1470,15 @@ static int rec_select_nth(const struct records *r, uint64_t n,
         }
         /* Three-way split as two two-way passes: [lo, lt) < pivot, then, only
          * when n is not left of lt, [lt, gt) == pivot and [gt, hi) > it. */
-        if (rec_partition_by(r, lo, hi, pbuf, 0, win, tmp, cmp, &lt)) {
+        base.le = 0;
+        if (rec_partition_by(r, lo, hi, &base, &lt)) {
             rc = -1; break;
         }
         if (n < lt) {
             nlo = lo; nhi = lt;
         } else {
-            if (rec_partition_by(r, lt, hi, pbuf, 1, win, tmp, cmp, &gt)) {
+            base.le = 1;
+            if (rec_partition_by(r, lt, hi, &base, &gt)) {
                 rc = -1; break;
             }
             if (n < gt) break; /* n is among the records equal to the pivot */

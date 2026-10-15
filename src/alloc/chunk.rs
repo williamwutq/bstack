@@ -1729,13 +1729,14 @@ impl<'s, 'a> Records<'s, 'a> {
     ) -> io::Result<u64> {
         let cu = self.cu;
         let ka = (a.1 - a.0) as usize;
-        // No overflow: `partition_by` passes at most two windows in total, which
-        // `win` (an allocated `usize`-length buffer) already holds.
-        let na = ka * cu;
-        let nb = b.map_or(0, |(lo, hi)| (hi - lo) as usize * cu);
+        // No overflow: `partition_by` passes at most `2k` records in total, so
+        // `a_len + b_len <= 2k * cu <= win.len()`, a length that already fits
+        // `usize` (and `Records::new` caps `cu` at `usize::MAX / 4`).
+        let a_len = ka * cu;
+        let b_len = b.map_or(0, |(lo, hi)| (hi - lo) as usize * cu);
         let a_off = self.off(a.0);
         let b_off = b.map_or(0, |(lo, _)| self.off(lo));
-        let win = &mut win[..na + nb];
+        let win = &mut win[..a_len + b_len];
         let mut nleft = 0u64;
         let mut write_b = false;
         let mut step = 0u8;
@@ -1752,16 +1753,16 @@ impl<'s, 'a> Records<'s, 'a> {
                             // SAFETY: `win` outlives the call and, as a borrowed
                             // slice, cannot be resized; the read resolves before
                             // the next step.
-                            buf: bstack_unsafe_reborrow_mut!(&mut win[..na]),
+                            buf: bstack_unsafe_reborrow_mut!(&mut win[..a_len]),
                         });
                     }
                     1 => {
                         step = 2;
-                        if nb > 0 {
+                        if b_len > 0 {
                             return Some(BStackGenOp::Read {
                                 offset: b_off,
                                 // SAFETY: as above.
-                                buf: bstack_unsafe_reborrow_mut!(&mut win[na..]),
+                                buf: bstack_unsafe_reborrow_mut!(&mut win[a_len..]),
                             });
                         }
                     }
@@ -1787,14 +1788,15 @@ impl<'s, 'a> Records<'s, 'a> {
                             if i == j {
                                 break; // the scans met: every record is classified
                             }
-                            j -= 1;
-                            let (head, tail) = win.split_at_mut(j * cu);
+                            // Record `i` is right and `j - 1` is left: swap them.
+                            let (head, tail) = win.split_at_mut((j - 1) * cu);
                             head[i * cu..(i + 1) * cu].swap_with_slice(&mut tail[..cu]);
-                            // `i < j`: window a moved iff `i` lies in it, window
-                            // b iff `j` does.
+                            // `i < j - 1`: window a moved iff record `i` lies in
+                            // it, window b iff record `j - 1` does.
                             write_a |= i < ka;
-                            write_b |= j >= ka;
+                            write_b |= j > ka;
                             i += 1;
+                            j -= 1;
                         }
                         nleft = i as u64;
                         if !write_a && !write_b {
@@ -1806,7 +1808,7 @@ impl<'s, 'a> Records<'s, 'a> {
                                 offset: a_off,
                                 // SAFETY: `win` outlives the call and is not
                                 // touched again until it returns.
-                                data: bstack_unsafe_reborrow!(&win[..na]),
+                                data: bstack_unsafe_reborrow!(&win[..a_len]),
                             });
                         }
                     }
@@ -1816,7 +1818,7 @@ impl<'s, 'a> Records<'s, 'a> {
                             return Some(BStackGenOp::Write {
                                 offset: b_off,
                                 // SAFETY: as above.
-                                data: bstack_unsafe_reborrow!(&win[na..]),
+                                data: bstack_unsafe_reborrow!(&win[a_len..]),
                             });
                         }
                     }
@@ -1951,9 +1953,12 @@ fn select_nth(
         return Ok(());
     }
     // The window buffer doubles as the pivot sample. Sized for two windows, and
-    // at least the budget, so the sample always holds at least one record. A
-    // boxed slice so it cannot grow: `partition_round` reborrows it for a whole
-    // `inplace_gen` call, which a reallocation would dangle.
+    // at least the budget, so the sample always holds at least one record. The
+    // product does not undo `window`'s `/ 2 / c`: the division rounds down, so it
+    // is the budget trimmed to whole window pairs, or two records when one is
+    // wider than half the budget. A boxed slice so it cannot grow:
+    // `partition_round` reborrows it for a whole `inplace_gen` call, which a
+    // reallocation would dangle.
     let win_len = (SORT_BUDGET as usize).max(2 * r.window() as usize * r.cu);
     let mut win = vec![0u8; win_len].into_boxed_slice();
     let mut order: Vec<usize> = Vec::new(); // reused pivot-sample scratch

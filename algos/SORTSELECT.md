@@ -204,8 +204,8 @@ ahead of the rest, and the second, run only when `n` is not in that left part,
 moves records `== pivot` ahead of those `> pivot`.
 
 Each two-way pass is a two-ended block partition over windows of
-`k = budget / 2 / chunk_len` records (at least one), keeping an unsettled range
-`[i, j)`:
+`k = budget / 2 / chunk_len` records, or of one record when a record is wider
+than half the budget. It keeps an unsettled range `[i, j)`:
 
 - One round reads the window at each frontier, `[i, i + k)` and `[j − k, j)`,
   and splits their concatenation in memory with a Hoare pass, so every left
@@ -221,21 +221,22 @@ Each two-way pass is a two-ended block partition over windows of
 
 Reads total about two passes over the range, and commits about `(j − i) / k`.
 Memory stays within budget: two windows (which also host the pivot sample) and
-a pivot record. No scratch region, no allocator.
+a pivot record, allocated once per call. No on-disk scratch region is used.
 
 ### Termination and equal keys
 
 The pivot value is copied from a real record of the band, and a total order
-never classes a record as `<` or `>` itself. So the first pass leaves at least
-one record right of `lt`, and the second puts at least one left of `gt`: the band
-strictly shrinks every round. With a sample-median pivot the shrink is geometric
-(expected `O(log)` rounds).
+never classes a record as `<` or `>` itself, so that record always lands in
+`[lt, gt)`. If `n < lt`, the band becomes `[lo, lt)`, which excludes it.
+Otherwise `n` either falls in `[lt, gt)` and the selection is done, or the band
+becomes `[gt, hi)`, which excludes it too. The band therefore strictly shrinks
+every round, even when the pivot is the band's minimum or maximum. With a
+sample-median pivot the shrink is geometric (expected `O(log)` rounds).
 
 Equal keys leave the band together. When `n` falls among the records equal to
 the pivot, the selection is done, since any of them is the answer. Otherwise the
 whole equal run is dropped with the side that cannot contain `n`. An all-equal
-range settles in one round, which a two-way (Lomuto) partition would peel off one
-record per round.
+range settles in one round.
 
 A comparator that is not a total order can fail to shrink the band. The loop
 detects a round that leaves `[lo, hi)` unchanged and stops, leaving a valid
@@ -250,11 +251,7 @@ permutation in unspecified order rather than spinning.
 | Base case                | one `process`              | one                                       |
 
 Rounds shrink the band geometrically in expectation, so summed reads and commits
-are linear in `count`, and commits are `k` times fewer than records. The
-replaced Lomuto loop read one record per step and committed one
-`cross_exchange` per moved record. On 2048 16-byte records under real fsync it
-took 25–30 s on distinct, four-valued, and all-equal keys; the windowed
-three-way partition takes 0.15 s, 0.18 s, and under 1 ms.
+are linear in `count`, and commits are `k` times fewer than records.
 
 ### Surface
 
