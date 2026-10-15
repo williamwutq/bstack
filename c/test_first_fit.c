@@ -1409,6 +1409,108 @@ static int test_slice_process_transforms_in_place(void)
     ff_unlink(tmp); return 0;
 }
 
+/* ---- bstack_slice_partition_partial ---------------------------------- */
+
+static int cmp_u16_le(const void *a, const void *b)
+{
+    const uint8_t *x = a, *y = b;
+    unsigned u = x[0] | (unsigned)x[1] << 8, v = y[0] | (unsigned)y[1] << 8;
+    return (u > v) - (u < v);
+}
+static int cmp_u16(const void *a, const void *b)
+{
+    uint16_t u = *(const uint16_t *)a, v = *(const uint16_t *)b;
+    return (u > v) - (u < v);
+}
+static int cmp_always_less(const void *a, const void *b) { (void)a; (void)b; return -1; }
+static int cmp_always_greater(const void *a, const void *b) { (void)a; (void)b; return 1; }
+
+/* Write keys as 2-byte LE records, partition around rank n with cmp, and read
+ * the keys back into out. */
+static int partition_keys(first_fit_bstack_allocator_t *a, const uint16_t *keys,
+                          size_t sz, uint64_t n, int (*cmp)(const void *, const void *),
+                          uint16_t *out)
+{
+    bstack_slice_t s;
+    uint8_t *buf = malloc(sz * 2);
+    size_t i;
+    int rc = -1;
+    if (!buf) return -1;
+    for (i = 0; i < sz; i++) { buf[2 * i] = (uint8_t)keys[i]; buf[2 * i + 1] = (uint8_t)(keys[i] >> 8); }
+    if (bstack_allocator_alloc((bstack_allocator_t *)a, sz * 2, &s) == 0
+            && bstack_slice_write(s, buf, sz * 2) == 0
+            && bstack_slice_partition_partial(s, 2, n, cmp) == 0
+            && bstack_slice_read(s, buf) == 0) {
+        for (i = 0; i < sz; i++) out[i] = (uint16_t)(buf[2 * i] | buf[2 * i + 1] << 8);
+        rc = bstack_allocator_dealloc((bstack_allocator_t *)a, s);
+    }
+    free(buf);
+    return rc;
+}
+
+/* Sizes straddle one and two 1536-record windows; distinct, few-valued, and
+ * all-equal keys each select correctly. */
+static int test_slice_partition_partial_selects_with_duplicates(void)
+{
+    static const size_t sizes[] = {3071, 3072, 3073, 4000, 9000};
+    static const unsigned mods[] = {65536, 3, 1};
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    uint16_t *keys = malloc(9000 * 2), *sorted = malloc(9000 * 2), *out = malloc(9000 * 2);
+    CHECK(keys && sorted && out);
+    uint64_t st = 0x2545F4914F6CDD1DULL;
+    size_t si, mi, ri, i;
+    for (si = 0; si < 5; si++) {
+        size_t sz = sizes[si];
+        for (mi = 0; mi < 3; mi++) {
+            for (i = 0; i < sz; i++) {
+                st = st * 6364136223846793005ULL + 1;
+                keys[i] = (uint16_t)((st >> 33) % mods[mi]);
+            }
+            memcpy(sorted, keys, sz * 2);
+            qsort(sorted, sz, 2, cmp_u16);
+            size_t ranks[3] = {0, sz / 3, sz - 1};
+            for (ri = 0; ri < 3; ri++) {
+                size_t n = ranks[ri];
+                CHECK(partition_keys(a, keys, sz, n, cmp_u16_le, out) == 0);
+                CHECK(out[n] == sorted[n]);
+                for (i = 0; i < n; i++) CHECK(out[i] <= out[n]);
+                for (i = n + 1; i < sz; i++) CHECK(out[i] >= out[n]);
+                qsort(out, sz, 2, cmp_u16);
+                CHECK(memcmp(out, sorted, sz * 2) == 0);
+            }
+        }
+    }
+    free(keys); free(sorted); free(out);
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
+/* A comparator that is not a total order cannot shrink the band; the call must
+ * still terminate and leave a permutation of the input. */
+static int test_slice_partition_partial_inconsistent_cmp_terminates(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    first_fit_bstack_allocator_t *a = first_fit_bstack_allocator_new(bs);
+    CHECK(a);
+    uint16_t keys[5000], sorted[5000], out[5000];
+    size_t i;
+    for (i = 0; i < 5000; i++) keys[i] = (uint16_t)(i * 7919u);
+    memcpy(sorted, keys, sizeof keys);
+    qsort(sorted, 5000, 2, cmp_u16);
+    CHECK(partition_keys(a, keys, 5000, 2500, cmp_always_less, out) == 0);
+    qsort(out, 5000, 2, cmp_u16);
+    CHECK(memcmp(out, sorted, sizeof out) == 0);
+    CHECK(partition_keys(a, keys, 5000, 2500, cmp_always_greater, out) == 0);
+    qsort(out, 5000, 2, cmp_u16);
+    CHECK(memcmp(out, sorted, sizeof out) == 0);
+    bstack_close(first_fit_bstack_allocator_into_stack(a));
+    ff_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* A slice issued by one allocator instance must be refused by another: the
@@ -1729,6 +1831,8 @@ int main(void)
     T(test_slice_cas_on_masked_match_swaps_and_returns_old);
     T(test_slice_cas_on_masked_no_match_returns_none);
     T(test_slice_process_transforms_in_place);
+    T(test_slice_partition_partial_selects_with_duplicates);
+    T(test_slice_partition_partial_inconsistent_cmp_terminates);
 #endif
 
     /* stats */
