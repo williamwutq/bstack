@@ -2674,7 +2674,7 @@ impl<'a> io::Read for BStackSliceReader<'a> {
         Ok(n)
     }
 
-    /// Routes through [`read_to_end`](Self::read_to_end); std's default
+    /// Routes through [`read_to_end`](io::Read::read_to_end); std's default
     /// does not.
     fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
         let mut bytes = Vec::new();
