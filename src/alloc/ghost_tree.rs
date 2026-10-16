@@ -16,7 +16,7 @@ use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x04\x00";
+const ALGT_MAGIC: [u8; 8] = *b"ALGT\x00\x01\x05\x00";
 const ALGT_MAGIC_PREFIX: [u8; 6] = *b"ALGT\x00\x01";
 
 /// Payload offset of the magic number.
@@ -113,7 +113,7 @@ struct PathEntry {
 /// ┌─────────────────────────────┐  payload offset 0
 /// │   User-reserved (32 bytes)  │
 /// ├─────────────────────────────┤  offset 32
-/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x04\x00"
+/// │   Magic number (8 bytes)    │  "ALGT\x00\x01\x05\x00"
 /// ├─────────────────────────────┤  offset 40
 /// │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 /// ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)

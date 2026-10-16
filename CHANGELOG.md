@@ -14,15 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`BStackSliceReader::read_to_end` and `read_to_string` read the rest of the slice in one `get_into` (Rust).** std's defaults issued repeated growing-probe reads.
 - **`sort_partial_by` rotates and reverses small spans in one commit (Rust and C, `set` + `atomic`).** A rotation or reversal that fits the sort budget is one `process` (C: `bstack_process`) instead of one `cross_exchange` per record pair. Wider spans keep the per-record swaps.
 - **`select_nth_partial_by`/`_key` and C's `bstack_slice_partition_partial` use a three-way windowed partition (`set` + `atomic`).** Each round splits a budget-sized window from each end of the range in memory and commits both in one `inplace_gen` (C: `bstack_inplace_gen`), instead of one `cross_exchange` per moved record; a round that moves nothing does not touch disk. Records equal to the pivot now drop out of the range in a single round, making selection far more efficient on regions with many duplicate keys.
-
-### Fixed
-
-- **`BStackChunk::sort_partial_by`/`_key` could corrupt records longer than `usize::MAX` bytes on 32-bit targets (Rust).** The record length was truncated to `usize`, so a merge step could move only part of each record. A `chunk_len` too large for the engine's scratch now fails with `io::ErrorKind::OutOfMemory` before any I/O, matching C's `ENOMEM`; `select_nth_partial_by`/`_key` check it too.
+- **`GhostTreeBstackAllocator` version bumped to 0.1.5 (`alloc` + `set`; Rust and C): magic `ALGT\x00\x01\x04\x00` → `ALGT\x00\x01\x05\x00`.** No layout change; the patch byte records a writer carrying the poison guard and tail-shrink fixes below. Only the first 6 bytes are checked on open, so existing 0.1.x files stay compatible.
 
 ### Fixed
 
 - **`GhostTreeBstackAllocator` kept serving a torn free tree after an I/O error, so two allocations could receive overlapping regions (Rust and C).** A tree mutation that failed partway could leave a node reachable from two parents until the next reopen. The allocator now poisons itself in memory on such a failure. Until a reopen rebuilds the tree, every non-empty `alloc`, `realloc`, `realloc_inplace` (Rust), `dealloc`, and bulk call fails with `InvalidData` (C: `EINVAL`) and hands back its handle (C: returns `-1`). C's `ghost_tree_bstack_allocator_t` gains a `poisoned` field; callers that only create it through `ghost_tree_bstack_allocator_new` are unaffected.
 - **`GhostTreeBstackAllocator::realloc`'s `atomic` tail shrink could return an out-of-bounds handle on error (Rust and C).** A failed tail-replace that had already armed is rolled forward by the next replay, yet the original handle was returned. An error after the tail-replace is issued now reports the block lost (`handle: None`; C: `-2`).
+- **`BStackChunk::sort_partial_by`/`_key` could corrupt records longer than `usize::MAX` bytes on 32-bit targets (Rust).** The record length was truncated to `usize`, so a merge step could move only part of each record. A `chunk_len` too large for the engine's scratch now fails with `io::ErrorKind::OutOfMemory` before any I/O, matching C's `ENOMEM`; `select_nth_partial_by`/`_key` check it too.
 
 ## [0.4.6] - 2026-10-01
 
