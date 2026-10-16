@@ -506,10 +506,12 @@ int bstack_slice_sort_partial(bstack_slice_t s, uint64_t chunk_len,
  * >= it — computed without holding the whole region in memory.
  *
  * A bounded-memory quickselect: it narrows an active record band around n,
- * choosing each pivot from a cross-region sample and partitioning in place with
- * atomic bstack_cross_exchange swaps, until the band fits the internal budget
- * and one bstack_process settles it exactly.  Peak memory is O(1) in the
- * region's size; no scratch region.
+ * choosing each pivot from a cross-region sample and partitioning in place
+ * three ways (<, ==, > the pivot), a pair of budget-sized windows per atomic
+ * bstack_inplace_gen, until the band fits the internal budget and one
+ * bstack_process settles it exactly. Records equal to the pivot leave the band
+ * together, so duplicate-heavy regions shrink as fast as distinct ones. Peak
+ * memory is O(1) in the region's size; no scratch region.
  *
  * Every step is crash-atomic and permutation-preserving, so a crash or an early
  * error return leaves a valid permutation and re-running completes the
