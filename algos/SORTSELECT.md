@@ -150,7 +150,7 @@ genuinely exceed memory; prefer `sort_by` whenever the region fits.
 `select_nth_by[_key]` is single-operation: it runs `select_nth_unstable_by`
 on an in-memory proxy index under one `process`, so it inherits `sort_by`'s
 memory bound. `select_nth_partial_by[_key]` (see `select_nth` /
-`partition_select` / `sample_pivot_index` in `src/alloc/chunk.rs`) is the
+`Records::partition_by` / `Records::sample_pivot` in `src/alloc/chunk.rs`) is the
 bounded-memory version, with the same budget and per-step crash-atomicity as
 `sort_partial_by`. It does **not** reuse the run-and-merge machinery —
 quickselect's whole point is to avoid sorting — so it is a distinct engine:
@@ -173,9 +173,12 @@ loop:
     if (hi - lo) * chunk_len <= budget:
         process([lo, hi)): select_nth_unstable_by(n - lo, cmp)   // exact, atomic
         return
-    pivot = sample_median(lo, hi)          // bounded read (below)
-    p     = partition(lo, hi, pivot)       // in-place, bounded, atomic per step
-    if n < p { hi = p } else { lo = p + 1 }   // p is a fixed pivot record; exclude it
+    pivot = sample_median(lo, hi)              // bounded read (below)
+    lt = partition(lo, hi, x < pivot)          // [lo, lt) < pivot
+    if n < lt { hi = lt; continue }
+    gt = partition(lt, hi, x <= pivot)         // [lt, gt) == pivot
+    if n < gt { return }                       // n is among the equal records
+    lo = gt
 ```
 
 The base case is the sort's trick reused: a range that fits the budget is
@@ -194,57 +197,65 @@ This is the "pivot-selection pass across sections": the sample straddles every
 section, so the median is representative without loading any section whole, and
 median-of-sample makes catastrophic imbalance vanishingly unlikely on real data.
 
-### Partition — bounded, in place, crash-safe
+### Partition — windowed, in place, crash-safe
 
-Partition `[lo, hi)` around the pivot **value** with a two-pointer scan:
+The three-way split is two two-way passes: the first moves records `< pivot`
+ahead of the rest, and the second, run only when `n` is not in that left part,
+moves records `== pivot` ahead of those `> pivot`.
 
-- Scan from both ends for an out-of-place pair — a left record ≥ pivot and a
-  right record < pivot — and swap it with one `cross_exchange` (atomic,
-  permutation-preserving). Reads are block-buffered (load a `K`-record block,
-  scan it in memory), so scanning costs `O((hi − lo) / K)` reads rather than one
-  per record.
-- Each swap is its own crash-atomic step, so a crash mid-partition leaves a
-  valid permutation — never lost or duplicated data — and re-running from scratch
-  completes (the goal is idempotent). `Err` only on a genuine
-  `cross_exchange`/`process` I/O failure.
+Each two-way pass is a two-ended block partition over windows of
+`k = budget / 2 / chunk_len` records, or of one record when a record is wider
+than half the budget. It keeps an unsettled range `[i, j)`:
 
-Memory stays within budget: a pivot record, one or two `K`-record scan blocks,
-`O(1)` cursors — no scratch region, no allocator.
+- One round reads the window at each frontier, `[i, i + k)` and `[j − k, j)`,
+  and splits their concatenation in memory with a Hoare pass, so every left
+  record comes first. The pass notes which windows its swaps touched.
+  It then writes both windows back, all under one `inplace_gen`, so the round
+  is a single crash-atomic, permutation-preserving commit.
+- After the split, the first `k` records are all left or the last `k` are all
+  right, so at least `k` records settle per round. The settled side advances
+  its frontier; the other window's settled tail or head advances too.
+- A round whose windows did not change ends before staging any write and
+  commits nothing, so an already-partitioned range costs reads only.
+- A residue under two windows is settled by one single-window round.
+
+Reads total about two passes over the range, and commits about `(j − i) / k`.
+Memory stays within budget: two windows (which also host the pivot sample) and
+a pivot record, allocated once per call. No on-disk scratch region is used.
 
 ### Termination and equal keys
 
-To guarantee progress, fix one pivot **record** at its final split position each
-round (swap the chosen pivot to the end, partition, swap it to `p`) and recurse
-into `[lo, p)` or `[p + 1, hi)`, excluding `p`. Each round then removes at least
-the pivot, so the band strictly shrinks; with a sample-median pivot the shrink is
-geometric (expected `O(log)` rounds), and the budget base case means any residual
-imbalance only matters while the band still exceeds the budget.
+The pivot value is copied from a real record of the band, and a total order
+never classes a record as `<` or `>` itself, so that record always lands in
+`[lt, gt)`. If `n < lt`, the band becomes `[lo, lt)`, which excludes it.
+Otherwise `n` either falls in `[lt, gt)` and the selection is done, or the band
+becomes `[gt, hi)`, which excludes it too. The band therefore strictly shrinks
+every round, even when the pivot is the band's minimum or maximum. With a
+sample-median pivot the shrink is geometric (expected `O(log)` rounds).
 
-Many equal keys are the one pathological case for two-way partitioning (each
-round peels off only the pivot). A three-way (Dutch-flag / Bentley–McIlroy)
-partition — `< pivot | == pivot | > pivot` — settles it: if `n` lands in the
-equal zone, any record there is the answer; otherwise recurse into `<` or `>`,
-dropping the whole equal run. Its out-of-core form keeps three cursors instead
-of two, same atomic-swap discipline.
+Equal keys leave the band together. When `n` falls among the records equal to
+the pivot, the selection is done, since any of them is the answer. Otherwise the
+whole equal run is dropped with the side that cannot contain `n`. An all-equal
+range settles in one round.
+
+A comparator that is not a total order can fail to shrink the band. The loop
+detects a round that leaves `[lo, hi)` unchanged and stops, leaving a valid
+permutation in unspecified order rather than spinning.
 
 ### Cost
 
-| Phase                    | Reads                     | Swaps                                       |
-|--------------------------|---------------------------|---------------------------------------------|
-| Pivot sample (per round) | `S = budget / chunk_len`  | —                                           |
-| Partition (per round)    | `O((hi − lo) / K)` blocks | `O(hi − lo)` single-record `cross_exchange` |
-| Base case                | one `process`             | —                                           |
+| Phase                    | Reads                      | Commits                                   |
+|--------------------------|----------------------------|-------------------------------------------|
+| Pivot sample (per round) | `S = budget / chunk_len`   | —                                         |
+| Partition (per round)    | about `2(hi − lo)` records | about `(hi − lo) / k` window `inplace_gen` |
+| Base case                | one `process`              | one                                       |
 
-Rounds shrink the band geometrically in expectation, so summed reads are
-`O(count / K)` and swaps `O(count)` — linear, like in-memory quickselect, with
-the same fsync-per-swap caveat as the sort's rotation merge. The single-record
-swaps are the natural target for the same `set_batched` two-block batching
-optimization noted for the merge, deferred for the same reason.
+Rounds shrink the band geometrically in expectation, so summed reads and commits
+are linear in `count`, and commits are `k` times fewer than records.
 
 ### Surface
 
 The split mirrors the sort: `select_nth_by[_key]` stays single-operation for
 regions that fit memory, and `select_nth_partial_by[_key]` is the shipped
-bounded-memory variant. The current implementation uses the two-way (Lomuto)
-partition above; the three-way partition for heavy-duplicate regions remains the
-open optimization, alongside the shared `set_batched` block-batched-swap idea.
+bounded-memory variant. In C, `bstack_slice_partition_partial` runs the same
+engine.

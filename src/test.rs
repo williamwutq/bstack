@@ -5060,6 +5060,19 @@ mod alloc_tests {
             .collect()
     }
 
+    // 22b. A stride too large for the engines' in-memory scratch is rejected
+    //      before any I/O rather than truncated to `usize`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_rejects_stride_too_large_for_usize() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks((usize::MAX / 4) as u64 + 1);
+        let err = view.sort_partial_by(|a, b| a.cmp(b)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+    }
+
     // 23. A region that fits the budget is fully sorted in one process pass.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
@@ -5347,6 +5360,106 @@ mod alloc_tests {
         .unwrap();
         let got = read_keys(&s.as_slice().read().unwrap(), 8192, 5);
         assert_selected(&got, 2, &sorted);
+    }
+
+    // 35. Small records give multi-record partition windows (1536 two-byte
+    //     records each); sizes straddle one and two windows. Distinct, few-valued,
+    //     and all-equal keys each select correctly.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_windowed_duplicates() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u16
+        };
+        for &sz in &[3071usize, 3072, 3073, 4000, 9000] {
+            for modulus in [u16::MAX, 3, 1] {
+                let keys: Vec<u16> = (0..sz).map(|_| next() % modulus).collect();
+                let mut sorted = keys.clone();
+                sorted.sort_unstable();
+                for &n in &[0, sz / 3, sz - 1] {
+                    let mut s = alloc.alloc((sz * 2) as u64).unwrap();
+                    s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+                    let (mut view, _rem) = s.as_slice().chunks(2);
+                    view.select_nth_partial_by_key(n as u64, |c| u16::from_le_bytes([c[0], c[1]]))
+                        .unwrap();
+                    let got = read_keys(&s.as_slice().read().unwrap(), 2, sz);
+                    assert_selected(&got, n, &sorted);
+                    alloc.dealloc(s).unwrap();
+                }
+            }
+        }
+    }
+
+    // 35b. An I/O error at any partition round or at the final `process` leaves
+    //      a permutation of the input, and re-running completes the selection.
+    #[cfg(all(
+        feature = "set",
+        feature = "atomic",
+        debug_assertions,
+        feature = "fault-injection"
+    ))]
+    #[test]
+    fn chunk_select_nth_partial_by_fault_leaves_permutation_and_converges() {
+        use crate::alloc_fuzz::common::policies::FailOpAt;
+        use std::sync::Arc;
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..9000u32)
+            .map(|i| (i.wrapping_mul(2654435761) % 7) as u16)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let key = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
+        let mut faulted = 0;
+        for op in ["inplace_gen", "process"] {
+            for at in 0..40 {
+                let mut s = alloc.alloc(18_000).unwrap();
+                s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+                let (mut view, _rem) = s.as_slice().chunks(2);
+                let policy: Arc<dyn crate::FaultPolicy> =
+                    Arc::new(FailOpAt::new(op, at, std::io::ErrorKind::Other));
+                alloc.stack().set_fault_policy(Some(policy));
+                let res = view.select_nth_partial_by_key(4500, key);
+                alloc.stack().set_fault_policy(None);
+                if res.is_err() {
+                    faulted += 1;
+                    let mut got = read_keys(&s.as_slice().read().unwrap(), 2, 9000);
+                    got.sort_unstable();
+                    assert_eq!(got, sorted, "{op}#{at}: not a permutation");
+                    view.select_nth_partial_by_key(4500, key).unwrap();
+                }
+                let got = read_keys(&s.as_slice().read().unwrap(), 2, 9000);
+                assert_selected(&got, 4500, &sorted);
+                alloc.dealloc(s).unwrap();
+            }
+        }
+        assert!(faulted > 1, "the schedule must fault several steps");
+    }
+
+    // 36. A comparator that is not a total order cannot shrink the band; the
+    //     selection must still terminate and leave a permutation of the input.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_inconsistent_cmp_terminates() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..5000u16).map(|i| i.wrapping_mul(7919)).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        for order in [std::cmp::Ordering::Less, std::cmp::Ordering::Greater] {
+            let mut s = alloc.alloc(10_000).unwrap();
+            s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+            let (mut view, _rem) = s.as_slice().chunks(2);
+            view.select_nth_partial_by(2500, |_, _| order).unwrap();
+            let mut got = read_keys(&s.as_slice().read().unwrap(), 2, 5000);
+            got.sort_unstable();
+            assert_eq!(got, sorted, "not a permutation under {order:?}");
+            alloc.dealloc(s).unwrap();
+        }
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]

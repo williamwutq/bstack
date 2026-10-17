@@ -19,7 +19,7 @@
 //! I/O view** that owns no region, carries no allocator handle, and frees nothing
 //! on `Drop`. It binds only to a [`BStackSlice`], so it inherits the crate's
 //! on-disk borrow soundness by composition rather than defining rules of its own.
-//! A guard cannot hold a still-freeable region — [`BStackOwnedSlice`]
+//! A guard cannot hold a still-freeable region — [`BStackOwnedSlice`](super::BStackOwnedSlice)
 //! exposes only `&self`-scoped views with no safe path to a `'a`-lifetime slice,
 //! and `dealloc`/`realloc` consume the owning handle by value — so a guard built
 //! in safe code can neither free a region nor observe one freed out from under it.
@@ -30,7 +30,9 @@
 //! [`as_slice`]: BStackGuardedSlice::as_slice
 //! [`raw_block`]: BStackGuardedSlice::raw_block
 
-use super::{BStackAllocator, BStackOwnedSlice, BStackRange, BStackSlice};
+#[cfg(feature = "set")]
+use super::BStackOwnedSlice;
+use super::{BStackAllocator, BStackRange, BStackSlice};
 use std::{borrow::Cow, io, ops::Range};
 
 /// A [`BStackSlice`] abstraction with lifecycle hooks for transparent I/O
