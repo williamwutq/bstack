@@ -434,20 +434,21 @@
 //!   [`SlabBStackAllocator`], [`CheckedSlabBStackAllocator`],
 //!   [`SegregatedBStackAllocator`], and [`BStackByteVec`].
 //!
-//! * **`atomic`** — Compound read-modify-write operations that hold the write
-//!   lock across what would otherwise be separate calls.  Combined with `set`,
-//!   also enables atomic swap, CAS, in-place batch writes, and cross-region
-//!   operations.
+//! * **`atomic`** *(default)* — Compound read-modify-write operations that hold
+//!   the write lock across what would otherwise be separate calls.  Combined
+//!   with `set`, also enables atomic swap, CAS, in-place batch writes, and
+//!   cross-region operations.  Enabled by default: it only adds methods and
+//!   changes no on-disk format, so a plain dependency compiles it in.  Opt out
+//!   with `default-features = false`.
 //!
-//! Enable with:
+//! `atomic` is on by default; `set` and `alloc` are opt-in:
 //!
 //! ```toml
 //! [dependencies]
-//! bstack = { version = "0.4", features = ["set"] }
-//! # or
-//! bstack = { version = "0.4", features = ["alloc"] }
-//! # or both
-//! bstack = { version = "0.4", features = ["alloc", "set"] }
+//! bstack = "0.5"                                            # atomic on
+//! bstack = { version = "0.5", features = ["set"] }          # + in-place writes
+//! bstack = { version = "0.5", features = ["alloc", "set"] } # + sub-allocation
+//! bstack = { version = "0.5", default-features = false }    # bare stack, no atomic
 //! ```
 //!
 //! # Allocator (`alloc` feature)
