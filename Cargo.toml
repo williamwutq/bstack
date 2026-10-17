@@ -13,12 +13,16 @@ keywords = ["stack", "persistent", "file-backed", "database", "binary"]
 include = ["src/**/*", "!src/alloc_fuzz/**", "!src/test.rs", "Cargo.toml", "README.md", "CHANGELOG.md", "LICENSE", "examples/**/*.rs", ".gitignore"]
 
 [features]
+# `atomic` is on by default: it only adds methods and changes no on-disk format,
+# so a plain dependency gets it. Opt out of atomic with
+# `default-features = false` plus an explicit `features = [...]` list.
+default = ["atomic"]
 # Enables BStack::set — in-place mutation of existing payload bytes.
 set = []
 # Enables BStackAllocator trait and BStackSlice for region management.
 alloc = []
 # Enables atomic compound operations: atrunc, splice, splice_into, try_extend, try_discard,
-# and (with set) swap, swap_into, cas.
+# and (with set) swap, swap_into, cas. Enabled by default (see `default` above).
 atomic = []
 # Enables BStackGuardedSlice and related hook-based slice abstractions.
 guarded = ["alloc"]
