@@ -17,9 +17,9 @@
 //! ## How to run
 //!
 //! ```text
-//! cargo run --example atomic_race --features atomic
+//! cargo run --example atomic_race
 //! # for both scenarios:
-//! cargo run --example atomic_race --features "atomic,set"
+//! cargo run --example atomic_race --features set
 //! ```
 
 #[cfg(feature = "atomic")]

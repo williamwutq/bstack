@@ -217,7 +217,7 @@ Implements both `BStackAllocator` and `BStackBulkAllocator`.
 ┌─────────────────────────────┐  payload offset 0
 │   User-reserved (32 bytes)  │
 ├─────────────────────────────┤  offset 32
-│   Magic number (8 bytes)    │  "ALGT\x00\x01\x02\x00"
+│   Magic number (8 bytes)    │  "ALGT\x00\x01\x05\x00"
 ├─────────────────────────────┤  offset 40
 │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
@@ -263,6 +263,23 @@ and leaks the other, never touching the retained window's bytes.
 No write-ahead log, no checksums. A crash during `dealloc` before the AVL
 insert permanently loses that block. A crash during rotation leaves the tree
 imbalanced — corrected on the next `GhostTreeBstackAllocator::new`.
+
+A tree mutation that fails partway on an I/O error, with no crash, can leave a
+node reachable from two parents. Two later best-fit descents could then hand out
+overlapping regions. An in-memory `poisoned` flag guards this:
+
+- **Arming:** an error in an insert's or removal's write phase sets the flag.
+  - The write phase is the up-pass and `write_root`.
+  - Down-pass reads and the unlinked leaf write cannot tear the tree, so they
+    don't arm it.
+- **Checks:**
+  - every mutating call checks the flag on entry;
+  - under `atomic`, it's checked again under the mutex right before each tree
+    access.
+- **Clearing:** a reopen clears it, since `new` always rebuilds the tree.
+
+There is no on-disk flag, because every open already runs
+`coalesce_and_rebalance`.
 
 ### Thread safety
 
@@ -383,7 +400,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x01\x00"` (version 0.1.1).
+* **`magic`** — `"ALCK\x00\x01\x04\x00"` (version 0.1.4).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 
@@ -441,7 +458,9 @@ Free-list mutations write block payloads before updating `free_head`. The overhe
 
 Without the `atomic` feature it is **not `Sync`**: free-list mutations read then write `free_head` as separate `BStack` calls — a TOCTOU race under concurrent `&self` access.
 
-With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). The one retained `Mutex` is held only by `recover`, to keep recovery single-flight (two concurrent runs could otherwise reclaim the same leaked block twice); the recovery scan itself is serialised against alloc/dealloc/realloc by the `BStack` write lock it holds across one `process_gen` sequence, not by the `Mutex`.
+With the `atomic` feature it **is `Sync`**. `alloc` / `dealloc` / `realloc` take no allocator-level lock: free-list pop uses a single `BStack::process_gen` sequence, free-list push uses `BStack::cross_exchange`, and tail grow/shrink use `try_extend_zeros` / `try_discard` — all check-and-act atomically under `BStack`'s own write lock (the shrink path writes the overhead before the tail check, since the overhead must be committed before discarding). 
+
+`recover` is exclusive of every mutator. An in-flight `alloc`, `dealloc`, or `realloc` passes through states that look exactly like leaks. A `recover` overlapping one would relink such a block and hand it out twice. An `AtomicBool` (`recovering`) and an in-flight counter (`in_flight`) exclude them. Each mutator, including the bulk and `_uninit` variants, increments `in_flight` and then checks the flag. `recover` sets the flag and then waits for `in_flight` to drain. Both sides use `SeqCst`, so either the mutator sees the flag or `recover` sees the count. A mutator refused this way fails with `ResourceBusy` before touching anything and hands back its handles for a retry. Internal paths such as `realloc`'s nested alloc and dealloc skip the check, so an operation already under way is never refused halfway through. A retained `Mutex` keeps `recover` single-flight.
 
 ### Constructors
 
@@ -487,7 +506,7 @@ round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
 
 ```text
 offset  0  reserved (user)                24 B
-offset 24  magic  "ALSG\x00\x02\x00\x00"   8 B
+offset 24  magic  "ALSG\x00\x02\x03\x00"   8 B
 offset 32  _reserved                       8 B
 offset 40  free_head[33] : u64           264 B   # last entry = oversized list
 offset 304 arena start (16-B aligned)
@@ -568,16 +587,25 @@ Every path either commits atomically or leaves an orphaned-but-recoverable block
   (over free excess only) writes all freed pieces first and the claiming header
   last.
 
+Every block on a classed list is exactly its class size: a pop claims and
+records the class size without reading the block's own, so a larger block would
+leave an untracked gap that desyncs the next scan.
+
 `recover()` rebuilds every free list with one linear scan of the overhead words:
 a live block is strided by its **recorded physical size** (no length-to-class
-derivation); a free block is relinked onto the head of the largest class `≤ size`
-(`classify(largest_class_le(size))`, or the oversized head above 4096), which
-reclaims leaked blocks and degrades a malformed non-class size to a leak rather
-than a head that would overrun the block; a fully-zeroed tail is discarded. The rebuilt head table is published as one crash-atomic contiguous
-write. The scan trusts only the overhead words and is idempotent. In-use orphans
-(e.g. the old block of a crashed *move*) are left live; a deep GC to reclaim them
-is future work. `recover` requires a quiescent allocator and is `unsafe`; `new`
-runs it before the handle escapes.
+derivation); a free block is relinked by its stored size, which reclaims leaked
+blocks. A non-class size (such as a merged run) is first split by the greedy
+carve into exact class blocks, written as one crash-atomic `set_batched`
+(without `atomic`, back to front so the block's own header shrinks last and a
+crash mid-split still tiles); above 4096 it goes to the oversized head whole.
+A zero overhead word is never a valid header: if every word to EOF is zero it is
+a crashed `extend` tail and is discarded, otherwise the gap is left leaked
+(counted as unsure) and the scan resumes at the next header. The rebuilt head
+table is published as one crash-atomic contiguous write. The scan trusts only the
+overhead words and is idempotent. In-use orphans (e.g. the old block of a
+crashed *move*) are left live; a deep GC to reclaim them is future work.
+`recover` requires a quiescent allocator and is `unsafe`; `new` runs it before
+the handle escapes.
 
 ### Coalescing (`atomic` feature)
 
@@ -587,18 +615,29 @@ contiguous run. `coalesce()` fuses them. It is the `recover` walk plus a merge:
 it strides the arena by the recorded physical sizes and, on any run of two or
 more adjacent free blocks, writes one merged free block in place and rebuilds
 every free list from the scan — the same wholesale rebuild `recover` uses, so no
-swallowed block needs a per-block unlink. Returns the number of blocks fused into a
-neighbour; `0` means nothing was adjacent, and nothing is written. A merged run
-lands on the largest class `≤` its size (a non-class size degrades to retained
-slack, never a head that overruns the block); a run reaching the tail is merged.
+swallowed block needs a per-block unlink. A merged run is split into exact class
+blocks as in `recover`; a run reaching the tail is merged. Returns the net drop in
+free blocks (run blocks minus pieces written); `0` means nothing merged and
+nothing is written, so re-merging a run that splits back into the same pieces
+counts as no progress and repeated calls reach a fixpoint.
 
 Unlike `recover`, `coalesce` is a **safe** method. The whole scan-and-rewrite
 runs inside one `BStack::inplace_gen`, striding the overhead words one at a time
-under the held write lock and committing the merges as one journalled batch, so
-a concurrent `alloc`/`dealloc` can neither observe an intermediate state nor be
-clobbered, with no allocator-level lock. A torn commit re-parses as a valid arena
-and is reclaimed by `recover`, so the pass is restartable; the scan follows only
-physical sizes, never `next_free`, so a corrupt free list cannot cycle it.
+under the held write lock and committing the merges as one journalled batch. A
+torn commit re-parses as a valid arena and is reclaimed by `recover`, so the pass
+is restartable; the scan follows only physical sizes, never `next_free`, so a
+corrupt free list cannot cycle it.
+
+The write lock alone does not make it safe: an in-flight `alloc` or `realloc`
+leaves a popped or staged block free-tagged between its own calls, and the scan
+would relink it, handing it out twice. `coalesce` therefore excludes every
+mutator for the whole call, the same way `CheckedSlabBStackAllocator::recover`
+does: each mutator increments an in-flight counter and then checks an
+`AtomicBool`; `coalesce` takes the flag by compare-and-swap (so concurrent
+`coalesce` calls run one at a time) and waits for the counter to drain. A mutator
+refused this way fails with `ResourceBusy` before touching anything and hands
+back its handles for a retry. Internal paths, such as `realloc`'s nested
+`dealloc`, skip the check.
 
 ### Thread safety
 

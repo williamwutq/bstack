@@ -218,6 +218,36 @@ static int test_bytevec_fill(void)
     return 0;
 }
 
+/* A corrupt header len must be rejected cleanly by push (which would otherwise
+ * wrap the element offset into a small in-block write over the header) and by
+ * fill (which would otherwise repeat past the block into neighbours). */
+static int test_bytevec_corrupt_len_rejected(void)
+{
+    env_t e;
+    CHECK(env_open(&e) == 0);
+
+    static const uint8_t data[] = {1, 2, 3};
+    bstack_bytevec_t v;
+    CHECK(bstack_bytevec_from_data(env_alloc(&e), data, sizeof data, &v) == 0);
+
+    /* Corrupt the on-disk len field (bytes 0..8 of the block) to UINT64_MAX. */
+    uint8_t corrupt[8];
+    memset(corrupt, 0xFF, sizeof corrupt);
+    CHECK(bstack_slice_write_range(v.slice, 0, corrupt, 8) == 0);
+
+    errno = 0;
+    CHECK(bstack_bytevec_push(&v, 0x99) == -1);
+    CHECK(errno == EINVAL);
+
+    errno = 0;
+    CHECK(bstack_bytevec_fill(&v, 0x99) == -1);
+    CHECK(errno == EINVAL);
+
+    CHECK(bstack_bytevec_dealloc(v) == 0);
+    env_close(&e);
+    return 0;
+}
+
 #ifdef BSTACK_FEATURE_ATOMIC
 
 /* ── atomic byte-movers (BSTACK_FEATURE_SET + BSTACK_FEATURE_ATOMIC) ────────── */
@@ -601,6 +631,7 @@ int main(void)
     T(test_bytevec_push_get_pop);
     T(test_bytevec_set);
     T(test_bytevec_fill);
+    T(test_bytevec_corrupt_len_rejected);
 #ifdef BSTACK_FEATURE_ATOMIC
     T(test_bytevec_extend_from_within);
     T(test_bytevec_insert);

@@ -506,10 +506,12 @@ int bstack_slice_sort_partial(bstack_slice_t s, uint64_t chunk_len,
  * >= it — computed without holding the whole region in memory.
  *
  * A bounded-memory quickselect: it narrows an active record band around n,
- * choosing each pivot from a cross-region sample and partitioning in place with
- * atomic bstack_cross_exchange swaps, until the band fits the internal budget
- * and one bstack_process settles it exactly.  Peak memory is O(1) in the
- * region's size; no scratch region.
+ * choosing each pivot from a cross-region sample and partitioning in place
+ * three ways (<, ==, > the pivot), a pair of budget-sized windows per atomic
+ * bstack_inplace_gen, until the band fits the internal budget and one
+ * bstack_process settles it exactly. Records equal to the pivot leave the band
+ * together, so duplicate-heavy regions shrink as fast as distinct ones. Peak
+ * memory is O(1) in the region's size; no scratch region.
  *
  * Every step is crash-atomic and permutation-preserving, so a crash or an early
  * error return leaves a valid permutation and re-running completes the
@@ -1108,7 +1110,7 @@ int first_fit_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..32)  — reserved (user area)
- *   [32..40) — magic: "ALGT\x00\x01\x04\x00"
+ *   [32..40) — magic: "ALGT\x00\x01\x05\x00"
  *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
  *   [48..)   — block arena (32-byte aligned)
  *
@@ -1123,6 +1125,13 @@ int first_fit_bstack_allocator_stats(
  * mutations; tail operations use bstack_try_discard / bstack_try_extend_zeros,
  * which check-and-act atomically under bstack's own write lock without holding
  * the allocator mutex.
+ *
+ * Poisoning: a tree mutation that fails partway on an I/O error can leave a
+ * node reachable from two parents, so two later allocations could share a
+ * region.  The allocator then poisons itself: every non-empty alloc, realloc,
+ * dealloc, and bulk call fails with errno = EINVAL until a reopen
+ * (ghost_tree_bstack_allocator_into_stack, then _new) rebuilds the tree.  A
+ * call refused on entry leaves its slice intact (-1).
  * ====================================================================== */
 
 typedef struct {
@@ -1132,6 +1141,10 @@ typedef struct {
     /* Opaque platform mutex; serialises AVL tree mutations so a single handle
      * may be shared across threads. */
     void              *lock;
+    /* Set when a tree mutation fails partway (see "Poisoning" above). */
+    atomic_int         poisoned;
+#else
+    int                poisoned;
 #endif
 } ghost_tree_bstack_allocator_t;
 
@@ -1327,7 +1340,7 @@ int slab_bstack_allocator_stats(
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
  *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
- *              magic = "ALCK\x00\x01\x03\x00"
+ *              magic = "ALCK\x00\x01\x04\x00"
  *   [48..)   — block arena
  *
  * Each block in the arena:
@@ -1363,12 +1376,10 @@ int slab_bstack_allocator_stats(
  * leave open), free-list push splices a block or a whole freed run with one
  * bstack_cross_exchange, and tail grow/shrink use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
- * The handle still owns an in-memory mutex (lock), held only by recover to keep
- * it single-flight: the recover scan and its one optional tail discard run as a
- * single bstack_process_gen sequence (so the bstack write lock, not the mutex,
- * serialises the scan against alloc/dealloc), while the mutex only prevents two
- * concurrent recover runs from each reclaiming the same leaked block.  Ordinary
- * alloc/dealloc/realloc never take it.
+ * recover is exclusive: while it runs, every mutator (including the bulk ones)
+ * fails with errno = EBUSY, leaving its slices intact for a retry.  An
+ * in-memory mutex (lock) keeps recover single-flight; ordinary operations never
+ * take it.
  *
  * Requires -DBSTACK_FEATURE_SET.
  * ====================================================================== */
@@ -1381,6 +1392,13 @@ typedef struct {
     /* Opaque platform mutex; held only by recover() to keep it single-flight
      * (alloc/dealloc/realloc are lock-free).  Shared across threads. */
     void              *lock;
+    /* Set while recover() runs; mutators fail with EBUSY.  Required: the scan
+     * misreads an in-flight op's intermediate state as a leak and relinks it
+     * (double allocation). */
+    atomic_bool        recovering;
+    /* Mutators in flight; recover() waits for it to drain.  The flag alone
+     * misses an op that checked it just before recover() set it. */
+    atomic_size_t      in_flight;
 #endif
 } checked_slab_bstack_allocator_t;
 
@@ -1421,6 +1439,9 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(
  * past suspicious regions, and discards any orphaned tail left by a failed
  * realloc truncation.  Writes *out_unsure (if non-NULL) with the count of
  * blocks that could not be classified with certainty (0 = fully recovered).
+ *
+ * Under -DBSTACK_FEATURE_ATOMIC, waits for in-flight mutators to finish and
+ * makes any mutator entered meanwhile fail with errno = EBUSY.
  *
  * Returns 0 on success, -1 on I/O error (errno set).
  * checked_slab_bstack_allocator_open calls this automatically.
@@ -1494,7 +1515,7 @@ int checked_slab_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x02\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x03\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)
@@ -1555,7 +1576,9 @@ int checked_slab_bstack_allocator_stats(
  * tail grow / oversized-discard paths use bstack_try_extend_zeros /
  * bstack_try_discard (check-and-act atomically under bstack's own write lock).
  * The handle carries no mutex at all; recover() is the sole exception and
- * requires a quiescent allocator (see its contract).
+ * requires a quiescent allocator (see its contract).  coalesce() is exclusive:
+ * while it runs, every mutator fails with errno = EBUSY, leaving its slices
+ * intact for a retry.
  *
  * Without -DBSTACK_FEATURE_ATOMIC a shrink cannot reclaim its freed excess —
  * recording the smaller size and dropping the excess cannot be fused without a
@@ -1574,6 +1597,15 @@ int checked_slab_bstack_allocator_stats(
 typedef struct {
     bstack_allocator_t base; /* must be first — safe cast to bstack_allocator_t * */
     bstack_t          *bs;
+#ifdef BSTACK_FEATURE_ATOMIC
+    /* Set while coalesce() runs; mutators fail with EBUSY.  Required: the scan
+     * misreads an in-flight op's detached free-tagged block as free and relinks
+     * it (double allocation). */
+    atomic_bool        coalescing;
+    /* Mutators in flight; coalesce() waits for it to drain.  The flag alone
+     * misses an op that checked it just before coalesce() set it. */
+    atomic_size_t      in_flight;
+#endif
 } segregated_bstack_allocator_t;
 
 /*
@@ -1596,8 +1628,11 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs);
 /*
  * Repair the allocator after an unclean shutdown: rebuild every free list from a
  * single linear scan of the arena's overhead words (reclaiming any block leaked
- * by a crashed alloc pop/claim), discard a fully-zeroed orphaned tail, and
- * publish the rebuilt head table as one crash-atomic bstack_set.  Idempotent and
+ * by a crashed alloc pop/claim), and publish the rebuilt head table as one
+ * crash-atomic bstack_set.  A classed list must hold exact class sizes, so a
+ * non-class free size (e.g. a merged run) is split into class blocks first.  A
+ * region zero to EOF (a crashed extend) is discarded; a zero gap followed by a
+ * header is left leaked, counted as unsure, and the scan resumes there.  Idempotent and
  * crash-safe by re-running.  Writes *out_unsure (if non-NULL) with the count of
  * blocks that could not be classified with certainty (0 = fully recovered).
  *
@@ -1620,17 +1655,18 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
  * own class list, so adjacent free blocks accumulate without merging and no
  * oversized request can reuse the contiguous run; coalesce fuses them.  It is the
  * recover walk plus a merge: it strides the arena by the recorded physical sizes
- * and, on any run of two or more adjacent free blocks, writes one merged free
- * block in place and rebuilds every free list from the scan (the same wholesale
- * rebuild recover uses, so no swallowed block needs a per-block unlink).  Writes
- * *out_fused (if non-NULL) with the number of blocks fused into a neighbour
- * (0 = nothing was adjacent, and nothing is written).
+ * and, on any run of two or more adjacent free blocks, writes the merged run in
+ * place, split into exact class blocks as recover does, and rebuilds every free
+ * list from the scan (the same wholesale rebuild recover uses, so no swallowed
+ * block needs a per-block unlink).  Writes *out_fused (if non-NULL) with the net
+ * drop in free blocks (0 = nothing merged, and nothing is written).
  *
- * Unlike recover, this needs no quiescence: the whole scan-and-rewrite runs
- * inside one bstack_inplace_gen, striding the overhead words one at a time under
- * the held write lock and committing the merges as one journalled batch, so a
- * concurrent alloc/dealloc can neither observe an intermediate state nor be
- * clobbered — no allocator-level lock.  A torn commit re-parses as a valid arena
+ * Unlike recover, this needs no caller-guaranteed quiescence: the whole
+ * scan-and-rewrite runs inside one bstack_inplace_gen and commits the merges as
+ * one journalled batch, and coalesce excludes mutators itself — it waits for
+ * in-flight ones, and any alloc/dealloc/realloc (or bulk op) entered meanwhile
+ * fails with errno = EBUSY and may be retried; concurrent coalesce calls run one
+ * at a time.  A torn commit re-parses as a valid arena
  * and is reclaimed by recover, so the pass is restartable; the scan follows only
  * physical sizes, never next_free, so a corrupt free list cannot cycle it.  A run
  * reaching the tail is merged like any other — tail discard is not attempted.
@@ -1657,8 +1693,8 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * scans under a bstack_process_gen, this walk needs only the shared lock. No
  * allocator-level lock is taken.
  *
- * A malformed overhead word, or a zeroed tail left by a crashed extend, ends
- * the scan at that point; the returned counts cover only the arena prefix
+ * A zero gap is skipped uncounted. A malformed overhead word ends the scan at
+ * that point; the returned counts cover only the arena prefix
  * that parsed cleanly — run segregated_bstack_allocator_coalesce (or
  * segregated_bstack_allocator_recover) first for an authoritative snapshot.
  *

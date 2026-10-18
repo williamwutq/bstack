@@ -28,10 +28,13 @@
 #ifdef BSTACK_FEATURE_ATOMIC
 #  ifdef _WIN32
 #    include <windows.h>
+#    define THREAD_YIELD()  ((void)SwitchToThread())
 #    define MUTEX_LOCK(a)   EnterCriticalSection((CRITICAL_SECTION *)(a)->lock)
 #    define MUTEX_UNLOCK(a) LeaveCriticalSection((CRITICAL_SECTION *)(a)->lock)
 #  else
 #    include <pthread.h>
+#    include <sched.h>
+#    define THREAD_YIELD()  ((void)sched_yield())
 #    define MUTEX_LOCK(a)   ((void)pthread_mutex_lock((pthread_mutex_t *)(a)->lock))
 #    define MUTEX_UNLOCK(a) ((void)pthread_mutex_unlock((pthread_mutex_t *)(a)->lock))
 #  endif
@@ -796,6 +799,8 @@ static int reverse_cb(uint8_t *buf, size_t len, void *ctxp)
 int bstack_slice_reverse_chunks(bstack_slice_t s, uint64_t chunk_len)
 {
     struct reverse_ctx ctx;
+    if (s.len / chunk_len < 2)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     return bstack_slice_process(s, reverse_cb, &ctx);
 }
@@ -824,6 +829,8 @@ int bstack_slice_rotate_left(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
         errno = EINVAL;
         return -1;
     }
+    if (k == 0 || k == count)
+        return 0;
     ctx.mid = (size_t)(k * chunk_len);
     return bstack_slice_process(s, rotate_cb, &ctx);
 }
@@ -836,6 +843,8 @@ int bstack_slice_rotate_right(bstack_slice_t s, uint64_t chunk_len, uint64_t k)
         errno = EINVAL;
         return -1;
     }
+    if (k == 0 || k == count)
+        return 0;
     /* Right by k records == left by (len - k*chunk_len) bytes. */
     ctx.mid = (size_t)(s.len - k * chunk_len);
     return bstack_slice_process(s, rotate_cb, &ctx);
@@ -860,6 +869,8 @@ int bstack_slice_sort(bstack_slice_t s, uint64_t chunk_len,
                       int (*cmp)(const void *a, const void *b))
 {
     struct sort_ctx ctx;
+    if (s.len / chunk_len < 2)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     ctx.cmp = cmp;
     return bstack_slice_process(s, sort_cb, &ctx);
@@ -933,6 +944,8 @@ int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
         errno = EINVAL;
         return -1;
     }
+    if (count == 1)
+        return 0;
     ctx.chunk_len = (size_t)chunk_len;
     ctx.n   = (size_t)n;
     ctx.cmp = cmp;
@@ -944,11 +957,12 @@ int bstack_slice_partition(bstack_slice_t s, uint64_t chunk_len, uint64_t n,
  *
  * bstack_slice_sort and bstack_slice_partition read the whole region into one
  * buffer and commit it with a single bstack_process, so a region larger than
- * memory cannot be ordered at all.  The two "partial" entry points below do
+ * memory cannot be ordered at all. The two "partial" entry points below do
  * the same work through a fixed byte budget instead: runs and base cases go
- * through bstack_process on sub-ranges that fit the budget, everything wider
- * is moved by single-record bstack_cross_exchange swaps.  Peak residency is
- * O(1) in the region's size.
+ * through bstack_process on sub-ranges that fit the budget. Wider merges move
+ * records by single-record bstack_cross_exchange swaps; wider partitions split
+ * budget-sized window pairs with one bstack_inplace_gen each. Peak residency
+ * is O(1) in the region's size.
  *
  * Every remote step is individually crash-atomic and permutation-preserving,
  * so a crash or an early I/O-error return leaves the region as some valid
@@ -1011,9 +1025,17 @@ static inline int rec_process(const struct records *r, uint64_t lo, uint64_t hi,
     return bstack_process(r->bs, REC_OFF(r, lo), REC_OFF(r, hi), cb, ctx);
 }
 
-/* Reverse the records in [x, y) via single-record atomic swaps. */
+/* Reverse the records in [x, y): one atomic rec_process when the span fits
+ * the budget, else single-record atomic swaps. */
 static inline int rec_reverse(const struct records *r, uint64_t x, uint64_t y)
 {
+    if (y - x < 2)
+        return 0;
+    if (y - x <= BSTACK_SORT_BUDGET / r->c) {
+        struct reverse_ctx rc;
+        rc.chunk_len = r->cu;
+        return rec_process(r, x, y, reverse_cb, &rc);
+    }
     while (y > x + 1) {
         uint64_t b = y - 1;
         if (rec_swap(r, x, b)) return -1;
@@ -1023,9 +1045,15 @@ static inline int rec_reverse(const struct records *r, uint64_t x, uint64_t y)
     return 0;
 }
 
-/* Swap the adjacent record blocks [a, b) and [b, d) by three reversals. */
+/* Swap the adjacent record blocks [a, b) and [b, d): one atomic rec_process
+ * when the span fits the budget, else three reversals. */
 static inline int rec_rotate(const struct records *r, uint64_t a, uint64_t b, uint64_t d)
 {
+    if (d - a <= BSTACK_SORT_BUDGET / r->c) {
+        struct rotate_ctx rc;
+        rc.mid = (size_t)(b - a) * r->cu;
+        return rec_process(r, a, d, rotate_cb, &rc);
+    }
     if (rec_reverse(r, a, b)) return -1;
     if (rec_reverse(r, b, d)) return -1;
     return rec_reverse(r, a, d);
@@ -1230,26 +1258,149 @@ static int rec_sample_pivot(const struct records *r, uint64_t lo, uint64_t hi,
     return 0;
 }
 
-/* Lomuto partition of [lo, hi) around the record at piv, in place via atomic
- * single-record swaps.  *out_p receives the pivot's final index p: [lo, p)
- * compare < pivot and [p + 1, hi) compare >= pivot.  Requires hi - lo >= 2. */
-static int rec_partition(const struct records *r, uint64_t lo, uint64_t hi,
-                         uint64_t piv, uint8_t *pbuf, uint8_t *one,
-                         int (*cmp)(const void *, const void *), uint64_t *out_p)
+/* Records per partition window: two windows fit the budget, and a record
+ * wider than half the budget still gets a one-record window. */
+static inline uint64_t rec_window(const struct records *r)
 {
-    uint64_t last = hi - 1, store = lo, k;
-    if (rec_read(r, piv, pbuf)) /* pivot bytes captured before moving */
-        return -1;
-    if (piv != last && rec_swap(r, piv, last)) return -1;
-    for (k = lo; k < last; k++) {
-        if (rec_read(r, k, one)) return -1;
-        if (cmp(one, pbuf) < 0) {
-            if (k != store && rec_swap(r, store, k)) return -1;
-            store++;
+    uint64_t k = BSTACK_SORT_BUDGET / 2 / r->c;
+    return k ? k : 1;
+}
+
+/* One partition step (bstack_inplace_gen generator): read the record ranges at
+ * a_off and, when b_len != 0, at b_off into win, move every left record of
+ * their concatenation ahead of the rest, and write back only the windows that
+ * changed.  A record is left when cmp(x, piv) < 0, or <= 0 when le is set. */
+struct part_round {
+    uint64_t       a_off, b_off;
+    size_t         a_len, b_len; /* window lengths in bytes */
+    size_t         cu;
+    size_t         nleft;      /* out: left records in the concatenation */
+    uint8_t       *win;        /* a_len + b_len bytes */
+    uint8_t       *tmp;        /* one record of swap scratch */
+    const uint8_t *piv;
+    int          (*cmp)(const void *, const void *);
+    int            prev_status;
+    unsigned char  step;
+    unsigned char  le;
+    unsigned char  write_a, write_b;
+};
+
+static int part_is_left(const struct part_round *c, size_t t)
+{
+    /* Pointer arithmetic: win is uint8_t *, so this addresses record t. */
+    int o = c->cmp(c->win + t * c->cu, c->piv);
+    return c->le ? o <= 0 : o < 0;
+}
+
+/* Hoare split of the concatenation in memory, noting which windows it moved. */
+static void part_split(struct part_round *c)
+{
+    size_t cu = c->cu, ka = c->a_len / cu;
+    size_t i = 0, j = (c->a_len + c->b_len) / cu;
+    for (;;) {
+        while (i < j && part_is_left(c, i)) i++;
+        while (i < j && !part_is_left(c, j - 1)) j--;
+        if (i == j) break; /* the scans met: every record is classified */
+        /* Record i is right and record j - 1 is left: swap them through tmp. */
+        memcpy(c->tmp, c->win + i * cu, cu);
+        memcpy(c->win + i * cu, c->win + (j - 1) * cu, cu);
+        memcpy(c->win + (j - 1) * cu, c->tmp, cu);
+        /* i < j - 1: window a moved iff record i lies in it, window b iff
+         * record j - 1 does. */
+        c->write_a |= i++ < ka;
+        c->write_b |= j-- > ka;
+    }
+    c->nleft = i;
+}
+
+static int part_round_gen(bstack_gen_op_t *op, void *ctxp)
+{
+    struct part_round *c = (struct part_round *)ctxp;
+    if (c->prev_status) {
+        op->kind = BSTACK_GEN_ABORT;
+        op->u.abort.status = c->prev_status;
+        return 1;
+    }
+    /* Each case advances step, so one that yields nothing falls into the next. */
+    switch (c->step) {
+    case 0:
+        c->step = 1;
+        op->kind = BSTACK_GEN_READ;
+        op->u.read.offset = c->a_off;
+        op->u.read.buf    = c->win;
+        op->u.read.len    = c->a_len;
+        return 1;
+    case 1:
+        c->step = 2;
+        if (c->b_len) {
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->b_off;
+            op->u.read.buf    = c->win + c->a_len;
+            op->u.read.len    = c->b_len;
+            return 1;
+        }
+        /* fall through */
+    case 2:
+        part_split(c);
+        if (!c->write_a && !c->write_b)
+            return 0; /* nothing moved: no writes staged, nothing to commit */
+        c->step = 3;
+        if (c->write_a) {
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->a_off;
+            op->u.write.data   = c->win;
+            op->u.write.len    = c->a_len;
+            return 1;
+        }
+        /* fall through */
+    case 3:
+        c->step = 4;
+        if (c->write_b) {
+            op->kind = BSTACK_GEN_WRITE;
+            op->u.write.offset = c->b_off;
+            op->u.write.data   = c->win + c->a_len;
+            op->u.write.len    = c->b_len;
+            return 1;
+        }
+        /* fall through */
+    default:
+        return 0; /* commit */
+    }
+}
+
+/* Two-way partition of [lo, hi) in place: *out receives s such that every
+ * record in [lo, s) is left and none in [s, hi) is.  Two-ended block scheme:
+ * each round splits the k-record windows at both frontiers of the unsettled
+ * range in one crash-atomic bstack_inplace_gen, so the left window ends all
+ * left or the right window ends all right — at least k records settle per
+ * round.  A residue under two windows is settled by one single-window round.
+ * base supplies cu, win, tmp, piv, cmp, and le; its per-round fields are 0. */
+static int rec_partition_by(const struct records *r, uint64_t lo, uint64_t hi,
+                            const struct part_round *base, uint64_t *out)
+{
+    uint64_t k = rec_window(r);
+    while (lo < hi) {
+        int win_fit = hi - lo >= 2 * k; /* two whole windows fit the range */
+        uint64_t ka = win_fit ? k : hi - lo;
+        struct part_round c = *base;
+        c.a_off = REC_OFF(r, lo);
+        c.b_off = win_fit ? REC_OFF(r, hi - k) : 0;
+        c.a_len = (size_t)ka * r->cu;
+        c.b_len = win_fit ? (size_t)k * r->cu : 0;
+        if (bstack_inplace_gen(r->bs, part_round_gen, &c, &c.prev_status)) return -1;
+        if (!win_fit) {
+            lo += c.nleft;
+            break;
+        }
+        if (c.nleft >= k) {
+            lo += k;
+            hi -= 2 * k - c.nleft;
+        } else {
+            lo += c.nleft;
+            hi -= k;
         }
     }
-    if (store != last && rec_swap(r, store, last)) return -1;
-    *out_p = store;
+    *out = lo;
     return 0;
 }
 
@@ -1263,7 +1414,8 @@ static int rec_select_nth(const struct records *r, uint64_t n,
     uint64_t fit = BSTACK_SORT_BUDGET / r->c;
     uint64_t lo = 0, hi = r->count;
     uint64_t max_samples;
-    uint8_t *scratch, *samp, *pbuf, *one;
+    size_t win_len;
+    uint8_t *scratch, *win, *pbuf, *tmp;
     int rc = 0;
     if (r->count <= 1) return 0;
     max_samples = BSTACK_SORT_BUDGET / r->c;
@@ -1271,17 +1423,35 @@ static int rec_select_nth(const struct records *r, uint64_t n,
         max_samples = BSTACK_SORT_SAMPLES;
     /* a record wider than the budget still samples one */
     if (max_samples == 0) max_samples = 1;
-    /* One allocation: the sample buffer, the pivot copy, and a compare slot. */
-    scratch = (uint8_t *)malloc((size_t)max_samples * cu + cu * 2);
+    /* One allocation: two partition windows (which also host the pivot
+     * sample), the pivot copy, and one record of swap scratch.  The window
+     * product does not undo rec_window's / 2 / c: the integer division rounds
+     * down, so this is the budget trimmed to whole window pairs, or two records
+     * when one is wider than half the budget.  Nothing here overflows size_t,
+     * even on 32-bit: max_samples * cu is at most the budget (or cu when
+     * max_samples was raised to 1), and records_init caps cu at SIZE_MAX / 4,
+     * so the malloc size is at most budget + 2 * cu or 4 * cu. */
+    win_len = (size_t)(2 * rec_window(r)) * cu;
+    if (win_len < (size_t)max_samples * cu)
+        win_len = (size_t)max_samples * cu;
+    scratch = (uint8_t *)malloc(win_len + cu * 2);
     if (!scratch) {
         errno = ENOMEM;
         return -1;
     }
-    samp = scratch;
-    pbuf = scratch + (size_t)max_samples * cu;
-    one  = pbuf + cu;
+    win  = scratch;
+    pbuf = scratch + win_len;
+    tmp  = pbuf + cu;
+    /* Partition template; each pass sets le.  Unnamed fields start at 0. */
+    struct part_round base = {
+        .cu  = cu,
+        .win = win,
+        .tmp = tmp,
+        .piv = pbuf,
+        .cmp = cmp,
+    };
     for (;;) {
-        uint64_t piv, p;
+        uint64_t piv, lt, gt, nlo, nhi;
         /* A single-record band already holds the answer. */
         if (hi - lo <= 1) break;
         /* Band within the budget: settle it exactly in one atomic pass.  The
@@ -1294,28 +1464,39 @@ static int rec_select_nth(const struct records *r, uint64_t n,
             rc = rec_process(r, lo, hi, select_cb, &sc);
             break;
         }
-        if (rec_sample_pivot(r, lo, hi, samp, max_samples, cmp, &piv)) {
+        if (rec_sample_pivot(r, lo, hi, win, max_samples, cmp, &piv)
+                || rec_read(r, piv, pbuf)) {
             rc = -1; break;
         }
-        if (rec_partition(r, lo, hi, piv, pbuf, one, cmp, &p)) {
+        /* Three-way split as two two-way passes: [lo, lt) < pivot, then, only
+         * when n is not left of lt, [lt, gt) == pivot and [gt, hi) > it. */
+        base.le = 0;
+        if (rec_partition_by(r, lo, hi, &base, &lt)) {
             rc = -1; break;
         }
-        /* Recurse into the side holding n, excluding the now-fixed pivot. */
-        if (n < p)
-            hi = p;
-        else if (n > p)
-            lo = p + 1;
-        else
-            break;
+        if (n < lt) {
+            nlo = lo; nhi = lt;
+        } else {
+            base.le = 1;
+            if (rec_partition_by(r, lt, hi, &base, &gt)) {
+                rc = -1; break;
+            }
+            if (n < gt) break; /* n is among the records equal to the pivot */
+            nlo = gt; nhi = hi;
+        }
+        /* A total order always shrinks the band, since the pivot record is
+         * neither < nor > itself.  Stop rather than spin on one that is not. */
+        if (nlo == lo && nhi == hi) break;
+        lo = nlo; hi = nhi;
     }
     free(scratch);
     return rc;
 }
 
 /* Fill in the record geometry, rejecting a stride this platform's size_t
- * cannot express.  The engines hold two to three records in memory, so the
+ * cannot express.  The engines hold up to four records in memory, so the
  * bound applies on every target, not just where size_t is narrower than the
- * offset type: three records must fit a size_t for rec_select_nth's scratch. */
+ * offset type: four records must fit a size_t for rec_select_nth's scratch. */
 static inline int records_init(struct records *r, bstack_slice_t s, uint64_t chunk_len)
 {
     if (chunk_len > (uint64_t)(SIZE_MAX / 4)) {
@@ -4166,7 +4347,7 @@ static int bstack_alloc_tail_shrink_gen(bstack_gen_op_t *out_op, void *ctx_)
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,4,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,5,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
@@ -4404,10 +4585,21 @@ static int algt_avl_rebalance(bstack_t *bs, uint64_t node, int8_t bf, uint8_t he
     return 0;
 }
 
+/* ---- poisoning --------------------------------------------------------- */
+
+/* Refuse while a prior tree mutation is torn.  Under BSTACK_FEATURE_ATOMIC the
+ * check that gates a tree access runs under a->lock. */
+static inline int algt_guard_not_poisoned(ghost_tree_bstack_allocator_t *a)
+{
+    if (a->poisoned) { errno = EINVAL; return -1; }
+    return 0;
+}
+
 /* ---- AVL insert -------------------------------------------------------- */
 
-static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
+static int algt_avl_insert(ghost_tree_bstack_allocator_t *a, uint64_t ptr, uint64_t size)
 {
+    bstack_t *bs = a->bs;
     algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
     size_t   path_len = 0;
     uint64_t root, current, child;
@@ -4440,6 +4632,7 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
         memset(buf, 0, 32); /* null children → cached child heights [10],[11] = 0 */
         write_le64(buf, size);
         buf[9] = 1;
+        /* The leaf is not yet linked, so a failure here leaves the tree intact. */
         if (bstack_set(bs, ptr, buf, 32) != 0) return -1;
     }
 
@@ -4465,13 +4658,18 @@ static int algt_avl_insert(bstack_t *bs, uint64_t ptr, uint64_t size)
             }
             if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
                                  new_left, new_right, known_lh, known_rh, &bf, &h) != 0)
-                return -1;
-            if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+                goto torn;
+            if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) goto torn;
             child   = new_child;
             child_h = new_h;
         }
     }
-    return algt_write_root(bs, child);
+    if (algt_write_root(bs, child) != 0) goto torn;
+    return 0;
+
+torn:
+    a->poisoned = 1; /* the up-pass may have torn the tree */
+    return -1;
 }
 
 /* ---- AVL remove-min ---------------------------------------------------- */
@@ -4532,9 +4730,10 @@ static int algt_avl_remove_min(bstack_t *bs, uint64_t root,
 
 /* Find and remove the best-fit (smallest block >= min_size) in one O(log n)
  * pass.  Sets *out_found_ptr = ALGT_NULL_PTR when no block fits. */
-static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
-    uint64_t *out_found_ptr, uint64_t *out_found_size)
+static int algt_avl_find_best_fit_and_remove(ghost_tree_bstack_allocator_t *a,
+    uint64_t min_size, uint64_t *out_found_ptr, uint64_t *out_found_size)
 {
+    bstack_t *bs = a->bs;
     algt_path_entry_t path[ALGT_MAX_AVL_DEPTH];
     size_t   path_len    = 0;
     int      fit_found   = 0;
@@ -4591,7 +4790,9 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
     found_lh    = path[last_fit_idx].lh; /* cached found_left  height */
     found_rh    = path[last_fit_idx].rh; /* cached found_right height */
 
-    /* Seed the up-pass directly with the best-fit node's replacement.  child_h
+    /* Everything from here writes the tree, so a failure may tear it (torn).
+     *
+     * Seed the up-pass directly with the best-fit node's replacement.  child_h
      * is the replacement subtree's height — known in every case now (single
      * child from the cache, successor from its rebalance). */
     if (found_left == ALGT_NULL_PTR) {
@@ -4604,10 +4805,10 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
         uint64_t succ, succ_sz, new_right;
         int8_t   bf; uint8_t h, rh;
         if (algt_avl_remove_min(bs, found_right, &succ, &succ_sz, &new_right) != 0)
-            return -1;
+            goto torn;
         if (algt_avl_write_h(bs, succ, succ_sz, found_left, new_right, -1, -1, &bf, &h) != 0)
-            return -1;
-        if (algt_avl_rebalance(bs, succ, bf, h, &child, &rh) != 0) return -1;
+            goto torn;
+        if (algt_avl_rebalance(bs, succ, bf, h, &child, &rh) != 0) goto torn;
         child_h = (int)rh;
     }
 
@@ -4626,16 +4827,20 @@ static int algt_avl_find_best_fit_and_remove(bstack_t *bs, uint64_t min_size,
             known_lh  = (int)path[i].lh; known_rh  = child_h;
         }
         if (algt_avl_write_h(bs, path[i].ptr, path[i].size,
-                             new_left, new_right, known_lh, known_rh, &bf, &h) != 0) return -1;
-        if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) return -1;
+                             new_left, new_right, known_lh, known_rh, &bf, &h) != 0) goto torn;
+        if (algt_avl_rebalance(bs, path[i].ptr, bf, h, &new_child, &new_h) != 0) goto torn;
         child   = new_child;
         child_h = (int)new_h;
     }
-    if (algt_write_root(bs, child) != 0) return -1;
+    if (algt_write_root(bs, child) != 0) goto torn;
 
     *out_found_ptr  = found_ptr;
     *out_found_size = found_size;
     return 0;
+
+torn:
+    a->poisoned = 1;
+    return -1;
 }
 
 /* ---- coalesce and rebalance -------------------------------------------- */
@@ -4880,10 +5085,12 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
     if (aligned == UINT64_MAX) { errno = EINVAL; return -1; }
 
     /* Lock covers AVL search and conditional insert (split case).
-     * Released before bstack_zero (no-split) and before bstack_extend. */
+     * Released before bstack_zero (no-split) and before bstack_extend.  The
+     * poison check is under the lock, so it also covers the extend fallback. */
     MUTEX_LOCK(a);
-    if (algt_avl_find_best_fit_and_remove(a->bs, aligned,
-                                           &found_ptr, &found_size) != 0) {
+    if (algt_guard_not_poisoned(a) != 0 ||
+        algt_avl_find_best_fit_and_remove(a, aligned,
+                                          &found_ptr, &found_size) != 0) {
         MUTEX_UNLOCK(a);
         return -1;
     }
@@ -4893,7 +5100,7 @@ static int gt_vt_alloc(bstack_allocator_t *self, uint64_t len,
         if (remainder >= ALGT_MIN_ALLOC) {
             /* Split: leading remainder becomes a new free block;
              * allocated block is at the back (tail of the found region). */
-            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+            if (algt_avl_insert(a, found_ptr, remainder) != 0) {
                 MUTEX_UNLOCK(a);
                 return -1;
             }
@@ -4937,6 +5144,8 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 
     if (slice.len == 0) return 0;
 
+    if (algt_guard_not_poisoned(a) != 0) return -1;
+
     if (slice.offset < ALGT_ARENA_START ||
         slice.offset != algt_align_up_ptr(slice.offset)) {
         errno = EINVAL;
@@ -4964,10 +5173,13 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     {
         int r;
         MUTEX_LOCK(a);
+        /* A refusal here keeps the slice (-1); its bytes are already zero, but
+         * the caller was freeing them. */
+        if (algt_guard_not_poisoned(a) != 0) { MUTEX_UNLOCK(a); return -1; }
         /* Past this point a torn (non-atomic) AVL insert cannot be safely
          * retried — GhostTree has no is_free flag to repair it in-process, so
          * a failure here can no longer hand the original back (-2). */
-        r = algt_avl_insert(a->bs, slice.offset, true_len);
+        r = algt_avl_insert(a, slice.offset, true_len);
         MUTEX_UNLOCK(a);
         return r == 0 ? 0 : -2;
     }
@@ -4985,7 +5197,7 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
          * torn AVL insert cannot be safely retried (-2), same reasoning as the
          * atomic path above. */
         if (bstack_zero(a->bs, slice.offset, (size_t)true_len) != 0) return -1;
-        return algt_avl_insert(a->bs, slice.offset, true_len) == 0 ? 0 : -2;
+        return algt_avl_insert(a, slice.offset, true_len) == 0 ? 0 : -2;
     }
 #endif
 }
@@ -5018,6 +5230,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         }
         return 0;
     }
+
+    if (algt_guard_not_poisoned(a) != 0) { *out = recovered; return -1; }
 
     if (slice.offset < ALGT_ARENA_START ||
         slice.offset != algt_align_up_ptr(slice.offset)) {
@@ -5081,8 +5295,9 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
          * crash-atomic splice. As two calls (try_discard then zero) a crash
          * between them shrinks the stack yet leaves the padding un-zeroed —
          * violating the zeroed-memory invariant. bstack_process_gen holds one
-         * write lock across the LEN tail-check and the SPLICE, so a fault is
-         * consulted before any mutation and leaves the block fully intact. */
+         * write lock across the LEN tail-check and the SPLICE. A SPLICE error
+         * may land after arming, and a replay then commits the cut, so it
+         * reports the block lost (-2). A LEN error precedes any mutation. */
         {
             bstack_alloc_tail_shrink_ctx_t ctx;
             uint8_t pad[ALGT_MIN_ALLOC];   /* zeros re-appended in the cut's place */
@@ -5098,6 +5313,7 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             ctx.new_buf       = pad;
             ctx.new_len       = (size_t)(aligned_new - new_len);
             if (bstack_process_gen(a->bs, bstack_alloc_tail_shrink_gen, &ctx) != 0) {
+                if (ctx.truncated) return -2;
                 *out = recovered;
                 return -1;
             }
@@ -5136,8 +5352,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 
         /* Non-tail: zero gap + freed tail (no lock), insert freed tail under
          * lock. The zero leaves the block intact on failure (-1); past that
-         * point a torn (non-atomic) AVL insert cannot be safely retried, so a
-         * failure there is a genuine loss (-2). */
+         * point the original is no longer intact and a torn (non-atomic) AVL
+         * insert cannot be safely retried, so any failure is a loss (-2). */
         {
             uint64_t zero_n = aligned_old - new_len;
 #if UINT64_MAX > SIZE_MAX
@@ -5151,7 +5367,8 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
         {
             int r;
             MUTEX_LOCK(a);
-            r = algt_avl_insert(a->bs, tail_ptr, freed_tail);
+            r = algt_guard_not_poisoned(a) != 0 ? -1
+                : algt_avl_insert(a, tail_ptr, freed_tail);
             MUTEX_UNLOCK(a);
             if (r != 0) return -2;
         }
@@ -5291,8 +5508,9 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
      * insert (split); released before bstack_zero and before bstack_extend. */
     block_ptr = ALGT_NULL_PTR; /* sentinel: no free block found */
     MUTEX_LOCK(a);
-    if (algt_avl_find_best_fit_and_remove(a->bs, total,
-                                           &found_ptr, &found_size) != 0) {
+    if (algt_guard_not_poisoned(a) != 0 ||
+        algt_avl_find_best_fit_and_remove(a, total,
+                                          &found_ptr, &found_size) != 0) {
         MUTEX_UNLOCK(a);
         free(aligned);
         return -1;
@@ -5303,7 +5521,7 @@ gt_vt_alloc_bulk(bstack_allocator_t *self, const uint64_t *lens, size_t n,
         if (remainder >= ALGT_MIN_ALLOC) {
             /* Split: recycle the leading remainder as a new free block;
              * use the trailing `total` bytes for the allocation. */
-            if (algt_avl_insert(a->bs, found_ptr, remainder) != 0) {
+            if (algt_avl_insert(a, found_ptr, remainder) != 0) {
                 MUTEX_UNLOCK(a);
                 free(aligned);
                 return -1;
@@ -5392,6 +5610,8 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
 
     if (pairs_n == 0) { free(pairs); return 0; }
 
+    if (algt_guard_not_poisoned(a) != 0) { free(pairs); return -1; }
+
     /* Sort by address so contiguous blocks are adjacent. */
     qsort(pairs, pairs_n, sizeof *pairs, algt_cmp_pair_by_ptr);
 
@@ -5460,8 +5680,13 @@ gt_vt_dealloc_bulk(bstack_allocator_t *self, const bstack_slice_t *slices,
     /* Insert all zeroed blocks under the lock. */
     if (pairs_n > 0) {
         MUTEX_LOCK(a);
+        if (algt_guard_not_poisoned(a) != 0) {
+            MUTEX_UNLOCK(a);
+            free(pairs);
+            return -1;
+        }
         for (i = 0; i < pairs_n; i++) {
-            if (algt_avl_insert(a->bs, pairs[i].ptr, pairs[i].size) != 0) {
+            if (algt_avl_insert(a, pairs[i].ptr, pairs[i].size) != 0) {
                 MUTEX_UNLOCK(a);
                 free(pairs);
                 return -1;
@@ -5494,6 +5719,7 @@ ghost_tree_bstack_allocator_t *ghost_tree_bstack_allocator_new(bstack_t *bs)
     a->base.vtbl      = &gt_bulk_vtbl.base;
     a->base.bulk_vtbl = &gt_bulk_vtbl;
     a->bs             = bs;
+    a->poisoned       = 0;
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
@@ -6936,7 +7162,7 @@ int slab_bstack_allocator_stats(
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,3,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,4,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -7776,13 +8002,19 @@ int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc
      * instead prevents two recover runs from overlapping (which would let both
      * reclaim the same leaked block and double-link it). */
     MUTEX_LOCK(alloc);
+    /* Exclude alloc/dealloc for the whole call, not just the scan: the reclaim
+     * relies on leaked blocks staying untouched until spliced.  seq_cst pairs
+     * with alck_enter_op (store flag, then load count). */
+    atomic_store(&alloc->recovering, 1);
+    while (atomic_load(&alloc->in_flight) != 0)
+        THREAD_YIELD();
 
     /* Cheap early-out hint; the authoritative size is read under the
      * process_gen lock below via BSTACK_GEN_LEN. */
-    if (bstack_len(bs, &stack_len) != 0) { MUTEX_UNLOCK(alloc); return -1; }
+    if (bstack_len(bs, &stack_len) != 0) { ret = -1; goto unlock; }
     if (stack_len <= ALCK_ARENA_START) {
         if (out_unsure) *out_unsure = 0;
-        MUTEX_UNLOCK(alloc); return 0;
+        goto unlock;
     }
 
     memset(&c, 0, sizeof c);
@@ -7793,9 +8025,8 @@ int checked_slab_bstack_allocator_recover(checked_slab_bstack_allocator_t *alloc
         ret = -1; goto done;
     }
 
-    /* Phase 2: splice reclaimed leaks onto the free list, lock-free.  Each is
-     * unreachable by alloc/dealloc, so its leaked state is stable across the
-     * unlocked gap, and alck_push_free_blocks splices atomically. */
+    /* Phase 2: splice reclaimed leaks onto the free list; each splice is an
+     * atomic cross_exchange. */
     for (i = 0; i < c.reclaim_cnt; i++) {
         if (alck_push_free_blocks(bs, c.reclaim[i], 1, alloc->block_size) != 0) {
             ret = -1; goto done;
@@ -7807,6 +8038,8 @@ done:
     free(c.free_arr);
     free(c.reclaim);
     free(c.reach);
+unlock:
+    atomic_store(&alloc->recovering, 0);
     MUTEX_UNLOCK(alloc);
     return ret;
 }
@@ -7943,13 +8176,40 @@ done:
 
 /* ---- vtable implementations -------------------------------------------- */
 
+/* Register a public mutator, or fail with EBUSY while recover runs.  Increment
+ * before checking (seq_cst): recover then either sees the count or we see its
+ * flag.  Non-atomic handles are single-threaded, so these are no-ops there. */
+static inline int alck_enter_op(checked_slab_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_add(&a->in_flight, 1);
+    if (atomic_load(&a->recovering)) {
+        atomic_fetch_sub(&a->in_flight, 1);
+        errno = EBUSY;
+        return -1;
+    }
+#else
+    (void)a;
+#endif
+    return 0;
+}
+
+static inline void alck_leave_op(checked_slab_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_sub(&a->in_flight, 1);
+#else
+    (void)a;
+#endif
+}
+
 static bstack_t *alck_vt_stack(bstack_allocator_t *base)
 {
     return ((checked_slab_bstack_allocator_t *)base)->bs;
 }
 
-static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
-                          bstack_slice_t *out)
+static int alck_alloc_impl(bstack_allocator_t *base, uint64_t len,
+                           bstack_slice_t *out)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t num_blocks;
@@ -8005,7 +8265,7 @@ static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
     }
 }
 
-static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+static int alck_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t block_start, overhead, num_blocks, backing, slice_end;
@@ -8061,7 +8321,7 @@ static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     return alck_push_free_blocks(a->bs, block_start, num_blocks, a->block_size) == 0 ? 0 : -2;
 }
 
-static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+static int alck_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
                              uint64_t new_len, bstack_slice_t *out)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
@@ -8083,7 +8343,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     if (check_own_slice(base, s) != 0) { *out = s; return -1; }
 
     if (s.len == 0 && s.offset == 0) {
-        if (alck_vt_alloc(base, new_len, out) != 0) {
+        if (alck_alloc_impl(base, new_len, out) != 0) {
             out->allocator = base; out->offset = 0; out->len = 0;
             return -1;
         }
@@ -8093,7 +8353,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     if (new_len == 0) {
         /* dealloc consumes `s`; propagate its own survivor signal unchanged
          * — on -1 it hands back exactly the original slice. */
-        int dr = alck_vt_dealloc(base, s);
+        int dr = alck_dealloc_impl(base, s);
         if (dr != 0) {
             if (dr == -1) *out = recovered;
             return dr;
@@ -8210,7 +8470,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                 uint8_t       *tmp;
                 uint64_t       copy_len;
 
-                if (alck_vt_alloc(base, new_len, &new_s) != 0) {
+                if (alck_alloc_impl(base, new_len, &new_s) != 0) {
                     *out = recovered;
                     return -1;
                 }
@@ -8220,14 +8480,14 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #if UINT64_MAX > SIZE_MAX
                     if (copy_len > (uint64_t)SIZE_MAX) {
                         errno = EINVAL;
-                        alck_vt_dealloc(base, new_s); /* best-effort rollback; original untouched either way */
+                        alck_dealloc_impl(base, new_s); /* best-effort rollback; original untouched either way */
                         *out = recovered;
                         return -1;
                     }
 #endif
                     tmp = malloc((size_t)copy_len);
                     if (!tmp) {
-                        alck_vt_dealloc(base, new_s);
+                        alck_dealloc_impl(base, new_s);
                         *out = recovered;
                         return -1;
                     }
@@ -8240,7 +8500,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                          * original still holds the data untouched, so it
                          * remains the survivor regardless of whether this
                          * rollback itself succeeds. */
-                        alck_vt_dealloc(base, new_s);
+                        alck_dealloc_impl(base, new_s);
                         *out = recovered;
                         return -1;
                     }
@@ -8251,7 +8511,7 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
                  * so a failure freeing the old block returns the new region
                  * instead (the old block leaks until crash recovery). */
                 recovered = new_s;
-                if (alck_vt_dealloc(base, s) != 0) {
+                if (alck_dealloc_impl(base, s) != 0) {
                     *out = recovered;
                     return -1;
                 }
@@ -8371,6 +8631,43 @@ static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
             return 0;
         }
     }
+}
+
+/* Public entries: each takes one alck_enter_op/alck_leave_op pair; internal
+ * paths call the _impl bodies directly (a nested enter could fail mid-op). */
+
+static int alck_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                          bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_alloc_impl(base, len, out);
+    alck_leave_op(a);
+    return r;
+}
+
+static int alck_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) return -1;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_dealloc_impl(base, s);
+    alck_leave_op(a);
+    return r;
+}
+
+static int alck_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                             uint64_t new_len, bstack_slice_t *out)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
+    if (alck_enter_op(a) != 0) { *out = s; return -1; }
+    r = alck_realloc_impl(base, s, new_len, out);
+    alck_leave_op(a);
+    return r;
 }
 
 #ifndef BSTACK_FEATURE_ATOMIC
@@ -8703,8 +9000,8 @@ static int alck_alloc_bulk_from_freelist_atomic(bstack_allocator_t *base,
     return c.enough ? 1 : 0;
 }
 
-static int alck_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
-                              size_t n, bstack_slice_t *out_slices)
+static int alck_alloc_bulk_impl(bstack_allocator_t *base, const uint64_t *lens,
+                                size_t n, bstack_slice_t *out_slices)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t bs = a->block_size;
@@ -8822,8 +9119,8 @@ fail:
     return -1;
 }
 
-static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
-                                const bstack_slice_t *slices, size_t n)
+static int alck_dealloc_bulk_impl(bstack_allocator_t *base,
+                                  const bstack_slice_t *slices, size_t n)
 {
     checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
     uint64_t bs = a->block_size, total = 0;
@@ -8876,6 +9173,30 @@ static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
     return r;
 }
 
+static int alck_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (n == 0) return 0;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_alloc_bulk_impl(base, lens, n, out_slices);
+    alck_leave_op(a);
+    return r;
+}
+
+static int alck_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    checked_slab_bstack_allocator_t *a = (checked_slab_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slices(base, slices, n) != 0) return -1;
+    if (alck_enter_op(a) != 0) return -1;
+    r = alck_dealloc_bulk_impl(base, slices, n);
+    alck_leave_op(a);
+    return r;
+}
+
 static const bstack_bulk_allocator_vtbl_t alck_bulk_vtbl = {
     { alck_vt_stack, alck_vt_alloc, alck_vt_realloc, alck_vt_dealloc },
     alck_vt_alloc_bulk,
@@ -8909,6 +9230,8 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_new(
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+    atomic_init(&a->recovering, 0);
+    atomic_init(&a->in_flight, 0);
 #endif
 
     memset(hdr, 0, sizeof hdr);
@@ -8987,6 +9310,8 @@ checked_slab_bstack_allocator_t *checked_slab_bstack_allocator_open(bstack_t *bs
 
 #ifdef BSTACK_FEATURE_ATOMIC
     if (bstack_alloc_lock_init(&a->lock) != 0) { free(a); return NULL; }
+    atomic_init(&a->recovering, 0);
+    atomic_init(&a->in_flight, 0);
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
@@ -9179,8 +9504,12 @@ int checked_slab_bstack_allocator_stats(
 /* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
  * and the in-use overhead recording the block's physical size (minor 1 recorded
  * the caller's length instead — a \x01 file fails new() with EINVAL). */
-static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,1,0};
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,3,0};
 static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
+
+/* Bytes recover's zero-run scan reads per step, into a stack buffer; a multiple
+ * of the 16-byte quantum so every chunk starts on a word boundary. */
+#define ALSG_ZERO_SCAN_CHUNK 2048
 
 #define alsg_head_off(cls) (ALSG_FREE_HEAD_BASE + (uint64_t)(cls) * 8)
 
@@ -9238,6 +9567,25 @@ static inline uint64_t alsg_largest_class_le(uint64_t v)
     k = alsg_ilog2_u64(v);                           /* 2^k <= v < 2^{k+1} */
     w = UINT64_C(1) << (k - ALSG_SUBCLASS_BITS);
     return v & ~(w - 1);
+}
+
+/* Greedily decompose a free region (multiple of 16) into exact class sizes: the
+ * largest class <= the remainder, repeated; a region > MAX_CLASS is one
+ * oversized piece.  Every classed free-list block must be exactly its class
+ * size — pops claim that size without reading the block's.  Returns the piece
+ * count (<= ALSG_MAX_CARVE_PIECES). */
+static inline size_t alsg_carve_pieces(uint64_t region,
+                                       uint64_t pieces[ALSG_MAX_CARVE_PIECES])
+{
+    size_t k = 0;
+    while (region > 0 && k < ALSG_MAX_CARVE_PIECES) {
+        uint64_t ps = (region > ALSG_MAX_CLASS) ? region : alsg_largest_class_le(region);
+        pieces[k++] = ps;
+        region -= ps;
+    }
+    /* region == 0 here: a greedy carve never needs more than
+     * ALSG_MAX_CARVE_PIECES, so the cap never drops a remainder. */
+    return k;
 }
 
 /* Validate a caller data pointer and return its block base offset. */
@@ -9630,8 +9978,9 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
                              uint64_t region_start, uint64_t region_size)
 {
     struct alsg_carve_ctx c;
-    uint64_t off = region_start, rem = region_size;
-    size_t   k = 0;
+    uint64_t off = region_start;
+    uint64_t pieces[ALSG_MAX_CARVE_PIECES];
+    size_t   k = alsg_carve_pieces(region_size, pieces), i;
 
 #ifdef BSTACK_FEATURE_ATOMIC
     c.step       = 0;
@@ -9640,20 +9989,18 @@ static int alsg_commit_carve(bstack_t *bs, uint64_t prefix_off,
     c.prefix_len = prefix_len;
 #endif
 
-    while (rem > 0) {
-        uint64_t ps = (rem > ALSG_MAX_CLASS) ? rem : alsg_largest_class_le(rem);
-        if (k >= ALSG_MAX_CARVE_PIECES) { errno = EINVAL; return -1; }
-        c.block_offs[k] = off;
-        c.head_offs[k]  = alsg_head_off(alsg_classify(ps));
-        write_le64(c.overhead_next[k], ps >> 4);
-        write_le64(c.overhead_next[k] + 8, 0); /* next_free half will be filled in by read */
-        write_le64(c.blockoff_bytes[k], off);
-        off += ps; rem -= ps; k++;
+    for (i = 0; i < k; i++) {
+        uint64_t ps = pieces[i];
+        c.block_offs[i] = off;
+        c.head_offs[i]  = alsg_head_off(alsg_classify(ps));
+        write_le64(c.overhead_next[i], ps >> 4);
+        write_le64(c.overhead_next[i] + 8, 0); /* next_free half will be filled in by read */
+        write_le64(c.blockoff_bytes[i], off);
+        off += ps;
     }
 
 #ifndef BSTACK_FEATURE_ATOMIC
     {
-        size_t i;
         for (i = 0; i < k; i++) {
             uint8_t shared[16];
             memcpy(shared, c.overhead_next[i], 16);
@@ -9752,6 +10099,83 @@ success:
 
 /* ---- recover ----------------------------------------------------------- */
 
+/* Offset within chunk of the first non-zero overhead word (one per quantum).
+ * Returns 1 and sets *out on a hit, 0 if none. */
+static inline int alsg_nonzero_word_in_chunk(const uint8_t *chunk, size_t n,
+                                             uint64_t *out)
+{
+    size_t i, b;
+    for (i = 0; i < n; i += (size_t)ALSG_QUANTUM)
+        for (b = i; b < i + (size_t)ALSG_OVERHEAD && b < n; b++)
+            if (chunk[b]) { *out = (uint64_t)i; return 1; }
+    return 0;
+}
+
+/* alsg_scan_nonzero_word: first quantum-aligned offset in [from, end) whose
+ * overhead word is non-zero.  Sets *found and *out on a hit; *found = 0 if every
+ * such word is zero.  Reads ALSG_ZERO_SCAN_CHUNK-byte chunks (all under one
+ * bstack_get_batched_gen lock with atomic). */
+#ifdef BSTACK_FEATURE_ATOMIC
+/* Fields ordered widest-alignment-first (byte buffer sized in multiples of 8,
+ * then u64, then size_t, then the ints) so the struct has no internal padding. */
+struct alsg_nz_ctx {
+    uint8_t  buf[ALSG_ZERO_SCAN_CHUNK];
+    uint64_t q, end, hit;
+    size_t   n;
+    int      pending, found;
+};
+
+static int alsg_nz_gen(uint64_t *out_offset, uint8_t **out_buf,
+                       size_t *out_len, void *ctxp)
+{
+    struct alsg_nz_ctx *c = ctxp;
+    if (c->pending) {
+        uint64_t i;
+        if (alsg_nonzero_word_in_chunk(c->buf, c->n, &i)) {
+            c->found = 1; c->hit = c->q + i; return 0;
+        }
+        c->q += c->n;
+    }
+    if (c->q >= c->end) return 0;
+    c->n = (c->end - c->q < ALSG_ZERO_SCAN_CHUNK) ? (size_t)(c->end - c->q)
+                                                  : ALSG_ZERO_SCAN_CHUNK;
+    c->pending  = 1;
+    *out_offset = c->q;
+    *out_buf    = c->buf;
+    *out_len    = c->n;
+    return 1;
+}
+
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t from, uint64_t end,
+                                  int *found, uint64_t *out)
+{
+    struct alsg_nz_ctx c;
+    c.q = from; c.end = end; c.hit = 0; c.n = 0; c.pending = 0; c.found = 0;
+    if (bstack_get_batched_gen(bs, alsg_nz_gen, &c)) return -1;
+    *found = c.found;
+    *out   = c.hit;
+    return 0;
+}
+#else
+static int alsg_scan_nonzero_word(bstack_t *bs, uint64_t q, uint64_t end,
+                                  int *found, uint64_t *out)
+{
+    uint8_t buf[ALSG_ZERO_SCAN_CHUNK];
+    while (q < end) {
+        size_t n = (end - q < ALSG_ZERO_SCAN_CHUNK) ? (size_t)(end - q)
+                                                   : ALSG_ZERO_SCAN_CHUNK;
+        uint64_t i;
+        if (bstack_get(bs, q, q + n, buf)) return -1;
+        if (alsg_nonzero_word_in_chunk(buf, n, &i)) {
+            *found = 1; *out = q + i; return 0;
+        }
+        q += n;
+    }
+    *found = 0;
+    return 0;
+}
+#endif
+
 int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
                                         uint64_t *out_unsure)
 {
@@ -9782,29 +10206,61 @@ int segregated_bstack_allocator_recover(segregated_bstack_allocator_t *alloc,
             }
             p += size;
         } else if (word == 0) {
-            /* Zeroed tail from a crashed extend: discard it. */
-            uint64_t dn = stack_len - p;
+            /* A zero word is never a valid header (free blocks store size >> 4
+             * >= 1).  Only an all-zero run to EOF is a crashed-extend tail;
+             * otherwise a mid-arena gap would take every block after it. */
+            int found;
+            uint64_t q;
+            if (alsg_scan_nonzero_word(bs, p + ALSG_QUANTUM, stack_len, &found, &q))
+                return -1;
+            if (!found) {
+                uint64_t dn = stack_len - p;
 #if UINT64_MAX > SIZE_MAX
-            if (dn > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
+                if (dn > (uint64_t)SIZE_MAX) { errno = EINVAL; return -1; }
 #endif
-            if (bstack_discard(bs, (size_t)dn)) return -1;
-            break;
+                if (bstack_discard(bs, (size_t)dn)) return -1;
+                break;
+            }
+            /* Resync at the next header; the gap stays leaked. */
+            unsure += (q - p) / ALSG_QUANTUM;
+            p = q;
         } else {
             /* Free: relink by the stored physical size (reclaims leaks too). */
             uint64_t size = word << 4;
-            uint64_t cc;
+            uint64_t pieces[ALSG_MAX_CARVE_PIECES], off = p;
+            uint8_t  pbuf[ALSG_MAX_CARVE_PIECES][16];
+            size_t   k, i;
             if (size < ALSG_QUANTUM || size % ALSG_QUANTUM || size > stack_len - p) {
                 unsure += (stack_len - p) / ALSG_QUANTUM; break;
             }
-            /* Relink by the largest class <= size so a malformed non-class size
-             * degrades to a leak, never a head that overruns the block. */
-            cc = (size > ALSG_MAX_CLASS)
-                 ? ALSG_OVERSIZED_CLASS
-                 : alsg_classify(alsg_largest_class_le(size));
-            /* Prepend: next_free <- current head of this class, head <- p. */
-            write_le64(wbuf, heads[cc]);
-            if (bstack_set(bs, p + ALSG_OVERHEAD, wbuf, 8)) return -1;
-            heads[cc] = p;
+            /* Split a non-class size into exact class pieces, each staged as
+             * overhead || next_free <- current head of its class. */
+            k = alsg_carve_pieces(size, pieces);
+            for (i = 0; i < k; i++) {
+                uint64_t cc = alsg_classify(pieces[i]);
+                write_le64(pbuf[i], pieces[i] >> 4);
+                write_le64(pbuf[i] + 8, heads[cc]);
+                heads[cc] = off;
+                off += pieces[i];
+            }
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                /* One crash-atomic batch for all pieces. */
+                bstack_iovec_t w[ALSG_MAX_CARVE_PIECES];
+                for (i = 0, off = p; i < k; off += pieces[i], i++) {
+                    w[i].offset = off; w[i].buf = pbuf[i]; w[i].len = 16;
+                }
+                if (bstack_set_batched(bs, w, k)) return -1;
+            }
+#else
+            /* Back to front so p's header shrinks last: until then the inner
+             * headers sit inside the block it still records, so a crash leaves
+             * a valid tiling and a re-run finishes the split. */
+            for (i = k; i-- > 0;) {
+                off -= pieces[i];
+                if (bstack_set(bs, off, pbuf[i], 16)) return -1;
+            }
+#endif
             p += size;
         }
     }
@@ -9832,6 +10288,8 @@ enum alsg_co_state {
     ALSG_CO_HAVEBLOCK,/* word_buf = word@p; classify (stride / free-run start) */
     ALSG_CO_NEEDRUN,  /* issue a READ of the run's next candidate at j */
     ALSG_CO_HAVERUN,  /* word_buf = word@j; extend the run or close it */
+    ALSG_CO_NEEDGAP,  /* inside a zero gap: issue a READ of the next chunk at p */
+    ALSG_CO_HAVEGAP,  /* chunk[..gap_n] = bytes@p; resync at a header or skip on */
     ALSG_CO_FLUSH     /* scan done: drain the writes, then the head table */
 };
 
@@ -9840,40 +10298,46 @@ enum alsg_co_state {
 struct alsg_co_ctx {
     uint64_t   stack_len;                    /* length seen under the lock */
     uint64_t   p, run_start, run_size, j;    /* cursor p; run being built [run_start, j) */
-    uint64_t   fused;                        /* blocks merged into a neighbour */
+    uint64_t   fused;                        /* net drop in free blocks */
+    uint64_t   run_blocks;                   /* blocks absorbed into the run */
     uint64_t   heads[ALSG_NUM_CLASSES];      /* rebuilt head table (SENTINEL == 0) */
     const int *prev;                         /* inplace_gen prev-status */
     struct alsg_co_write *writes;            /* plan, grown during the scan */
     size_t     nwrites, cap;                 /* plan length / capacity */
     size_t     wi;                           /* next write to emit in FLUSH */
+    size_t     gap_n;                        /* bytes read into chunk */
     int        state;                        /* scan state (enum alsg_co_state) */
     uint8_t    head_bytes[ALSG_NUM_CLASSES * 8];
     uint8_t    word_buf[8];                  /* reused across strides */
+    uint8_t    chunk[ALSG_ZERO_SCAN_CHUNK];  /* zero-gap scan buffer */
 };
 
-/* Record one maximal free run as a single output free block: stage its
- * [overhead || next_free] edit at run_start and prepend it onto the class for
- * run_size (largest class <= run_size, or oversized above MAX_CLASS, so a
- * non-class merged size degrades to retained slack — the recover rule).
- * Returns 0, or -1 on allocation failure (nothing mutated). */
+/* Record one maximal free run as exact class free blocks (the recover split):
+ * stage each piece's [overhead || next_free] edit and prepend it onto its class.
+ * Counts only net merges into fused, so a run that re-splits into as many
+ * pieces as it had changes nothing.  Returns 0, or -1 on allocation failure
+ * (nothing mutated). */
 static int alsg_co_record(struct alsg_co_ctx *c)
 {
-    uint64_t cls = (c->run_size > ALSG_MAX_CLASS)
-                   ? ALSG_OVERSIZED_CLASS
-                   : alsg_classify(alsg_largest_class_le(c->run_size));
-    struct alsg_co_write *w;
-    if (c->nwrites == c->cap) {
+    uint64_t pieces[ALSG_MAX_CARVE_PIECES], off = c->run_start;
+    size_t   k = alsg_carve_pieces(c->run_size, pieces), i;
+    if (c->cap - c->nwrites < k) {
         size_t newcap = c->cap ? c->cap * 2 : 16;
         struct alsg_co_write *nw = realloc(c->writes, newcap * sizeof *nw);
         if (!nw) return -1;
         c->writes = nw;
         c->cap = newcap;
     }
-    w = &c->writes[c->nwrites++];
-    w->off = c->run_start;
-    write_le64(w->buf, c->run_size >> 4);    /* overhead: free tag | merged size */
-    write_le64(w->buf + 8, c->heads[cls]);   /* next_free <- current class head */
-    c->heads[cls] = c->run_start;
+    for (i = 0; i < k; i++) {
+        uint64_t cls = alsg_classify(pieces[i]);
+        struct alsg_co_write *w = &c->writes[c->nwrites++];
+        w->off = off;
+        write_le64(w->buf, pieces[i] >> 4);  /* overhead: free tag | piece size */
+        write_le64(w->buf + 8, c->heads[cls]); /* next_free <- current class head */
+        c->heads[cls] = off;
+        off += pieces[i];
+    }
+    if (c->run_blocks > k) c->fused += c->run_blocks - k;
     return 0;
 }
 
@@ -9912,8 +10376,12 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
 
         case ALSG_CO_HAVEBLOCK: {
             uint64_t word = read_le64(c->word_buf);
-            /* Zeroed tail from a crashed extend: stop (tail unhandled). */
-            if (word == 0) { c->state = ALSG_CO_FLUSH; continue; }
+            /* Never a valid header: skip the gap as recover does (zero to the
+             * end is a crashed-extend tail, left alone). */
+            if (word == 0) {
+                c->p += ALSG_QUANTUM;
+                c->state = ALSG_CO_NEEDGAP; continue;
+            }
             if (word & ALSG_IN_USE_BIT) {
                 uint64_t size = (word & ~ALSG_IN_USE_BIT) << 4;
                 /* Malformed: stop; the remainder leaks until a recover. */
@@ -9930,8 +10398,9 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
                     c->state = ALSG_CO_FLUSH; continue;
                 }
                 /* Free block: open a run and look ahead at the next block. */
-                c->run_start = c->p;
-                c->run_size  = size;
+                c->run_start  = c->p;
+                c->run_size   = size;
+                c->run_blocks = 1;
                 c->j = c->p + size;          /* <= stack_len by the check above */
                 c->state = ALSG_CO_NEEDRUN; continue;
             }
@@ -9960,7 +10429,7 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
                      * <= stack_len, so neither add overflows. */
                     c->run_size += s;
                     c->j += s;
-                    c->fused += 1;
+                    c->run_blocks += 1;
                     c->state = ALSG_CO_NEEDRUN; continue;
                 }
             }
@@ -9970,6 +10439,27 @@ static int alsg_coalesce_gen(bstack_gen_op_t *op, void *uc)
             }
             c->p = c->j;
             c->state = ALSG_CO_NEEDBLOCK; continue;
+        }
+
+        case ALSG_CO_NEEDGAP:
+            if (c->p >= c->stack_len) { c->state = ALSG_CO_FLUSH; continue; }
+            c->gap_n = (c->stack_len - c->p < ALSG_ZERO_SCAN_CHUNK)
+                       ? (size_t)(c->stack_len - c->p) : ALSG_ZERO_SCAN_CHUNK;
+            c->state = ALSG_CO_HAVEGAP;
+            op->kind = BSTACK_GEN_READ;
+            op->u.read.offset = c->p; op->u.read.buf = c->chunk; op->u.read.len = c->gap_n;
+            return 1;
+
+        case ALSG_CO_HAVEGAP: {
+            uint64_t i;
+            if (alsg_nonzero_word_in_chunk(c->chunk, c->gap_n, &i)) {
+                c->p += i;                   /* resync at the next header */
+                c->state = ALSG_CO_NEEDBLOCK;
+            } else {
+                c->p += c->gap_n;
+                c->state = ALSG_CO_NEEDGAP;
+            }
+            continue;
         }
 
         case ALSG_CO_FLUSH:
@@ -10020,6 +10510,18 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
         return 0;
     }
 
+    /* Exclude mutators for the whole scan: an in-flight op's detached
+     * free-tagged block reads as free.  Taken by CAS so a second coalesce waits
+     * rather than clearing this one's flag.  seq_cst pairs with alsg_enter_op
+     * (store flag, then load count). */
+    for (;;) {
+        _Bool expected = 0;
+        if (atomic_compare_exchange_strong(&alloc->coalescing, &expected, 1)) break;
+        THREAD_YIELD();
+    }
+    while (atomic_load(&alloc->in_flight) != 0)
+        THREAD_YIELD();
+
     memset(&c, 0, sizeof c);                  /* heads[] <- SENTINEL (0) */
     c.prev  = &prev;
     c.state = ALSG_CO_NEEDLEN;
@@ -10027,6 +10529,7 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
 
     r = bstack_inplace_gen(bs, alsg_coalesce_gen, &c, &prev);
     free(c.writes);
+    atomic_store(&alloc->coalescing, 0);
     if (r) return -1;
     if (out_fused) *out_fused = c.fused;
     return 0;
@@ -10038,49 +10541,72 @@ int segregated_bstack_allocator_coalesce(segregated_bstack_allocator_t *alloc,
  * arena length it sampled. */
 #define ALSG_STATS_SHRINK_RETRIES 4
 
+/* Fields ordered widest-alignment-first (u64, then size_t, then the ints, then
+ * the byte buffers) so the struct has no internal padding. */
 struct alsg_stats_ctx {
     uint64_t scan_end;
     uint64_t p;
     uint64_t free_blocks, free_bytes, in_use_blocks, in_use_bytes;
-    int      pending; /* word_buf holds an unprocessed read from the last call */
+    size_t   gap_n;   /* bytes read into chunk */
+    int      pending; /* the last call's read is still unprocessed */
+    int      in_gap;  /* inside a zero gap: chunk is read instead of word_buf */
     uint8_t  word_buf[8];
+    uint8_t  chunk[ALSG_ZERO_SCAN_CHUNK];
 };
 
 static int alsg_stats_gen(uint64_t *out_offset, uint8_t **out_buf,
                           size_t *out_len, void *ctxp)
 {
     struct alsg_stats_ctx *c = ctxp;
-    if (c->pending) {
+    if (c->pending && c->in_gap) {
+        uint64_t i;
+        c->pending = 0;
+        if (alsg_nonzero_word_in_chunk(c->chunk, c->gap_n, &i)) {
+            c->p += i;                       /* resync at the next header */
+            c->in_gap = 0;
+        } else {
+            c->p += c->gap_n;
+        }
+    } else if (c->pending) {
         uint64_t word = read_le64(c->word_buf);
         uint64_t size;
         c->pending = 0;
         if (word == 0) {
-            /* Zeroed tail from a crashed extend: stop (recover and coalesce
-             * both discard/skip this the same way). */
-            c->p = c->scan_end; return 0;
-        }
-        /* size comes off disk and may be arbitrary, so the fit test is
-         * `size > scan_end - p` (no underflow: p < scan_end here) rather than
-         * `p + size`, which could overflow.  << 4 makes it a multiple of
-         * ALSG_QUANTUM, so only the lower bound is left. */
-        size = (word & ~ALSG_IN_USE_BIT) << 4;
-        if (size < ALSG_QUANTUM || size > c->scan_end - c->p) {
-            c->p = c->scan_end; return 0; /* malformed: stop the scan here */
-        }
-        if (word & ALSG_IN_USE_BIT) {
-            c->in_use_blocks++;
-            c->in_use_bytes += size;
+            /* Never a valid header: skip the gap as recover does (zero to the
+             * end is a crashed-extend tail). */
+            c->p += ALSG_QUANTUM;
+            c->in_gap = 1;
         } else {
-            c->free_blocks++;
-            c->free_bytes += size;
+            /* size comes off disk and may be arbitrary, so the fit test is
+             * `size > scan_end - p` (no underflow: p < scan_end here) rather
+             * than `p + size`, which could overflow.  << 4 makes it a multiple
+             * of ALSG_QUANTUM, so only the lower bound is left. */
+            size = (word & ~ALSG_IN_USE_BIT) << 4;
+            if (size < ALSG_QUANTUM || size > c->scan_end - c->p) {
+                c->p = c->scan_end; return 0; /* malformed: stop the scan here */
+            }
+            if (word & ALSG_IN_USE_BIT) {
+                c->in_use_blocks++;
+                c->in_use_bytes += size;
+            } else {
+                c->free_blocks++;
+                c->free_bytes += size;
+            }
+            c->p += size;
         }
-        c->p += size;
     }
     if (c->p >= c->scan_end) return 0;
     c->pending  = 1;
     *out_offset = c->p;
-    *out_buf    = c->word_buf;
-    *out_len    = 8;
+    if (c->in_gap) {
+        c->gap_n = (c->scan_end - c->p < ALSG_ZERO_SCAN_CHUNK)
+                   ? (size_t)(c->scan_end - c->p) : ALSG_ZERO_SCAN_CHUNK;
+        *out_buf = c->chunk;
+        *out_len = c->gap_n;
+    } else {
+        *out_buf = c->word_buf;
+        *out_len = 8;
+    }
     return 1;
 }
 
@@ -10134,13 +10660,40 @@ int segregated_bstack_allocator_stats(
 
 /* ---- vtable implementations -------------------------------------------- */
 
+/* Register a public mutator, or fail with EBUSY while coalesce runs.  Increment
+ * before checking (seq_cst): coalesce then either sees the count or we see its
+ * flag.  Without atomic there is no coalesce, so these are no-ops. */
+static inline int alsg_enter_op(segregated_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_add(&a->in_flight, 1);
+    if (atomic_load(&a->coalescing)) {
+        atomic_fetch_sub(&a->in_flight, 1);
+        errno = EBUSY;
+        return -1;
+    }
+#else
+    (void)a;
+#endif
+    return 0;
+}
+
+static inline void alsg_leave_op(segregated_bstack_allocator_t *a)
+{
+#ifdef BSTACK_FEATURE_ATOMIC
+    atomic_fetch_sub(&a->in_flight, 1);
+#else
+    (void)a;
+#endif
+}
+
 static bstack_t *alsg_vt_stack(bstack_allocator_t *base)
 {
     return ((segregated_bstack_allocator_t *)base)->bs;
 }
 
-static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
-                         bstack_slice_t *out)
+static int alsg_alloc_impl(bstack_allocator_t *base, uint64_t len,
+                           bstack_slice_t *out)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     uint64_t blk, sz;
@@ -10153,7 +10706,7 @@ success:
     out->allocator = base; return 0;
 }
 
-static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+static int alsg_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t *bs = a->bs;
@@ -10206,8 +10759,8 @@ static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
     return alsg_push(bs, block_start, size, class) == 0 ? 0 : -2;
 }
 
-static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
-                           uint64_t new_len, bstack_slice_t *out)
+static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
+                             uint64_t new_len, bstack_slice_t *out)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t      *bs = a->bs;
@@ -10220,7 +10773,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 
     /* Empty handle: realloc is a fresh alloc. */
     if (s.len == 0 && s.offset == 0) {
-        if (alsg_vt_alloc(base, new_len, out)) {
+        if (alsg_alloc_impl(base, new_len, out)) {
             out->allocator = base; out->offset = 0; out->len = 0;
             return -1;
         }
@@ -10228,7 +10781,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
     }
     /* new_len == 0: dealloc consumes s; propagate its survivor signal. */
     if (new_len == 0) {
-        int dr = alsg_vt_dealloc(base, s);
+        int dr = alsg_dealloc_impl(base, s);
         if (dr) {
             if (dr == -1) { out->allocator = base; out->offset = start; out->len = old_len; }
             return dr;
@@ -10351,15 +10904,30 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #endif
         if (grew) {
             uint64_t slack = (old_size - ALSG_OVERHEAD) - old_len;
-            if (slack > 0) {
+            int saved;
 #if UINT64_MAX > SIZE_MAX
-                if (slack > (uint64_t)SIZE_MAX) goto fail_invalid;
+            if (slack > (uint64_t)SIZE_MAX) goto fail_invalid;
 #endif
-                if (bstack_zero(bs, start + old_len, (size_t)slack)) goto fail_recover;
+            if (slack == 0 || bstack_zero(bs, start + old_len, (size_t)slack) == 0) {
+                write_le64(buf, ALSG_IN_USE_BIT | (new_size >> 4));
+                if (bstack_set(bs, block_start, buf, 8) == 0) {
+                    result.offset = start; result.len = new_len; goto success;
+                }
             }
-            write_le64(buf, ALSG_IN_USE_BIT | (new_size >> 4));
-            if (bstack_set(bs, block_start, buf, 8)) goto fail_recover;
-            result.offset = start; result.len = new_len; goto success;
+            /* Best-effort: drop the unrecorded extension, else it is a
+             * mid-arena zero gap once the next alloc extends past it. */
+            saved = errno;
+#ifdef BSTACK_FEATURE_ATOMIC
+            {
+                int ok;
+                (void)bstack_try_discard(bs, old_end + delta, (size_t)delta, &ok);
+            }
+#else
+            int ignore = bstack_discard(bs, (size_t)delta);
+            (void)ignore;
+#endif
+            errno = saved;
+            goto fail_recover;
         }
         /* Not at tail: fall through to the move. */
     }
@@ -10394,7 +10962,7 @@ static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
         recovered.allocator = base; recovered.offset = nb + ALSG_OVERHEAD;
         recovered.len = new_len;
         old_s.allocator = base; old_s.offset = start; old_s.len = old_len;
-        if (alsg_vt_dealloc(base, old_s)) goto fail_recover;
+        if (alsg_dealloc_impl(base, old_s)) goto fail_recover;
         result.offset = nb + ALSG_OVERHEAD; result.len = new_len; goto success;
 #endif
     }
@@ -10408,6 +10976,43 @@ fail_invalid:
 fail_recover:
     *out = recovered;
     return -1;
+}
+
+/* Public entries: each takes one alsg_enter_op/alsg_leave_op pair; internal
+ * paths call the _impl bodies directly (a nested enter could fail mid-op). */
+
+static int alsg_vt_alloc(bstack_allocator_t *base, uint64_t len,
+                         bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_alloc_impl(base, len, out);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_dealloc(bstack_allocator_t *base, bstack_slice_t s)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) return -1;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_dealloc_impl(base, s);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_realloc(bstack_allocator_t *base, bstack_slice_t s,
+                           uint64_t new_len, bstack_slice_t *out)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slice(base, s) != 0) { *out = s; return -1; }
+    if (alsg_enter_op(a)) { *out = s; return -1; }
+    r = alsg_realloc_impl(base, s, new_len, out);
+    alsg_leave_op(a);
+    return r;
 }
 
 #ifndef BSTACK_FEATURE_ATOMIC
@@ -10551,13 +11156,13 @@ static int alsg_popall_gen(bstack_gen_op_t *op, void *uc)
             uint64_t word = read_le64(c->node_buf);
             uint64_t size = word << 4;
             uint64_t next;
-            /* A block on class cls's list must be free and belong on it —
-             * matching how recover() places blocks, so a non-class size relinked
-             * onto a smaller class is reused here just as alsg_pop_class reuses
-             * it.  The size >= QUANTUM guard precedes alsg_classify (which
-             * underflows on 0). */
-            if ((word & ALSG_IN_USE_BIT) || size < ALSG_QUANTUM
-                || alsg_classify(alsg_largest_class_le(size)) != (uint64_t)c->cls) {
+            /* A block on class cls's list must be free and exactly class cls's
+             * size: the claim records the class size, so a larger block would
+             * leave an untracked gap.  The bounds guards precede
+             * alsg_largest_class_le / alsg_classify. */
+            if ((word & ALSG_IN_USE_BIT) || size < ALSG_QUANTUM || size > ALSG_MAX_CLASS
+                || alsg_largest_class_le(size) != size
+                || alsg_classify(size) != (uint64_t)c->cls) {
                 c->err = EINVAL;
                 return 0;
             }
@@ -10908,8 +11513,8 @@ static uint8_t *alsg_reuse_buf(struct alsg_reuse *tab, size_t *ntab, uint64_t si
  * by recover().  On failure the fresh tail is discarded and the detached blocks
  * re-pushed, both best-effort, and out_slices is left unmodified.
  */
-static int alsg_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
-                              size_t n, bstack_slice_t *out_slices)
+static int alsg_alloc_bulk_impl(bstack_allocator_t *base, const uint64_t *lens,
+                                size_t n, bstack_slice_t *out_slices)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t             *bs = a->bs;
@@ -11145,8 +11750,8 @@ done:
  * class left unspliced (or a crash after staging) leaves its blocks free-tagged
  * and reclaimed by recover().
  */
-static int alsg_vt_dealloc_bulk(bstack_allocator_t *base,
-                                const bstack_slice_t *slices, size_t n)
+static int alsg_dealloc_bulk_impl(bstack_allocator_t *base,
+                                  const bstack_slice_t *slices, size_t n)
 {
     segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
     bstack_t          *bs = a->bs;
@@ -11243,6 +11848,30 @@ done:
     return ret;
 }
 
+static int alsg_vt_alloc_bulk(bstack_allocator_t *base, const uint64_t *lens,
+                              size_t n, bstack_slice_t *out_slices)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (n == 0) return alsg_alloc_bulk_impl(base, lens, n, out_slices);
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_alloc_bulk_impl(base, lens, n, out_slices);
+    alsg_leave_op(a);
+    return r;
+}
+
+static int alsg_vt_dealloc_bulk(bstack_allocator_t *base,
+                                const bstack_slice_t *slices, size_t n)
+{
+    segregated_bstack_allocator_t *a = (segregated_bstack_allocator_t *)base;
+    int r;
+    if (check_own_slices(base, slices, n) != 0) return -1;
+    if (alsg_enter_op(a)) return -1;
+    r = alsg_dealloc_bulk_impl(base, slices, n);
+    alsg_leave_op(a);
+    return r;
+}
+
 static const bstack_bulk_allocator_vtbl_t alsg_bulk_vtbl = {
     { alsg_vt_stack, alsg_vt_alloc, alsg_vt_realloc, alsg_vt_dealloc },
     alsg_vt_alloc_bulk,
@@ -11262,6 +11891,8 @@ segregated_bstack_allocator_t *segregated_bstack_allocator_new(bstack_t *bs)
     a = malloc(sizeof *a);
     if (!a) { errno = ENOMEM; return NULL; }
 #ifdef BSTACK_FEATURE_ATOMIC
+    atomic_init(&a->coalescing, 0);
+    atomic_init(&a->in_flight, 0);
     a->base.vtbl      = &alsg_bulk_vtbl.base;
     a->base.bulk_vtbl = &alsg_bulk_vtbl;
 #else

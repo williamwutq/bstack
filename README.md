@@ -2,7 +2,7 @@
 
 A persistent, fsync-durable binary stack backed by a single file.
 
-Every write — `push`, `pop`, and the optional `set`/`atomic` operations —
+Every write — `push`, `pop`, and the optional `set` and the `atomic` operations —
 performs a *durable sync* before returning, so data survives a process crash
 or unclean shutdown.  On **macOS**, `fcntl(F_FULLFSYNC)` is used instead of
 `fdatasync` to flush the drive's hardware write cache, which plain
@@ -21,7 +21,8 @@ On **Unix**, `open` acquires an **exclusive advisory `flock`**; on
 **Windows**, `LockFileEx` is used instead.  Both prevent two processes from
 concurrently corrupting the same stack file.
 
-The optional `atomic` feature adds compound read-modify-write and
+The `atomic` feature — **enabled by default** (opt out with `default-features =
+false`) — adds compound read-modify-write and
 compare-and-swap operations, including a generator-driven `get_batched_gen` for
 multi-step reads, `process_gen` for multi-step read and writes, and `set_batched`
 / `inplace_gen` for committing several in-place writes as one crash-atomic unit.
@@ -621,7 +622,7 @@ A fixed 32-byte header precedes the payload:
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x04\x06\x00` (0.4.6).  `open` accepts any
+  This version writes `BSTK\x00\x04\x07\x00` (0.4.7).  `open` accepts any
   0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
   minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
   `BStack::migrate`.
@@ -668,8 +669,8 @@ before it is read/compare/callback work under the lock.
 
 | Operation                              | Sequence                                                                                  |
 |----------------------------------------|-------------------------------------------------------------------------------------------|
-| `push`                                 | `lseek(END)` → `write(data)` → `lseek(8)` → `write(clen)` → sync                          |
-| `extend`                               | `lseek(END)` → `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                     |
+| `push`                                 | `pwrite(data)` at `32 + clen` → `lseek(8)` → `write(clen)` → sync                          |
+| `extend`                               | `set_len(new_end)` → `lseek(8)` → `write(clen)` → sync                                    |
 | `extend_sparse`, `extend_sparse_batched` | `set_len(new_end)` → `write` each buffer into the grown region (gaps left zero) → `lseek(8)` → `write(clen)` → sync |
 | `pop`, `pop_into`                      | `lseek` → `read` → `ftruncate` → `lseek(8)` → `write(clen)` → sync                        |
 | `discard`                              | `ftruncate` → `lseek(8)` → `write(clen)` → sync                                           |
@@ -795,8 +796,8 @@ maps to `io::ErrorKind::WouldBlock` in Rust).  The lock is released when the
 
 `BStack` wraps the file in a `RwLock`. The committed payload length is also
 cached in memory and kept in sync with the on-disk header by every
-write-lock-held operation, so `len`/`is_empty` can be answered under the read
-lock without any `File::metadata` syscall.
+write-lock-held operation, so `len`/`is_empty` and the bounds checks of every
+read and in-place write use it without a `File::metadata` or `lseek` syscall.
 
 | Operation                                                       | Lock (Unix / Windows) | Lock (other) |
 |-----------------------------------------------------------------|-----------------------|--------------|
@@ -1289,6 +1290,10 @@ free block; grows are `Unsupported`, as a headerless exact-size block has no
 neighbour tag to grow into without moving).  Without `atomic`: `Send` only.
 With `atomic`: `Send + Sync` via an internal `Mutex`.
 
+A tree mutation that fails partway poisons the allocator. Every later non-empty
+mutating call then fails with `InvalidData` (C: `EINVAL`) and hands back its
+handle, until a reopen rebuilds the tree.
+
 `stats` counts maximal contiguous live spans: a live allocation carries no
 header, leaving adjacent ones to read as a single span.
 
@@ -1311,7 +1316,9 @@ Constructor takes `data_size` (usable bytes per block; physical = `data_size + 8
 `open` runs `recover()` automatically.  Without `atomic`: `Send` only.  With
 `atomic`: `Send + Sync` (same lock-free strategy as `SlabBStackAllocator`), and
 additionally implements `BStackBulkAllocator` (`alloc_bulk`/`dealloc_bulk`;
-freed batches leave only `recover`-reclaimable leaks on a crash).
+freed batches leave only `recover`-reclaimable leaks on a crash). With
+`atomic`, `recover()` is exclusive: mutators called while it runs fail with
+`ResourceBusy` (C: `EBUSY`) and may be retried.
 
 `stats` (`atomic`) counts live allocations, each spanning one or more blocks;
 leaked blocks count as free until `recover()`.
@@ -1362,7 +1369,7 @@ A general typed vector over arbitrary `Copy` types requires a sound POD/byte-cas
 
 ```toml
 [dependencies]
-bstack = { version = "0.4", features = ["alloc", "set"] }
+bstack = { version = "0.5", features = ["alloc", "set"] }
 ```
 
 ### Memory layout

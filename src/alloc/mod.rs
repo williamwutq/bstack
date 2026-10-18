@@ -100,7 +100,7 @@
 //! Every allocator above is `UnwindSafe` and `RefUnwindSafe` in all configurations.
 //! Without `atomic` the latter is an explicit impl: the `PhantomData<Cell<()>>`
 //! marker that removes `Sync` would otherwise take `RefUnwindSafe` with it, and
-//! the only interior mutability is the [`BStack`](crate::BStack)'s own poisoning
+//! the only interior mutability is the [`BStack`]'s own poisoning
 //! lock.
 //!
 //! # Uninitialised allocation

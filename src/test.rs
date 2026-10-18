@@ -508,7 +508,7 @@ mod tests {
         // Directly append 5 "phantom" bytes to the file (clen still says 9).
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
             f.write_all(b"ghost").unwrap();
             // Do NOT update the header — simulating a crash after write but
             // before the header update + fsync.
@@ -764,7 +764,7 @@ mod tests {
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
 
-        // n exceeds MOVE_CHUNK (64 KiB), so the on-disk copy streams over several
+        // n exceeds MOVE_CHUNK (4 KiB), so the on-disk copy streams over several
         // buffer-sized iterations rather than buffering the whole region.
         let n = 200 * 1024usize;
         let mut payload = vec![0u8; 2 * n];
@@ -835,6 +835,18 @@ mod tests {
         assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), expect);
+    }
+
+    // A pattern longer than MOVE_CHUNK bypasses the chunk buffer.
+    #[cfg(feature = "set")]
+    #[test]
+    fn repeat_pattern_larger_than_move_chunk() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        let pat: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        s.push(vec![b'.'; 3 * pat.len()]).unwrap();
+        s.repeat(0, &pat, 3).unwrap();
+        assert_eq!(s.peek(0).unwrap(), pat.repeat(3));
     }
 
     #[cfg(feature = "set")]
@@ -1419,6 +1431,68 @@ mod tests {
 
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"hi\x00\x00");
+    }
+
+    // A grow whose resulting raw file size (header + payload) would overflow
+    // `u64` must be rejected cleanly, not wrap `set_len` and truncate the file —
+    // header and all — into an unopenable, data-destroying state.
+    #[test]
+    fn extend_overflow_rejected_preserves_data() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+
+        s.push(b"keepme").unwrap();
+        let err = s.extend(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        // The file and header are untouched: data still readable, reopen works.
+        assert_eq!(s.len().unwrap(), 6);
+        assert_eq!(s.peek(0).unwrap(), b"keepme");
+        drop(s);
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(s2.peek(0).unwrap(), b"keepme");
+    }
+
+    #[test]
+    fn resize_grow_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        let err = s.resize(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
+    #[test]
+    fn ensure_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        let err = s.ensure(u64::MAX).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
+    #[test]
+    fn extend_sparse_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        // `payload + length` fits in u64, but `HEADER_SIZE + new_len` would not.
+        let err = s.extend_sparse(b"", u64::MAX - 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
+    }
+
+    #[test]
+    #[cfg(feature = "atomic")]
+    fn try_extend_zeros_overflow_rejected() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"data").unwrap();
+        // `data_size + n` fits in u64, but `HEADER_SIZE + new_len` would not.
+        let err = s.try_extend_zeros(4, u64::MAX - 10).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(s.peek(0).unwrap(), b"data");
     }
 
     // ---- extend_sparse ------------------------------------------------------
@@ -3031,6 +3105,49 @@ mod alloc_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
+    // A near-`u64::MAX` start must not wrap `start + len` small enough to pass the
+    // length check and land an out-of-slice write in another allocation's bytes.
+    #[cfg(feature = "set")]
+    #[test]
+    fn write_range_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        let err = s.write_range(u64::MAX, b"abc").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn zero_range_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(5).unwrap();
+        let err = s.zero_range(u64::MAX, 4).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_range_into_offset_overflow_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        let mut buf = [0u8; 3];
+        let err = s.read_range_into(u64::MAX, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn read_range_start_after_end_rejected() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(5).unwrap();
+        // `start > end` with `end <= len`: must be rejected before the absolute
+        // offsets are computed, not silently wrapped.
+        let err = s.read_range(3, 1).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
     // 20. subslice creates correct sub-slice
     #[test]
     fn subslice_correct() {
@@ -3343,6 +3460,108 @@ mod alloc_tests {
         assert_eq!(view.position(|b| b > 2).unwrap(), Some(2));
         assert_eq!(view.rposition(|b| b > 2).unwrap(), Some(4));
         assert_eq!(view.position(|b| b > 10).unwrap(), None);
+    }
+
+    // Spans several 512-byte scan windows, at a non-zero stack offset.
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_search_across_windows() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _pad = alloc.alloc(3).unwrap();
+        let mut s = alloc.alloc(1500).unwrap();
+        let view = s.as_slice();
+        assert_eq!(view.find(7).unwrap(), None);
+        assert_eq!(view.rfind(7).unwrap(), None);
+        assert!(!view.contains(7).unwrap());
+        for hits in [
+            vec![0u64],
+            vec![511],
+            vec![512],
+            vec![1023, 1024],
+            vec![1499],
+            vec![0, 1499],
+            vec![5, 700, 1200],
+        ] {
+            let mut bytes = vec![0u8; 1500];
+            for &h in &hits {
+                bytes[h as usize] = 7;
+            }
+            s.write(&bytes).unwrap();
+            let view = s.as_slice();
+            let (first, last) = (hits[0], *hits.last().unwrap());
+            assert!(view.contains(7).unwrap());
+            assert_eq!(view.find(7).unwrap(), Some(first), "{hits:?}");
+            assert_eq!(view.rfind(7).unwrap(), Some(last), "{hits:?}");
+            assert_eq!(view.position(|b| b == 7).unwrap(), Some(first));
+            assert_eq!(view.rposition(|b| b == 7).unwrap(), Some(last));
+            // A sub-view not aligned to the window grid.
+            let sub = view.subslice(first + 1, 1500);
+            let expect = hits.get(1).map(|&h| h - first - 1);
+            assert_eq!(sub.find(7).unwrap(), expect, "{hits:?}");
+        }
+        let empty = s.as_slice().subslice(10, 10);
+        assert_eq!(empty.find(0).unwrap(), None);
+        assert_eq!(empty.rfind(0).unwrap(), None);
+    }
+
+    #[cfg(feature = "set")]
+    #[test]
+    fn slice_reader_read_to_end_and_string() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let _pad = alloc.alloc(3).unwrap();
+        let mut s = alloc.alloc(5).unwrap();
+        s.write(b"hello").unwrap();
+        let mut r = s.as_slice().reader_at(1);
+        let mut out = b"x".to_vec();
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 4);
+        assert_eq!(out, b"xello");
+        assert_eq!(r.position(), 5);
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 0);
+        r.seek(SeekFrom::Start(9)).unwrap();
+        assert_eq!(r.read_to_end(&mut out).unwrap(), 0);
+        assert_eq!(r.position(), 9);
+
+        let mut text = String::from(">");
+        let mut r = s.as_slice().reader();
+        assert_eq!(r.read_to_string(&mut text).unwrap(), 5);
+        assert_eq!(text, ">hello");
+
+        s.write([0xffu8, b'a', b'b', b'c', b'd']).unwrap();
+        let mut text = String::from(">");
+        let err = s.as_slice().reader().read_to_string(&mut text).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(text, ">");
+    }
+
+    // The no-op early-outs leave the bytes untouched.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn slice_noop_mutations() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut s = alloc.alloc(4).unwrap();
+        s.write([1u8, 2, 3, 4]).unwrap();
+        let mut view = s.as_slice();
+        let same = view.clone();
+        view.copy_from_bstack_slice(&same).unwrap();
+        view.copy_within(1..3, 1).unwrap();
+        view.rotate_left(0).unwrap();
+        view.rotate_left(4).unwrap();
+        view.rotate_right(0).unwrap();
+        view.rotate_right(4).unwrap();
+        view.subslice(2, 3).reverse().unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 3, 4]);
+
+        let (mut chunks, _) = s.as_slice().chunks(2);
+        chunks.rotate_left(0).unwrap();
+        chunks.rotate_right(2).unwrap();
+        let (mut one, _) = s.as_slice().chunks(4);
+        one.reverse().unwrap();
+        one.sort_by(|a, b| b.cmp(a)).unwrap();
+        one.select_nth_by(0, |a, b| b.cmp(a)).unwrap();
+        assert_eq!(s.read().unwrap(), [1, 2, 3, 4]);
     }
 
     #[test]
@@ -4848,6 +5067,19 @@ mod alloc_tests {
             .collect()
     }
 
+    // 22b. A stride too large for the engines' in-memory scratch is rejected
+    //      before any I/O rather than truncated to `usize`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_sort_partial_by_rejects_stride_too_large_for_usize() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let s = alloc.alloc(8).unwrap();
+        let (mut view, _rem) = s.as_slice().chunks((usize::MAX / 4) as u64 + 1);
+        let err = view.sort_partial_by(|a, b| a.cmp(b)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::OutOfMemory);
+    }
+
     // 23. A region that fits the budget is fully sorted in one process pass.
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
@@ -5135,6 +5367,106 @@ mod alloc_tests {
         .unwrap();
         let got = read_keys(&s.as_slice().read().unwrap(), 8192, 5);
         assert_selected(&got, 2, &sorted);
+    }
+
+    // 35. Small records give multi-record partition windows (1536 two-byte
+    //     records each); sizes straddle one and two windows. Distinct, few-valued,
+    //     and all-equal keys each select correctly.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_windowed_duplicates() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u16
+        };
+        for &sz in &[3071usize, 3072, 3073, 4000, 9000] {
+            for modulus in [u16::MAX, 3, 1] {
+                let keys: Vec<u16> = (0..sz).map(|_| next() % modulus).collect();
+                let mut sorted = keys.clone();
+                sorted.sort_unstable();
+                for &n in &[0, sz / 3, sz - 1] {
+                    let mut s = alloc.alloc((sz * 2) as u64).unwrap();
+                    s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+                    let (mut view, _rem) = s.as_slice().chunks(2);
+                    view.select_nth_partial_by_key(n as u64, |c| u16::from_le_bytes([c[0], c[1]]))
+                        .unwrap();
+                    let got = read_keys(&s.as_slice().read().unwrap(), 2, sz);
+                    assert_selected(&got, n, &sorted);
+                    alloc.dealloc(s).unwrap();
+                }
+            }
+        }
+    }
+
+    // 35b. An I/O error at any partition round or at the final `process` leaves
+    //      a permutation of the input, and re-running completes the selection.
+    #[cfg(all(
+        feature = "set",
+        feature = "atomic",
+        debug_assertions,
+        feature = "fault-injection"
+    ))]
+    #[test]
+    fn chunk_select_nth_partial_by_fault_leaves_permutation_and_converges() {
+        use crate::alloc_fuzz::common::policies::FailOpAt;
+        use std::sync::Arc;
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..9000u32)
+            .map(|i| (i.wrapping_mul(2654435761) % 7) as u16)
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        let key = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
+        let mut faulted = 0;
+        for op in ["inplace_gen", "process"] {
+            for at in 0..40 {
+                let mut s = alloc.alloc(18_000).unwrap();
+                s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+                let (mut view, _rem) = s.as_slice().chunks(2);
+                let policy: Arc<dyn crate::FaultPolicy> =
+                    Arc::new(FailOpAt::new(op, at, std::io::ErrorKind::Other));
+                alloc.stack().set_fault_policy(Some(policy));
+                let res = view.select_nth_partial_by_key(4500, key);
+                alloc.stack().set_fault_policy(None);
+                if res.is_err() {
+                    faulted += 1;
+                    let mut got = read_keys(&s.as_slice().read().unwrap(), 2, 9000);
+                    got.sort_unstable();
+                    assert_eq!(got, sorted, "{op}#{at}: not a permutation");
+                    view.select_nth_partial_by_key(4500, key).unwrap();
+                }
+                let got = read_keys(&s.as_slice().read().unwrap(), 2, 9000);
+                assert_selected(&got, 4500, &sorted);
+                alloc.dealloc(s).unwrap();
+            }
+        }
+        assert!(faulted > 1, "the schedule must fault several steps");
+    }
+
+    // 36. A comparator that is not a total order cannot shrink the band; the
+    //     selection must still terminate and leave a permutation of the input.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn chunk_select_nth_partial_by_inconsistent_cmp_terminates() {
+        let (alloc, path) = mk_alloc();
+        let _g = Guard(path);
+        let keys: Vec<u16> = (0..5000u16).map(|i| i.wrapping_mul(7919)).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        for order in [std::cmp::Ordering::Less, std::cmp::Ordering::Greater] {
+            let mut s = alloc.alloc(10_000).unwrap();
+            s.as_slice_mut().write(keyed_records(&keys, 2)).unwrap();
+            let (mut view, _rem) = s.as_slice().chunks(2);
+            view.select_nth_partial_by(2500, |_, _| order).unwrap();
+            let mut got = read_keys(&s.as_slice().read().unwrap(), 2, 5000);
+            got.sort_unstable();
+            assert_eq!(got, sorted, "not a permutation under {order:?}");
+            alloc.dealloc(s).unwrap();
+        }
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]
@@ -6455,10 +6787,7 @@ mod first_fit_tests {
         // Append partial block bytes (less than BLOCK_OVERHEAD=24) directly to the file
         {
             use std::fs::OpenOptions;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
             f.write_all(&[0u8; 12]).unwrap(); // 12 < 24 = partial block
         }
 
@@ -6466,7 +6795,7 @@ mod first_fit_tests {
         {
             use std::fs::OpenOptions;
             use std::io::{Seek, SeekFrom};
-            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(16 + 24)).unwrap(); // file_header(16) + payload_offset(24)
             f.write_all(&1u32.to_le_bytes()).unwrap();
         }
@@ -10153,6 +10482,46 @@ mod atomic_tests {
         // [0,6)="abcabc", [6,10)="ZZZZ", [10,18) is the repeat resumed at phase
         // (0+10)%3=1 -> "bcabcabc", [18,20)="..".
         assert_eq!(s.peek(0).unwrap(), b"abcabcZZZZbcabcabc..");
+    }
+
+    // Sliced repeats resume at a nonzero phase, both through the chunk buffer
+    // (small pattern, multi-chunk) and directly (pattern > MOVE_CHUNK).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_repeat_sliced_across_chunks() {
+        use crate::BStackGenOp;
+        for pat in [
+            b"abc".to_vec(),
+            (0..5000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        ] {
+            let (s, p) = mk_stack();
+            let _g = Guard(p);
+            let count = 12_000 / pat.len() + 2;
+            let n = count * pat.len();
+            s.push(vec![b'.'; n]).unwrap();
+            let z = [b'Z'; 7];
+            let mut step = 0usize;
+            s.inplace_gen(|_res| {
+                let r = match step {
+                    0 => Some(BStackGenOp::Repeat {
+                        offset: 0,
+                        pattern: bstack_unsafe_reborrow!(&pat[..]),
+                        count: count as u64,
+                    }),
+                    1 => Some(BStackGenOp::Write {
+                        offset: 1,
+                        data: bstack_unsafe_reborrow!(&z[..]),
+                    }),
+                    _ => None,
+                };
+                step += 1;
+                r
+            })
+            .unwrap();
+            let mut expect = pat.repeat(count);
+            expect[1..8].copy_from_slice(&z);
+            assert_eq!(s.peek(0).unwrap(), expect);
+        }
     }
 
     // A later Repeat overrides the middle of an earlier Write.

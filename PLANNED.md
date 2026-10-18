@@ -100,6 +100,14 @@ Reasons:
 
 `RangeBounds::end_bound` must return `Bound<&u64>` — a reference into `self`. `BStackRange` stores `offset` and `len`, so the end (`offset + len`) is a computed temporary with no field to borrow, and only `start_bound` could be satisfied. Storing `end` instead of `len` would make both bounds borrowable but is invasive: it touches every `len`-reading method and the 16-byte on-disk `(offset, len)` layout. The need is already met by the existing `range()` accessor, which returns `Range<u64>` (itself `RangeBounds<u64>`) at zero cost.
 
+### Adding `coalescible()`, a query for pending coalesce work on `SegregatedBStackAllocator`
+
+The proposal: a read-only `coalescible()` that walks the arena and returns the number of merges `coalesce` would perform (free-to-free physical adjacencies), so callers can skip `coalesce` when it is zero.
+
+Reasons:
+
+Free-block adjacency is only observable by striding the arena, so `coalescible()` must perform the same full linear scan as `coalesce`, and it saves nothing on the scan itself. The claimed saving, avoiding the journalled write, does not exist either. `coalesce` already writes nothing and returns `0` when it finds no run to merge. When runs do exist, the caller calls `coalesce` anyway and pays for the scan twice. The only real difference is that the query takes the read lock rather than `inplace_gen`'s write lock. That is not enough to justify a new public method. The count is also stale as soon as the lock is released, so it cannot decide anything that calling `coalesce` directly would not decide more cheaply. Folding the count into `recover` does not change this, since it only covers the moment after reopen and goes stale in the same way. A query that is actually cheap would need incrementally maintained adjacency state updated on every `alloc`/`dealloc`/`realloc`, which is a different and much more invasive design.
+
 ---
 
 ## Compact `Repeat` staging within a batched commit (0.5.0)
@@ -121,28 +129,70 @@ The compact form advances the on-disk format wherever it lives — a new encodin
 
 ---
 
-## Enabling the `atomic` feature by default (0.5.0)
+## A `BStack` write returns `Err` only before its commit point (0.5.0)
 
-**Feature flag:** N/A — this changes which features are enabled by default, not a new one.
-**Breaking change:** Yes (0.5.0) — a plain `bstack = "0.5"` dependency (anything without `default-features = false`) now compiles in the `atomic`-gated API surface: `atrunc`, `splice`/`splice_into`, `try_extend`/`try_extend_zeros`/`try_extend_sparse`/`try_extend_sparse_batched`, `try_discard`, and `get_batched_gen`. The larger set gated on `set` *and* `atomic` together — `cross_exchange`, `copy`, `process_gen`, `set_batched`/`inplace_gen`, `swap`/`swap_into`/`cas` — only newly compiles in for consumers who *also* already enable `set`, since `set` itself stays opt-in (see Design below). Consumers who already pin an explicit `features = [...]` list without `atomic` are unaffected; `default-features = false` still builds the bare push/pop/get/peek stack with none of it.
+**Feature flag:** None (core) + `atomic`.
+**Breaking change:** Yes (0.5.0). No API change, but the documented meaning of `Err` changes. The crate docs and README (*Deferred replay*), `bstack.h` ("Deferred replay"), and `algos/WIP.md` (*Deferred replay*) all say that a write failing after its first mutating I/O can leave an armed journal, which the next write replays. Replaying an armed journal rolls the write forward, so today an `Err` can follow the commit point and the write still takes effect.
 
 ### Motivation
 
-- **No on-disk format change.** The write-in-progress journal that `atomic`'s compound ops use — `wip_ptr`/`wip_aux` in the 32-byte header, the splice/exchange/multi-write/copy journal modes documented in `lib.rs`'s format table and implemented by `io_core.rs`'s `journaled_*` helpers — is already unconditional: every `bstack` file carries it regardless of which features are compiled in. Enabling `atomic` by default changes no format byte and persists no new state; it only exposes machinery that is already there.
-- **Does not compromise plain-stack use.** `atomic` only adds methods; it changes no existing `push`/`pop`/`get`/`peek` behavior. `alloc`, by contrast, adds real state — sub-allocator bookkeeping, handle types, `BStackSlice` provenance — which is why it stays opt-in even for a caller who only wants compound atomicity. `atomic` carries none of that cost.
-- **Already required by most of what ships.** `alloc`, `set`, and `atomic` are gated together across `guarded`'s hook-based slices, the external-merge-sort strategy above, `BStackInPlaceResizeAllocator`, and the public journal primitive planned for 0.5.0 that `bllist` depends on. 7 of the 12 examples already require `atomic`. A caller reaching for any of these already hand-adds the flag; defaulting it removes that step.
-- **Matches how the crate is already documented.** README's dependency snippets already list `atomic` in nearly every example (`features = ["atomic"]`, `features = ["set", "atomic"]`, …) — it's optional in name only.
+Callers assume an `Err` means the change was not written. bstack does not promise that: the error is returned wherever the function stops, which can be after the commit point `algos/WIP.md` documents.
+
+- `journaled_set` returns `Err` from the in-place write, the disarm, or the truncate, all after the synced arm. The deferred replay merged in #69, or the next `open`, then rolls the write forward.
+- `commit_shrink` returns `Err` from the header write after the truncation that commits the shrink, so `pop` can fail with the bytes already gone.
+- Allocators work around this. `GhostTreeBstackAllocator`'s atomic tail shrink must report a failed `Atrunc` as lost, because it cannot tell a fault before the commit from one after it.
+
+Only bstack knows where each commit point is. Fixing the contract there fixes it for every caller. The `replay_needed` flag from #69 already finishes a write after a failure, so a failure past the commit point no longer needs to surface as an `Err`.
 
 ### Design
 
-- Add `default = ["atomic"]` to `[features]` in `Cargo.toml`.
-- `set` and `alloc` stay opt-in — both add real new semantics (in-place byte-mutation history, sub-allocation) that a stack-only consumer may not want, unlike `atomic`.
-- `docs.rs` already builds with `all-features = true`, so its output is unaffected.
-- The 0.5.0 migration guide should note this briefly: it affects only consumers on default features who don't want `atomic` — an uncommon but real case (e.g. minimizing compiled surface, or auditing exactly which journal codepaths are reachable) — who now need `default-features = false` plus an explicit `features = [...]` list to keep it out.
+New contract, in Rust and C:
+
+- **`Err`:** the write did not commit. Recovery (the deferred replay or `open`) rolls it back.
+- **`Ok`:** the write committed. Steps after the commit point may still be pending; a failure among them sets `replay_needed`, and the next write, `recover`, or `open` completes them.
+
+Each commit helper in `io_core.rs` / `bstack.c` splits at its commit point. A failure before it keeps today's rollback and returns `Err`. A failure after it sets `replay_needed` and returns `Ok`. The commit points:
+
+| Strategy                                                 | Commit point                    |
+|----------------------------------------------------------|---------------------------------|
+| Aligned-block write                                      | the synced block write          |
+| Single-region journal (`Set`, `Repeat`, `Copy`, splice)  | the synced arm                  |
+| Multi-write journal                                      | the synced `MultiWrite` arm     |
+| Append or grow (`push`, `extend`, the sparse extends)    | the synced `clen` header write  |
+| Shrink (`pop`, `discard`, `try_discard`)                 | the truncation                  |
+
+Document the contract once, in the crate docs' *Durability* and *Deferred replay*, the README, `bstack.h`, and `algos/WIP.md`, and point each method's `# Errors` at it.
 
 ### Open questions
 
-- Whether to also drop the now-redundant `atomic` entry from example `required-features` lists that pair it with `set`/`alloc` — cosmetic only, since `required-features` checks additively against whatever is enabled regardless of default status, so leaving them as-is is also fine.
+- **When the commit write itself fails.** The commit point is a write followed by a sync, for example the arm in `journaled_set`. If that sync fails, the arm may or may not be on disk. The contract requires `Err`, since the call never passed its commit point. But if the arm did land, the next write, `recover`, or `open` sees an armed journal and replays it, so the write takes effect after an `Err`. To prevent that, the repair after this failure must discard the journal instead of replaying it, which `replay_needed` cannot express today. A crash before the next write performs the discard still leaves the armed journal for `open` to replay. Decide whether `Err` must mean "not written" only while the process keeps running, or also across a crash in that window.
+- **Reads after an `Ok`.** While `replay_needed` is set, reads such as `get` and `len` fail with `InterruptedWrite` (C: `BSTACK_EREPLAY`). Today that only follows a failed write. After this change, a failure past the commit point returns `Ok` and still sets the flag, so `set` can return `Ok` and the next `get` fail. Decide whether reads run the repair themselves, or keep failing with this documented.
+
+---
+
+## Allocators' `lost` reporting when a single `BStack` call fails (0.5.0)
+
+**Feature flag:** `alloc` + `set`.
+**Breaking change:** No.
+**Related:** *A `BStack` write returns `Err` only before its commit point* (above). This entry is needed whichever way that one is decided.
+
+### Motivation
+
+Allocators disagree on what a failed `BStack` call means for the caller's handle:
+
+- **Worst case assumed.** `GhostTreeBstackAllocator`'s atomic tail shrink reports any error after its `Atrunc` is issued as lost (`handle: None`, C: `-2`), even when the fault came before the commit.
+- **Not-committed assumed.** Every allocator's tail discard (`try_discard` / `discard` in `dealloc`, `dealloc_bulk`, and the realloc shrinks) returns the original handle on `Err`. Today `commit_shrink` can return `Err` after the truncation that commits the shrink, so that handle names bytes no longer in the stack.
+
+### Design
+
+- **If the commit-point entry lands:** an `Err` from a single call means it did not commit. The tail discards are already correct; return the original handle from the worst-case paths too, starting with the ghost-tree tail shrink.
+- **If it is dismissed:** an `Err` may follow the commit. Every allocator's tail discard must then report the handle lost on any error that can follow the truncation, the same worst-case rule the ghost-tree tail shrink uses.
+
+Either way, the audit covers every site in `src/alloc/*.rs` and `c/bstack_alloc.c` where a `BStack` error decides the handle outcome:
+
+- **Outcome:** `BStackAllocError::handle` (`Some` or `None`) and `BStackBulkAllocError::handles` in Rust, and the vtable `realloc`/`dealloc` return of `-1` (survived) or `-2` (lost) in C.
+- **Calls:** each tail-changing call (`discard`, `try_discard`, `atrunc`, and the `Discard`/`Atrunc` steps of `process_gen`) gets the `lost` value its commit point implies.
+- **Tests:** each site gets a `FailOpAt` fault test that pins the outcome.
 
 ---
 
@@ -468,87 +518,3 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 - **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
 - **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
 - **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
-
----
-
-## `coalescible()` — a cheap query for pending coalesce work on `SegregatedBStackAllocator`
-
-### Motivation
-
-`SegregatedBStackAllocator::coalesce` always strides the entire arena, so its cost is linear in the number of live blocks and reaches roughly 13 ms at 20,000 blocks on real filesystem I/O. In realistic interleaved workloads, however, freed blocks rarely come to rest physically adjacent to another free block, so the scan finds nothing to merge on the overwhelming majority of calls. There is currently no way to determine whether a scan would find any mergeable run without performing that scan in full. Because the answer depends on the physical adjacency of free blocks, which only the allocator can observe, it should be surfaced by the allocator rather than approximated by caller-side scheduling policy.
-
-### Design
-
-The value to expose is the number of merges `coalesce` would perform, which equals the count of free-to-free physical adjacencies, `(free blocks) − (free runs)`. A caller skips `coalesce` whenever it is zero.
-
-The default reported quantity is an adjacency **count**, because it is the minimal surface with a clean, testable invariant: `coalescible()` must equal what `coalesce()` would return if it ran without writing. A coalescible-*bytes* figure is recoverable in the same walk at no extra cost (see open questions) and can be offered alongside it.
-
-A dedicated method walks the arena once, reusing the `stats_scan`/`recover` walk and tracks only whether the previous physical block was free:
-
-```rust
-#[cfg(feature = "atomic")]
-pub fn coalescible(&self) -> io::Result<u64> {
-    let stack_len = self.stack.len()?; // retry on InvalidInput as stats() does
-    if stack_len <= Self::ARENA_START {
-        return Ok(0);
-    }
-    let scan_end =
-        Self::ARENA_START + ((stack_len - Self::ARENA_START) & !(Self::QUANTUM - 1));
-    let mut adjacencies = 0u64;
-    let mut prev_free = false;
-    let mut p = Self::ARENA_START;
-    let mut word_buf = [0u8; 8];
-    let mut pending = false;
-    self.stack.get_batched_gen(|| {
-        if pending {
-            pending = false;
-            let word = u64::from_le_bytes(word_buf);
-            let size = (word & !Self::IN_USE_BIT) << 4;
-            if word == 0 || size < Self::QUANTUM || size > scan_end - p {
-                p = scan_end; // zeroed tail or malformed: stop the scan here
-                return None;
-            }
-            let is_free = word & Self::IN_USE_BIT == 0;
-            if is_free && prev_free {
-                adjacencies += 1; // one more merge within this run
-            }
-            prev_free = is_free;
-            p += size;
-        }
-        if p >= scan_end {
-            return None;
-        }
-        pending = true;
-        Some((p, bstack_unsafe_reborrow_mut!(&mut word_buf[..])))
-    })?;
-    Ok(adjacencies)
-}
-```
-
-`adjacencies` counts each free block that immediately follows a free block, so it sums `(run_len − 1)` over every maximal free run, which is the merge count. The walk is linear in live blocks, which is the same cost profile as the `recover` scan that `new` already runs on every non-empty reopen and as the scan `coalesce` itself performs, so the query stays consistent with the allocator's existing costs rather than introducing a new one. It is a standalone query rather than a `BStackAllocStats` field, because a field would tie the value to the snapshot scan and defeat the purpose.
-
-The value is still meaningfully cheaper than `coalesce` in the common case it targets, because it reads the arena but never writes and so avoids the journalled `inplace_gen` commit. A caller that scans, finds `0`, and skips the merge pays one read pass instead of a read pass plus a durable write.
-
-Because the `recover` walk already strides every overhead word in exactly this order, the same `is_free && prev_free` accumulation can be folded into it, so that `recover` returns the coalescible count alongside its repair result rather than requiring a second scan. A caller that has just reopened the arena — where `new` runs `recover` before the handle escapes — then already holds the count without calling `coalescible()` at all. The standalone `coalescible()` above and this `recover`-side accumulation share the per-block body; whether to factor that body into one visitor both call, or to inline it in each, is left to implementation.
-
-### Open questions
-
-- **Naming.** Whether to name the method `coalescible`, reporting the adjacency (merge) count. The count alone is the minimal, invariant-checkable surface, since `coalescible()` must equal what `coalesce()` returns without writing.
-- **Whether to also expose a byte figure.** Whether to additionally return a coalescible-*bytes* value. Bytes are recoverable in the same walk at no extra cost and let a caller weigh reclamation value rather than just its existence, at the cost of a second returned quantity.
-
----
-
-## Derive logical size from the cached committed length, not the file end
-
-**Feature flag:** None (internal change; no API or on-disk format change).
-**Breaking change:** No.
-
-### Motivation
-
-The committed length `clen` already holds the authoritative logical payload size at every operation boundary — `len`/`is_empty` answer from it with no syscall. Yet the read and in-place-mutation hot paths still ask the operating system for that same size on every call, so each read and each in-place write pays a redundant size syscall to learn what the stack already knows.
-
-### Design
-
-Reads — `peek`, `get`, `peek_into`, `get_into`, and the `get_batched`/`get_batched_into`/`get_batched_gen` family — bound-check against `guard.1` instead of `File::metadata().len()` (and, on the non-Unix/Windows fallback, instead of `lseek(SEEK_END)`). The in-place mutators — `set`, `zero`, `repeat`, `swap`/`swap_into`, `cas`, `copy`, `cross_exchange`, `process`, `process_gen`, the `*_crds` family (`eq_crds`/`ne_crds`/`masked_eq_crds`/`masked_ne_crds`), and `set_batched`/`inplace_gen` — bound-check against `guard.1` instead of `lseek(SEEK_END)`. `clen` is authoritative wherever these paths run: `read_lock`/`write_lock_read` already return `InterruptedWrite` while a replay is pending, so a read only proceeds once `clen` equals the physical payload size, and `write_lock` runs `replay_pending` — which reconciles and adopts `clen` — before a mutator's body, so a mutator reads `guard.1` after that point. The journals' staging and append offsets move to `clen` for the same reason: the WIP and multi-write journals stage scratch *past* `clen`, so a bounds check on `clen` while a staging point still used `seek(END)` could diverge mid-op — they agree today only because replay reconciles them at entry, and converting both removes that latent divergence. Only these steady-state read and mutator paths change; the recovery, replay, `open`, and `migrate` paths (`replay_pending`, `recover_file`, and the two entry points) must keep reading the physical file length.
-
-Because the change moves where size and journal offsets come from, it needs fuzzing, including crash and replay schedules, and a safety review of every converted call site before it lands. The expected payoff is the read-path `fstat` drop, since reads never journal; the in-place-write `lseek` drop is minor next to the journal's per-op `durable_sync` barriers. A mutator that derives its size from `clen` rather than the file end also cannot be misled by a stale tail past `clen` — the hazard `write_lock`'s contract currently calls out.

@@ -24,7 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 /// Bytes occupied by the file header
-/// (magic[8] + committed_len[8] + wip_ptr[8] + wip_aux[8]).
+/// (`magic[8]` + `committed_len[8]` + `wip_ptr[8]` + `wip_aux[8]`).
 ///
 /// `wip_ptr`/`wip_aux` hold the write-in-progress journal that makes in-place
 /// mutations crash-atomic (see *Crash recovery* in the crate docs); both are
@@ -53,6 +53,13 @@ pub(crate) const ATOMIC_BLOCK: u64 = 256;
 /// of any length uses O(1) memory. Sized to one typical filesystem page. Not
 /// feature-gated: recovery's repeat-fill replay ([`write_repeated`]) uses it.
 const MOVE_CHUNK: u64 = 4 * 1024;
+
+thread_local! {
+    /// Per-thread [`MOVE_CHUNK`] scratch for streaming moves and fills, reused to
+    /// avoid a heap allocation per call.
+    static CHUNK_BUF: std::cell::RefCell<[u8; MOVE_CHUNK as usize]> =
+        const { std::cell::RefCell::new([0; MOVE_CHUNK as usize]) };
+}
 
 /// Block-kind tag prefixing each staged [`WipAux::MultiAtrunc`] block: a literal
 /// span of `e - s` bytes.
@@ -89,7 +96,7 @@ pub(crate) fn pread_exact(file: &File, offset: u64, len: usize) -> io::Result<Ve
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io_error!(UnexpectedEof, "pread_exact: unexpected EOF"));
+            return Err(io_error!(UnexpectedEof, "failed to fill whole buffer"));
         }
         filled += n;
     }
@@ -112,11 +119,43 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
     while filled < len {
         let n = file.seek_read(&mut buf[filled..], offset + filled as u64)?;
         if n == 0 {
-            return Err(io_error!(UnexpectedEof, "pread_exact_into: unexpected EOF"));
+            return Err(io_error!(UnexpectedEof, "failed to fill whole buffer"));
         }
         filled += n;
     }
     Ok(())
+}
+
+/// Write all of `data` at absolute file position `offset`, with one positional
+/// write where the platform has it instead of a seek plus a write. Unix uses
+/// `pwrite(2)` via `write_all_at`; Windows uses `WriteFile` with an
+/// `OVERLAPPED` offset via `seek_write`. The cursor is left unspecified.
+#[cfg(unix)]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.write_all_at(data, offset)
+}
+
+/// Windows counterpart of `pwrite_all`.
+#[cfg(windows)]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    let mut done = 0usize;
+    while done < data.len() {
+        match file.seek_write(&data[done..], offset + done as u64) {
+            // Same error `write_all` / `write_all_at` return.
+            Ok(0) => return Err(io_error!(WriteZero, "failed to write whole buffer")),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fallback `pwrite_all` for platforms without a positional write.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn pwrite_all(file: &mut File, offset: u64, data: &[u8]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(data)
 }
 
 /// Lock-free positional read using a raw file descriptor (Unix).
@@ -126,25 +165,13 @@ pub(crate) fn pread_exact_into(file: &File, offset: u64, buf: &mut [u8]) -> io::
 /// concurrent writer can touch those bytes.
 #[cfg(unix)]
 pub(crate) fn pread_exact_raw(fd: RawFd, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf[filled..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - filled,
-                (offset + filled as u64) as libc::off_t,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            return Err(io_error!(UnexpectedEof, "locked pread: unexpected EOF"));
-        }
-        filled += n as usize;
-    }
-    Ok(())
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow the fd as a `File` (never closed) to reuse std's `read_exact_at`,
+    // which uses `pread64` where `off_t` is 32-bit (e.g. 32-bit glibc).
+    // SAFETY: `fd` stays open for the call; `ManuallyDrop` prevents closing it.
+    let file = ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
+    file.read_exact_at(buf, offset)
 }
 
 /// Lock-free positional read using a raw Windows HANDLE.
@@ -167,7 +194,7 @@ pub(crate) fn pread_exact_raw_handle(handle: isize, offset: u64, buf: &mut [u8])
             ReadFile(
                 handle,
                 buf[filled..].as_mut_ptr(),
-                (len - filled) as u32,
+                (len - filled).min(u32::MAX as usize) as u32,
                 &mut bytes_read,
                 &mut overlapped,
             )
@@ -326,16 +353,17 @@ pub(crate) fn write_at(file: &mut File, offset: u64, data: &[u8]) -> io::Result<
 /// other writer — and, on the rwlock-guarded paths, no reader — can observe or
 /// touch the region between chunks. The chunking is purely an in-memory detail.
 pub(crate) fn move_chunked(file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
-    let cap = n.min(MOVE_CHUNK) as usize;
-    let mut buf = vec![0u8; cap];
-    let mut done = 0u64;
-    while done < n {
-        let take = ((n - done) as usize).min(cap);
-        read_at(file, src + done, &mut buf[..take])?;
-        write_at(file, dst + done, &buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let mut done = 0u64;
+        while done < n {
+            // `min` in u64 first: casting the remainder could truncate to 0 on 32-bit.
+            let take = (n - done).min(MOVE_CHUNK) as usize;
+            read_at(file, src + done, &mut buf[..take])?;
+            write_at(file, dst + done, &buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Overwrite the committed-length field at file offset 8 and update the
@@ -499,6 +527,8 @@ pub(crate) fn recover_wip(
     wip_aux: u64,
     raw_size: u64,
 ) -> io::Result<u64> {
+    // Clamp a corrupt on-disk length so `HEADER_SIZE + committed_len` cannot overflow.
+    let committed_len = committed_len.min(raw_size.saturating_sub(HEADER_SIZE));
     let tail_start = HEADER_SIZE + committed_len;
     let tail_len = raw_size.saturating_sub(tail_start);
     // Committed length after recovery; only a splice changes it.
@@ -525,6 +555,7 @@ pub(crate) fn recover_wip(
                 let s_len = tail_len - 8;
                 let total = k.saturating_mul(s_len);
                 if s_len > 0
+                    && k > 0
                     && wip_ptr >= HEADER_SIZE
                     && wip_ptr.saturating_add(total) <= tail_start
                     && let Ok(s_len_usize) = usize::try_from(s_len)
@@ -725,8 +756,8 @@ pub(crate) fn journaled_repeat(
 }
 
 /// Fill `[phys .. phys + k*s.len())` with `k` back-to-back copies of `s`, writing
-/// through a buffer of whole copies of `s` bounded by [`MOVE_CHUNK`] (so O(1)
-/// memory beyond `s` itself). `phys` is a physical file offset.
+/// through a per-thread buffer of whole copies of `s` bounded by [`MOVE_CHUNK`]
+/// (no allocation). `phys` is a physical file offset.
 ///
 /// Because the buffer is an exact number of copies of `s` and the total is
 /// `k*s.len()`, every chunk boundary lands on a copy boundary, so the pattern
@@ -739,22 +770,31 @@ pub(crate) fn write_repeated(file: &mut File, phys: u64, s: &[u8], k: u64) -> io
     }
     let total = k
         .checked_mul(unit)
-        .ok_or_else(|| io_error!(InvalidData, "write_repeated: length overflow"))?;
-    // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK
-    // (at least one), capped at `k`.
-    let copies = (MOVE_CHUNK / unit).max(1).min(k);
-    let mut buf = Vec::with_capacity((copies * unit) as usize);
-    for _ in 0..copies {
-        buf.extend_from_slice(s);
+        .ok_or_else(|| io_error!(InvalidData, "repeat fill length overflows u64"))?;
+    file.seek(SeekFrom::Start(phys))?;
+    if unit > MOVE_CHUNK {
+        // One copy already exceeds the buffer: write `s` itself.
+        for _ in 0..k {
+            file.write_all(s)?;
+        }
+        return Ok(());
     }
-    let mut done = 0u64;
-    while done < total {
-        let take = ((total - done) as usize).min(buf.len());
-        file.seek(SeekFrom::Start(phys + done))?;
-        file.write_all(&buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    // Pack as many whole copies of `s` into one buffer as fit under MOVE_CHUNK,
+    // capped at `k`.
+    let blen = ((MOVE_CHUNK / unit).min(k) * unit) as usize;
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let buf = &mut buf[..blen];
+        for c in buf.chunks_exact_mut(s.len()) {
+            c.copy_from_slice(s);
+        }
+        let mut done = 0u64;
+        while done < total {
+            let take = (total - done).min(blen as u64) as usize;
+            file.write_all(&buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Fill `[offset, offset + k*s.len())` with `k` copies of `s`, crash-atomically,
@@ -929,9 +969,10 @@ pub(crate) fn commit_grow(
 /// `logical_offset` is the pre-op payload size (the tail the growth is anchored
 /// at); `file_end == HEADER_SIZE + logical_offset` is the pre-op raw file size;
 /// `new_len == logical_offset + length` is the post-op payload size (already
-/// overflow-checked by the caller). Each `(rel, data)` block is written at logical
-/// offset `logical_offset + rel`; callers guarantee every block fits within
-/// `[logical_offset, new_len)` and that blocks do not overlap.
+/// overflow-checked by the caller, which also guarantees `new_len <= u64::MAX -
+/// HEADER_SIZE` so `HEADER_SIZE + new_len` cannot wrap). Each `(rel, data)` block
+/// is written at logical offset `logical_offset + rel`; callers guarantee every
+/// block fits within `[logical_offset, new_len)` and that blocks do not overlap.
 ///
 /// The efficiency win over a full `push` of `length` bytes: the extension is
 /// realised with a single `set_len`, so the gaps between blocks cost no I/O (they
@@ -1832,7 +1873,7 @@ impl<'a> OverlayData<'a> {
 
     /// Write the edit's `len()` bytes at the file's current position, advancing the
     /// cursor. A literal is one `write_all`; a repeat streams through a bounded
-    /// buffer (`O(pattern.len())` memory, capped near [`MOVE_CHUNK`]).
+    /// per-thread buffer (no allocation).
     fn write_seq(&self, file: &mut File) -> io::Result<()> {
         match self {
             OverlayData::Literal(d) => file.write_all(d),
@@ -1848,8 +1889,8 @@ impl<'a> OverlayData<'a> {
 /// Stream `len` bytes of `pattern`, rotated to start at `phase`, at the file's
 /// current position (no seek; the cursor advances). The scratch buffer is a whole
 /// number of pattern periods (so each refill continues the rotation seamlessly)
-/// bounded near [`MOVE_CHUNK`], keeping memory `O(pattern.len())`. `pattern` is
-/// non-empty; `phase < pattern.len()`.
+/// within [`MOVE_CHUNK`]; a pattern longer than that is written directly.
+/// `pattern` is non-empty; `phase < pattern.len()`.
 ///
 /// Not feature-gated: `MultiAtrunc` recovery ([`recover_multi_atrunc`]) uses it to
 /// replay a compact repeat block, so every build must be able to expand one.
@@ -1858,22 +1899,39 @@ fn write_pattern(file: &mut File, pattern: &[u8], phase: usize, len: u64) -> io:
         return Ok(());
     }
     let plen = pattern.len();
-    let copies = (MOVE_CHUNK / plen as u64).max(1) as usize;
-    let cap = copies * plen;
-    let mut buf = Vec::with_capacity(cap);
-    for j in 0..cap {
-        buf.push(pattern[(phase + j) % plen]);
+    // `phase == plen` would make the direct loop's first `take` 0 and spin forever.
+    debug_assert!(phase < plen);
+    if plen as u64 > MOVE_CHUNK {
+        // One period already exceeds the buffer: write `pattern` itself, starting
+        // at `phase` and wrapping to 0 thereafter.
+        let mut pos = phase;
+        let mut done = 0u64;
+        while done < len {
+            let take = ((plen - pos) as u64).min(len - done) as usize;
+            file.write_all(&pattern[pos..pos + take])?;
+            done += take as u64;
+            pos = 0;
+        }
+        return Ok(());
     }
-    // `cap` is a multiple of `plen`, so `buf[cap]` would wrap to `buf[0]` — writing
-    // the buffer repeatedly continues the same rotation, and any short final write
-    // is a valid prefix of it.
-    let mut done = 0u64;
-    while done < len {
-        let take = ((len - done) as usize).min(buf.len());
-        file.write_all(&buf[..take])?;
-        done += take as u64;
-    }
-    Ok(())
+    let cap = (MOVE_CHUNK as usize / plen) * plen;
+    CHUNK_BUF.with_borrow_mut(|buf| {
+        let buf = &mut buf[..cap];
+        for c in buf.chunks_exact_mut(plen) {
+            c[..plen - phase].copy_from_slice(&pattern[phase..]);
+            c[plen - phase..].copy_from_slice(&pattern[..phase]);
+        }
+        // `cap` is a multiple of `plen`, so `buf[cap]` would wrap to `buf[0]` —
+        // writing the buffer repeatedly continues the same rotation, and any short
+        // final write is a valid prefix of it.
+        let mut done = 0u64;
+        while done < len {
+            let take = (len - done).min(cap as u64) as usize;
+            file.write_all(&buf[..take])?;
+            done += take as u64;
+        }
+        Ok(())
+    })
 }
 
 /// Insert an in-place write `[off, off + data.len())` into an `inplace_gen`

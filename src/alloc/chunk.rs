@@ -9,6 +9,8 @@
 use super::BStackOwnedSliceAllocator;
 use super::{BStackAllocator, BStackOwnedSlice, BStackRange, BStackSlice};
 use crate::BStack;
+#[cfg(all(feature = "set", feature = "atomic"))]
+use crate::{BStackGenOp, bstack_unsafe_reborrow, bstack_unsafe_reborrow_mut};
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -565,6 +567,9 @@ impl<'a> BStackChunk<'a> {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[inline]
     pub fn reverse(&mut self) -> io::Result<()> {
+        if self.chunk_count() < 2 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -594,6 +599,9 @@ impl<'a> BStackChunk<'a> {
             k <= self.chunk_count(),
             "rotate_left: k must be <= chunk_count"
         );
+        if k == 0 || k == self.chunk_count() {
+            return Ok(());
+        }
         let mid = (k * self.chunk_len) as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -621,6 +629,9 @@ impl<'a> BStackChunk<'a> {
             k <= self.chunk_count(),
             "rotate_right: k must be <= chunk_count"
         );
+        if k == 0 || k == self.chunk_count() {
+            return Ok(());
+        }
         let mid = (k * self.chunk_len) as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -687,6 +698,9 @@ impl<'a> BStackChunk<'a> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn sort_by(&mut self, mut cmp: impl FnMut(&[u8], &[u8]) -> Ordering) -> io::Result<()> {
+        if self.chunk_count() <= 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -704,6 +718,9 @@ impl<'a> BStackChunk<'a> {
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn sort_by_key<K: Ord>(&mut self, mut key: impl FnMut(&[u8]) -> K) -> io::Result<()> {
+        if self.chunk_count() <= 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1101,6 +1118,9 @@ impl<'a> BStackChunk<'a> {
             n < self.chunk_count(),
             "select_nth_by: n must be < chunk_count"
         );
+        if self.chunk_count() == 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1135,6 +1155,9 @@ impl<'a> BStackChunk<'a> {
             n < self.chunk_count(),
             "select_nth_by_key: n must be < chunk_count"
         );
+        if self.chunk_count() == 1 {
+            return Ok(());
+        }
         let chunk_len = self.chunk_len as usize;
         let start = self.aligned.start();
         let end = self.aligned.end();
@@ -1171,8 +1194,9 @@ impl<'a> BStackChunk<'a> {
     /// re-running from any such permutation completes the sort, so as long as
     /// I/O eventually succeeds, repeated calls converge to fully sorted.
     ///
-    /// Returns `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
-    /// I/O failure. Not guaranteed stable — the out-of-core merge may reorder
+    /// Returns `Err` on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
+    /// I/O failure, or [`io::ErrorKind::OutOfMemory`] before any I/O when
+    /// `chunk_len` is too large for this platform's `usize`. Not guaranteed stable — the out-of-core merge may reorder
     /// records that compare equal (use [`sort_by`](Self::sort_by) when the whole
     /// region fits memory and stability is required).
     ///
@@ -1212,16 +1236,20 @@ impl<'a> BStackChunk<'a> {
     /// `select_nth_unstable_by` on an in-memory copy under one
     /// [`BStack::process`], this is a bounded-memory quickselect: it narrows an
     /// active record range around `n`, choosing each pivot from a cross-region
-    /// sample and partitioning in place with atomic [`BStack::cross_exchange`]
-    /// swaps, until the range fits the budget and one `process` settles it
-    /// exactly. Peak memory is O(1) in the region's total size; no scratch
-    /// region is used.
+    /// sample and partitioning in place three ways (`<`, `==`, `>` the pivot), a
+    /// pair of budget-sized windows per atomic [`BStack::inplace_gen`], until the
+    /// range fits the budget and one `process` settles it exactly. Records equal
+    /// to the pivot leave the range together, so duplicate-heavy regions shrink
+    /// as fast as distinct ones. Peak memory is O(1) in the region's total size;
+    /// no scratch region is used.
     ///
     /// Every step is crash-atomic and permutation-preserving, so a crash or an
     /// early I/O-error return leaves the region as a valid permutation (never
     /// lost or duplicated data) and re-running completes the selection. Returns
-    /// `Err` only on a genuine [`BStack::process`]/[`BStack::cross_exchange`]
-    /// I/O failure. See `algos/SORTSELECT.md`.
+    /// `Err` on a genuine [`BStack::process`]/[`BStack::inplace_gen`] I/O
+    /// failure, or [`io::ErrorKind::OutOfMemory`] before any I/O when
+    /// `chunk_len` is too large for this platform's `usize`. See
+    /// `algos/SORTSELECT.md`.
     ///
     /// Requires the `set` and `atomic` features.
     ///
@@ -1442,13 +1470,16 @@ struct Records<'s, 'a> {
 
 #[cfg(all(feature = "set", feature = "atomic"))]
 impl<'s, 'a> Records<'s, 'a> {
+    /// Rejects a stride whose four-record scratch would not fit `usize`, as
+    /// C's `records_init` does: on a 32-bit target `c as usize` would truncate,
+    /// and the engines would then move partial records.
     #[inline]
-    fn new(aligned: &'s BStackSlice<'a>, c: u64) -> Self {
-        Records {
-            aligned,
-            c,
-            cu: c as usize,
-        }
+    fn new(aligned: &'s BStackSlice<'a>, c: u64) -> io::Result<Self> {
+        let cu = usize::try_from(c)
+            .ok()
+            .filter(|&cu| cu <= usize::MAX / 4)
+            .ok_or_else(|| io_error!(OutOfMemory, "chunk_len too large for this platform"))?;
+        Ok(Records { aligned, c, cu })
     }
 
     /// Number of whole records in the region.
@@ -1485,9 +1516,17 @@ impl<'s, 'a> Records<'s, 'a> {
         self.aligned.stack().process(self.off(lo), self.off(hi), f)
     }
 
-    /// Reverse the records in `[x, y)` via single-record atomic swaps.
+    /// Reverse the records in `[x, y)`: one atomic `process` when the span
+    /// fits [`SORT_BUDGET`], else single-record atomic swaps.
     #[inline(always)] // only called by `rotate`
     fn reverse(&self, mut x: u64, mut y: u64) -> io::Result<()> {
+        if y - x < 2 {
+            return Ok(());
+        }
+        if (y - x) * self.c <= SORT_BUDGET {
+            let cu = self.cu;
+            return self.process(x, y, |buf| reverse_chunks(buf, cu));
+        }
         while y > x + 1 {
             let b = y - 1;
             self.swap(x, b)?;
@@ -1497,11 +1536,16 @@ impl<'s, 'a> Records<'s, 'a> {
         Ok(())
     }
 
-    /// Rotate: swap the adjacent record blocks `[a, b)` and `[b, d)` via three
-    /// reversals. Crash-safe: each underlying swap is atomic, so any crash
+    /// Rotate: swap the adjacent record blocks `[a, b)` and `[b, d)` — one
+    /// atomic `process` when the span fits [`SORT_BUDGET`], else three
+    /// reversals. Crash-safe: each underlying step is atomic, so any crash
     /// leaves a valid permutation.
     #[inline(always)] // only called by `imerge`
     fn rotate(&self, a: u64, b: u64, d: u64) -> io::Result<()> {
+        if (d - a) * self.c <= SORT_BUDGET {
+            let mid = (b - a) as usize * self.cu;
+            return self.process(a, d, |buf| buf.rotate_left(mid));
+        }
         self.reverse(a, b)?;
         self.reverse(b, d)?;
         self.reverse(a, d)
@@ -1660,40 +1704,164 @@ impl<'s, 'a> Records<'s, 'a> {
         Ok(lo + stride * med)
     }
 
-    /// Lomuto partition of `[lo, hi)` around the record at `piv_idx`, in place via
-    /// atomic single-record swaps. Returns the pivot's final index `p`: `[lo, p)`
-    /// compare `< pivot`, `[p + 1, hi)` compare `>= pivot`, and the pivot record
-    /// sits at `p` in its final position. Requires `hi - lo >= 2`.
-    fn partition(
+    /// Records per partition window: two windows fit [`SORT_BUDGET`], and a
+    /// record wider than half the budget still gets a one-record window.
+    #[inline]
+    fn window(&self) -> u64 {
+        (SORT_BUDGET / 2 / self.c).max(1)
+    }
+
+    /// One partition step: read the record range `a` and, if given, the
+    /// disjoint range `b` into `win`, move every *left* record of their
+    /// concatenation ahead of the rest, and write each window back. A record
+    /// is left when it compares `<` `piv`, or `<=` when `le` is set. One
+    /// crash-atomic [`BStack::inplace_gen`] that commits only the windows whose
+    /// bytes changed, and nothing at all when neither did. Returns how many
+    /// records were left.
+    fn partition_round(
         &self,
-        lo: u64,
-        hi: u64,
-        piv_idx: u64,
-        pbuf: &mut [u8],
-        one: &mut [u8],
+        a: (u64, u64),
+        b: Option<(u64, u64)>,
+        win: &mut [u8],
+        piv: &[u8],
+        le: bool,
         cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
     ) -> io::Result<u64> {
-        let last = hi - 1;
-        self.read(piv_idx, pbuf)?; // pivot bytes captured before moving
-        if piv_idx != last {
-            self.swap(piv_idx, last)?;
-        }
-        let mut store = lo;
-        let mut k = lo;
-        while k < last {
-            self.read(k, one)?;
-            if cmp(one, pbuf) == Ordering::Less {
-                if k != store {
-                    self.swap(store, k)?;
-                }
-                store += 1;
+        let cu = self.cu;
+        let ka = (a.1 - a.0) as usize;
+        // No overflow: `partition_by` passes at most `2k` records in total, so
+        // `a_len + b_len <= 2k * cu <= win.len()`, a length that already fits
+        // `usize` (and `Records::new` caps `cu` at `usize::MAX / 4`).
+        let a_len = ka * cu;
+        let b_len = b.map_or(0, |(lo, hi)| (hi - lo) as usize * cu);
+        let a_off = self.off(a.0);
+        let b_off = b.map_or(0, |(lo, _)| self.off(lo));
+        let win = &mut win[..a_len + b_len];
+        let mut nleft = 0u64;
+        let mut write_b = false;
+        let mut step = 0u8;
+        self.aligned.stack().inplace_gen(|feedback| {
+            if let Err(e) = feedback {
+                return Some(BStackGenOp::Abort { source: Some(e) });
             }
-            k += 1;
+            loop {
+                match step {
+                    0 => {
+                        step = 1;
+                        return Some(BStackGenOp::Read {
+                            offset: a_off,
+                            // SAFETY: `win` outlives the call and, as a borrowed
+                            // slice, cannot be resized; the read resolves before
+                            // the next step.
+                            buf: bstack_unsafe_reborrow_mut!(&mut win[..a_len]),
+                        });
+                    }
+                    1 => {
+                        step = 2;
+                        if b_len > 0 {
+                            return Some(BStackGenOp::Read {
+                                offset: b_off,
+                                // SAFETY: as above.
+                                buf: bstack_unsafe_reborrow_mut!(&mut win[a_len..]),
+                            });
+                        }
+                    }
+                    2 => {
+                        // Both reads resolved: Hoare split of the
+                        // concatenation in place. `[0, i)` holds left records
+                        // and `[j, cnt)` right ones; each swap settles one
+                        // misplaced pair.
+                        let mut is_left = |rec: &[u8]| {
+                            let o = cmp(rec, piv);
+                            o.is_lt() || (le && o.is_eq())
+                        };
+                        let mut i = 0;
+                        let mut j = win.len() / cu;
+                        let mut write_a = false;
+                        loop {
+                            while i < j && is_left(&win[i * cu..(i + 1) * cu]) {
+                                i += 1;
+                            }
+                            while i < j && !is_left(&win[(j - 1) * cu..j * cu]) {
+                                j -= 1;
+                            }
+                            if i == j {
+                                break; // the scans met: every record is classified
+                            }
+                            // Record `i` is right and `j - 1` is left: swap them.
+                            let (head, tail) = win.split_at_mut((j - 1) * cu);
+                            head[i * cu..(i + 1) * cu].swap_with_slice(&mut tail[..cu]);
+                            // `i < j - 1`: window a moved iff record `i` lies in
+                            // it, window b iff record `j - 1` does.
+                            write_a |= i < ka;
+                            write_b |= j > ka;
+                            i += 1;
+                            j -= 1;
+                        }
+                        nleft = i as u64;
+                        if !write_a && !write_b {
+                            return None; // nothing moved: no writes staged, nothing to commit
+                        }
+                        step = 3;
+                        if write_a {
+                            return Some(BStackGenOp::Write {
+                                offset: a_off,
+                                // SAFETY: `win` outlives the call and is not
+                                // touched again until it returns.
+                                data: bstack_unsafe_reborrow!(&win[..a_len]),
+                            });
+                        }
+                    }
+                    3 => {
+                        step = 4;
+                        if write_b {
+                            return Some(BStackGenOp::Write {
+                                offset: b_off,
+                                // SAFETY: as above.
+                                data: bstack_unsafe_reborrow!(&win[a_len..]),
+                            });
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        })?;
+        Ok(nleft)
+    }
+
+    /// Two-way partition of `[lo, hi)` in place: returns `s` such that every
+    /// record in `[lo, s)` is left of `piv` and none in `[s, hi)` is, *left*
+    /// meaning `<` `piv`, or `<=` when `le` is set.
+    ///
+    /// Two-ended block scheme over `k`-record windows. Each round takes the
+    /// window at each frontier of the unsettled range and splits their
+    /// concatenation, so the left window ends all left or the right window ends
+    /// all right: at least `k` records settle per round. A residue under two
+    /// windows is settled by one last single-window round.
+    fn partition_by(
+        &self,
+        mut lo: u64,
+        mut hi: u64,
+        win: &mut [u8],
+        piv: &[u8],
+        le: bool,
+        cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
+    ) -> io::Result<u64> {
+        let k = self.window();
+        while hi - lo >= 2 * k {
+            let nl = self.partition_round((lo, lo + k), Some((hi - k, hi)), win, piv, le, cmp)?;
+            if nl >= k {
+                lo += k;
+                hi -= 2 * k - nl;
+            } else {
+                lo += nl;
+                hi -= k;
+            }
         }
-        if store != last {
-            self.swap(store, last)?;
+        if lo < hi {
+            lo += self.partition_round((lo, hi), None, win, piv, le, cmp)?;
         }
-        Ok(store)
+        Ok(lo)
     }
 }
 
@@ -1717,7 +1885,7 @@ fn merge_sort(
     c: u64,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<()> {
-    let r = Records::new(aligned, c);
+    let r = Records::new(aligned, c)?;
     let count = r.count();
     if count <= 1 {
         return Ok(());
@@ -1765,9 +1933,9 @@ fn merge_sort(
 // Engine for `BStackChunk::select_nth_partial_by`/`select_nth_partial_by_key`.
 // Bounded-memory quickselect: narrow an active range `[lo, hi)` that holds rank
 // `n` (every record left of `lo` <= it <= every record right of `hi`), picking
-// each pivot from a cross-region sample and partitioning in place with atomic
-// swaps, until the range fits the budget and one `process` settles it. Every
-// step is crash-atomic and permutation-preserving.
+// each pivot from a cross-region sample and partitioning in place three ways
+// with windowed atomic rounds, until the range fits the budget and one `process`
+// settles it. Every step is crash-atomic and permutation-preserving.
 
 /// Out-of-core in-place selection of rank `n` over `aligned`, viewed as records
 /// of `c` bytes. `n < count` is the caller's precondition (asserted in the
@@ -1779,17 +1947,22 @@ fn select_nth(
     n: u64,
     cmp: &mut dyn FnMut(&[u8], &[u8]) -> Ordering,
 ) -> io::Result<()> {
-    let r = Records::new(aligned, c);
+    let r = Records::new(aligned, c)?;
     let count = r.count();
     if count <= 1 {
         return Ok(());
     }
-    // Sized to hold at least one record even when a record exceeds the budget
-    // (`c > SORT_BUDGET`), so the pivot sample can always read one in.
-    let mut samp = vec![0u8; (SORT_BUDGET as usize).max(r.cu)];
-    let mut pbuf = vec![0u8; r.cu];
-    let mut one = vec![0u8; r.cu];
+    // The window buffer doubles as the pivot sample. Sized for two windows, and
+    // at least the budget, so the sample always holds at least one record. The
+    // product does not undo `window`'s `/ 2 / c`: the division rounds down, so it
+    // is the budget trimmed to whole window pairs, or two records when one is
+    // wider than half the budget. A boxed slice so it cannot grow:
+    // `partition_round` reborrows it for a whole `inplace_gen` call, which a
+    // reallocation would dangle.
+    let win_len = (SORT_BUDGET as usize).max(2 * r.window() as usize * r.cu);
+    let mut win = vec![0u8; win_len].into_boxed_slice();
     let mut order: Vec<usize> = Vec::new(); // reused pivot-sample scratch
+    let mut pbuf = vec![0u8; r.cu];
     let (mut lo, mut hi) = (0u64, count);
     loop {
         // A single-record band already holds the answer (rank-band invariant).
@@ -1810,17 +1983,27 @@ fn select_nth(
                 apply_chunk_permutation(buf, cu, &ord);
             });
         }
-        let piv = r.sample_pivot(lo, hi, &mut samp, &mut order, cmp)?;
-        let p = r.partition(lo, hi, piv, &mut pbuf, &mut one, cmp)?;
-        // Recurse into the side holding `n`, excluding the fixed pivot at `p`
-        // (strict progress → termination).
-        if n < p {
-            hi = p;
-        } else if n > p {
-            lo = p + 1;
+        let piv = r.sample_pivot(lo, hi, &mut win, &mut order, cmp)?;
+        r.read(piv, &mut pbuf)?;
+        // Three-way split as two two-way passes: `[lo, lt)` < pivot, then, only
+        // when `n` is not left of `lt`, `[lt, gt)` == pivot and `[gt, hi)` > it.
+        let lt = r.partition_by(lo, hi, &mut win, &pbuf, false, cmp)?;
+        let (nlo, nhi) = if n < lt {
+            (lo, lt)
         } else {
+            let gt = r.partition_by(lt, hi, &mut win, &pbuf, true, cmp)?;
+            if n < gt {
+                // `n` is among the records equal to the pivot: done.
+                return Ok(());
+            }
+            (gt, hi)
+        };
+        // A total order always shrinks the band, since the pivot record is
+        // neither `<` nor `>` itself. Stop rather than spin on one that is not.
+        if (nlo, nhi) == (lo, hi) {
             return Ok(());
         }
+        (lo, hi) = (nlo, nhi);
     }
 }
 

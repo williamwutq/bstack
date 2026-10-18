@@ -764,9 +764,8 @@ static int test_foreign_slice_is_rejected(void)
 }
 
 /* =========================================================================
- * Bulk (BStackBulkAllocator) — requires -DBSTACK_FEATURE_ATOMIC
+ * recover
  * ====================================================================== */
-#ifdef BSTACK_FEATURE_ATOMIC
 
 #define SG_HEAD_OFF(c) (40u + (uint64_t)(c) * 8u)
 
@@ -783,6 +782,110 @@ static uint64_t sg_rd64(const uint8_t *p)
     for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
     return v;
 }
+
+/* A non-class free size used to be linked whole onto a smaller class; the pop
+ * then claimed only the class size, leaving an untracked gap. */
+static int test_recover_splits_non_class_free_block(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin, r;
+    uint64_t xb, unsure = 999;
+    uint8_t w[8], got[6];
+
+    CHECK(bstack_allocator_alloc(base, 300, &x) == 0);   /* block 320 */
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 300, &pin) == 0);
+    CHECK(bstack_slice_write(pin, (const uint8_t *)"pinned", 6) == 0);
+    CHECK(bstack_allocator_dealloc(base, x) == 0);
+    /* Re-tile the free 320 as a free 272 (not a class size) + a free 48. */
+    sg_wr64(w, 272u >> 4); CHECK(bstack_set(bs, xb, w, 8) == 0);
+    sg_wr64(w, 48u >> 4);  CHECK(bstack_set(bs, xb + 272, w, 8) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    /* 272 splits into 256 + 16. */
+    CHECK(bstack_get(bs, xb, xb + 8, w) == 0);             CHECK(sg_rd64(w) == 256u >> 4);
+    CHECK(bstack_get(bs, xb + 256, xb + 264, w) == 0);     CHECK(sg_rd64(w) == 16u >> 4);
+
+    CHECK(bstack_allocator_alloc(base, 248, &r) == 0);    /* block 256 */
+    CHECK(r.offset == xb + 8);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    CHECK(bstack_get(bs, pin.offset, pin.offset + 6, got) == 0);
+    CHECK(memcmp(got, "pinned", 6) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A zero word followed by a valid header is a gap, not a crashed-extend tail;
+ * discarding from it used to drop every block after it. */
+static int test_recover_resyncs_past_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, y;
+    uint64_t xb, len, len2, unsure = 999;
+    uint8_t zero[8] = {0}, got[13];
+
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);    /* block 32 */
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 100, &y) == 0);
+    CHECK(bstack_slice_write(y, (const uint8_t *)"after the gap", 13) == 0);
+    CHECK(bstack_len(bs, &len) == 0);
+    CHECK(bstack_set(bs, xb, zero, 8) == 0);
+
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 2);                                   /* the 32-byte gap */
+    CHECK(bstack_len(bs, &len2) == 0);
+    CHECK(len2 == len);
+    CHECK(bstack_get(bs, y.offset, y.offset + 13, got) == 0);
+    CHECK(memcmp(got, "after the gap", 13) == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* A crafted free size near UINT64_MAX must not wrap the bound check. */
+static int test_recover_rejects_wrapping_free_size(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t x, pin;
+    uint64_t xb, unsure = 0;
+    uint8_t w[8], magic[6];
+
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);
+    xb = x.offset - 8;
+    CHECK(bstack_allocator_alloc(base, 24, &pin) == 0);
+    CHECK(bstack_allocator_dealloc(base, x) == 0);
+    sg_wr64(w, UINT64_C(0x0FFFFFFFFFFFFFF0)); CHECK(bstack_set(bs, xb, w, 8) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure > 0);
+    CHECK(bstack_get(bs, 24, 30, magic) == 0);
+    CHECK(memcmp(magic, "ALSG\x00\x02", 6) == 0);         /* header untouched */
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* =========================================================================
+ * Bulk (BStackBulkAllocator) — requires -DBSTACK_FEATURE_ATOMIC
+ * ====================================================================== */
+#ifdef BSTACK_FEATURE_ATOMIC
 
 /* n == 0 is a no-op; a zero-length entry yields the null sentinel slice. */
 static int test_bulk_empty_and_zero_lengths(void)
@@ -955,8 +1058,8 @@ static int test_bulk_dealloc_rejects_bad_batches(void)
     sg_unlink(t1); sg_unlink(t2); return 0;
 }
 
-/* recover() relinks a non-class size onto the largest class <= size, so
- * alloc_bulk must accept it there too (single alloc already does). */
+/* recover() splits a non-class size into exact class blocks, so alloc_bulk's
+ * exact-size check accepts the class piece. */
 static int test_bulk_reuses_recovered_non_class_size(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -984,7 +1087,7 @@ static int test_bulk_reuses_recovered_non_class_size(void)
     CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
     CHECK(unsure == 0);
 
-    /* largest_class_le(272) == 256, so it lands on class 15. */
+    /* 272 splits into 256 (class 15) + 16 (class 0). */
     CHECK(bstack_get(bs, SG_HEAD_OFF(15), SG_HEAD_OFF(15) + 8, w) == 0);
     CHECK(sg_rd64(w) == xb);
 
@@ -992,6 +1095,8 @@ static int test_bulk_reuses_recovered_non_class_size(void)
     lens[0] = 248;
     CHECK(bstack_allocator_alloc_bulk(base, lens, 1, out) == 0);
     CHECK(out[0].offset == xb + 8);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);                                   /* tiling intact */
 
     CHECK(bstack_allocator_dealloc(base, pin) == 0);
     bstack_close(segregated_bstack_allocator_into_stack(a));
@@ -1093,6 +1198,42 @@ static int test_coalesce_noop_without_adjacency(void)
     sg_unlink(tmp); return 0;
 }
 
+/* A non-class merged run is split into class blocks, and re-merging the same
+ * pieces counts as no progress, so coalesce reaches a fixpoint. */
+static int test_coalesce_splits_non_class_run(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t b0, b1, b2, pin, r;
+    uint64_t fused = 999, unsure = 999, base_off;
+    CHECK(bstack_allocator_alloc(base, 100, &b0) == 0);  /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 100, &b1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &b2) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    base_off = b0.offset;
+    CHECK(bstack_allocator_dealloc(base, b0) == 0);
+    CHECK(bstack_allocator_dealloc(base, b1) == 0);
+    CHECK(bstack_allocator_dealloc(base, b2) == 0);
+
+    /* 3 x 112 = 336 is not a class: it becomes 320 + 16, a net drop of 1. */
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 1);
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 0);
+    CHECK(bstack_allocator_alloc(base, 300, &r) == 0);   /* block 320 */
+    CHECK(r.offset == base_off);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 static int test_coalesce_empty_arena(void)
 {
     char tmp[64]; make_tmp(tmp, sizeof tmp);
@@ -1103,6 +1244,76 @@ static int test_coalesce_empty_arena(void)
     uint64_t fused = 999;
     CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
     CHECK(fused == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* coalesce used to stop at a zero gap, republishing heads rebuilt from the
+ * prefix only and so unlinking every free block past it. */
+static int test_coalesce_resyncs_past_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t f0, f1, x, g0, g1, pin, r0, r1;
+    uint64_t fused = 999, unsure = 999, f0_off, g0_off;
+    uint8_t zero[8] = {0};
+    CHECK(bstack_allocator_alloc(base, 100, &f0) == 0);  /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 100, &f1) == 0);
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);    /* block 32, the gap */
+    CHECK(bstack_allocator_alloc(base, 100, &g0) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &g1) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    f0_off = f0.offset; g0_off = g0.offset;
+    CHECK(bstack_set(bs, x.offset - 8, zero, 8) == 0);
+    CHECK(bstack_allocator_dealloc(base, f0) == 0);
+    CHECK(bstack_allocator_dealloc(base, f1) == 0);
+    CHECK(bstack_allocator_dealloc(base, g0) == 0);
+    CHECK(bstack_allocator_dealloc(base, g1) == 0);
+
+    CHECK(segregated_bstack_allocator_coalesce(a, &fused) == 0);
+    CHECK(fused == 2);                                    /* both pairs fuse */
+    CHECK(bstack_allocator_alloc(base, 216, &r0) == 0);
+    CHECK(bstack_allocator_alloc(base, 216, &r1) == 0);
+    /* the run past the gap stays linked */
+    CHECK((r0.offset == f0_off && r1.offset == g0_off)
+          || (r0.offset == g0_off && r1.offset == f0_off));
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 2);                                   /* only the gap */
+    (void)pin;
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+/* stats used to stop at a zero gap, dropping every block past it. */
+static int test_stats_skips_mid_arena_zero_gap(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t before, x, after, freed, pin;
+    uint64_t fb, fy, ub, uy;
+    uint8_t zero[8] = {0};
+    CHECK(bstack_allocator_alloc(base, 100, &before) == 0); /* block 112 */
+    CHECK(bstack_allocator_alloc(base, 24, &x) == 0);       /* block 32, the gap */
+    CHECK(bstack_allocator_alloc(base, 100, &after) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &freed) == 0);
+    CHECK(bstack_allocator_alloc(base, 100, &pin) == 0);
+    CHECK(bstack_set(bs, x.offset - 8, zero, 8) == 0);
+    CHECK(bstack_allocator_dealloc(base, freed) == 0);
+
+    CHECK(segregated_bstack_allocator_stats(a, &fb, &fy, &ub, &uy) == 0);
+    CHECK(ub == 3 && uy == 3 * 112);
+    CHECK(fb == 1 && fy == 112);
+    (void)before; (void)after; (void)pin;
 
     bstack_close(segregated_bstack_allocator_into_stack(a));
     sg_unlink(tmp); return 0;
@@ -1317,6 +1528,131 @@ static int test_stats_survives_concurrent_tail_discard(void)
     sg_unlink(tmp); return 0;
 }
 
+/* ---- coalesce excludes mutators ------------------------------------- */
+
+static int test_mutators_refuse_while_coalescing(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *base = (bstack_allocator_t *)a;
+
+    bstack_slice_t s, out, bulk[1];
+    uint64_t len8 = 8, unsure = 999;
+    CHECK(bstack_allocator_alloc(base, 100, &s) == 0);
+
+    atomic_store(&a->coalescing, 1);
+    errno = 0;
+    CHECK(bstack_allocator_alloc(base, 8, &out) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_alloc_bulk(base, &len8, 1, bulk) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_realloc(base, s, 500, &out) == -1 && errno == EBUSY);
+    CHECK(out.offset == s.offset && out.len == s.len);
+    errno = 0;
+    CHECK(bstack_allocator_dealloc(base, s) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(bstack_allocator_dealloc_bulk(base, &s, 1) == -1 && errno == EBUSY);
+    atomic_store(&a->coalescing, 0);
+
+    CHECK(atomic_load(&a->in_flight) == 0);
+    CHECK(bstack_allocator_dealloc(base, s) == 0);
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
+#define SG_CO_THREADS 4
+#define SG_CO_ITERS   200
+
+typedef struct {
+    bstack_allocator_t *a;
+    int                 tid, ok;
+    pthread_mutex_t    *live_lock;
+    uint64_t           *live;  /* one live offset per thread, 0 = none */
+    volatile int       *done;
+} sg_co_arg_t;
+
+static void sg_co_body(sg_co_arg_t *w)
+{
+    uint8_t wbuf[100], rbuf[100];
+    int i, t, r;
+    memset(wbuf, (uint8_t)w->tid, sizeof wbuf);
+    w->ok = 1;
+    for (i = 0; i < SG_CO_ITERS; i++) {
+        /* Two sizes so freed neighbours give coalesce work. */
+        uint64_t len = (i % 2 == 0) ? 100 : 24;
+        bstack_slice_t s;
+        while ((r = bstack_allocator_alloc(w->a, len, &s)) != 0 && errno == EBUSY) {}
+        if (r) { w->ok = 0; return; }
+
+        pthread_mutex_lock(w->live_lock);
+        for (t = 0; t < SG_CO_THREADS; t++)
+            if (w->live[t] == s.offset) w->ok = 0;   /* handed out twice */
+        w->live[w->tid] = s.offset;
+        pthread_mutex_unlock(w->live_lock);
+        if (!w->ok) return;
+
+        if (bstack_slice_write(s, wbuf, (size_t)len) || bstack_slice_read(s, rbuf)
+            || memcmp(wbuf, rbuf, (size_t)len)) {
+            w->ok = 0; return;
+        }
+
+        pthread_mutex_lock(w->live_lock);
+        w->live[w->tid] = 0;
+        pthread_mutex_unlock(w->live_lock);
+
+        while ((r = bstack_allocator_dealloc(w->a, s)) != 0 && errno == EBUSY) {}
+        if (r) { w->ok = 0; return; }
+    }
+}
+
+static void *sg_co_worker(void *raw)
+{
+    sg_co_arg_t *w = raw;
+    sg_co_body(w);
+    __atomic_fetch_add((int *)w->done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* coalesce racing alloc/dealloc used to relink a popped-but-unclaimed block,
+ * handing it to two callers. */
+static int test_concurrent_coalesce_never_doubles_blocks(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+
+    pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+    uint64_t        live[SG_CO_THREADS] = {0};
+    volatile int    done = 0;
+    pthread_t       threads[SG_CO_THREADS];
+    sg_co_arg_t     args[SG_CO_THREADS];
+    int i, coalesce_ok = 1;
+    uint64_t unsure = 999;
+
+    for (i = 0; i < SG_CO_THREADS; i++) {
+        args[i].a = (bstack_allocator_t *)a; args[i].tid = i; args[i].ok = 1;
+        args[i].live_lock = &live_lock; args[i].live = live; args[i].done = &done;
+        pthread_create(&threads[i], NULL, sg_co_worker, &args[i]);
+    }
+    while (__atomic_load_n((int *)&done, __ATOMIC_ACQUIRE) < SG_CO_THREADS)
+        if (segregated_bstack_allocator_coalesce(a, NULL) != 0) coalesce_ok = 0;
+    for (i = 0; i < SG_CO_THREADS; i++) pthread_join(threads[i], NULL);
+    CHECK(coalesce_ok);
+    for (i = 0; i < SG_CO_THREADS; i++) CHECK(args[i].ok);
+
+    CHECK(segregated_bstack_allocator_recover(a, &unsure) == 0);
+    CHECK(unsure == 0);
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 #endif /* BSTACK_FEATURE_ATOMIC */
 
 /* =========================================================================
@@ -1343,6 +1679,10 @@ int main(void)
 
     T(test_foreign_slice_is_rejected);
 
+    T(test_recover_splits_non_class_free_block);
+    T(test_recover_resyncs_past_mid_arena_zero_gap);
+    T(test_recover_rejects_wrapping_free_size);
+
 #ifdef BSTACK_FEATURE_ATOMIC
     T(test_bulk_empty_and_zero_lengths);
     T(test_bulk_alloc_distinct_usable);
@@ -1356,6 +1696,8 @@ int main(void)
     T(test_coalesce_noop_without_adjacency);
     T(test_coalesce_empty_arena);
     T(test_coalesce_partial_run);
+    T(test_coalesce_splits_non_class_run);
+    T(test_coalesce_resyncs_past_mid_arena_zero_gap);
 
     T(test_stats_empty_arena_is_all_zero);
     T(test_stats_accepts_null_out_pointers);
@@ -1363,6 +1705,9 @@ int main(void)
     T(test_stats_oversized_block_counts_physical_size);
     T(test_stats_clamps_tail_that_is_not_a_whole_quantum);
     T(test_stats_survives_concurrent_tail_discard);
+    T(test_stats_skips_mid_arena_zero_gap);
+    T(test_mutators_refuse_while_coalescing);
+    T(test_concurrent_coalesce_never_doubles_blocks);
 #endif
 
     printf("\n%d/%d tests passed\n", g_passed, g_total);
