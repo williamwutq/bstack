@@ -484,21 +484,26 @@ kind == 2 (Cycle):    [+24 .. +32)   counter (u64 LE), in [0, k], staged as k
 ```
 
 The next block begins at the next 8-byte boundary after the previous block's
-payload (padding bytes are the sparse zeros `set_len` already realised); the
+payload (padding bytes are the sparse zeros `set_len` already realized); the
 sequence runs to `file_size` with no explicit count. A gap in `[0, clen')` not
 covered by any block keeps its bytes: old committed bytes below
 `min(clen, clen')`, or (on a grow) sparse zeros above the old end — which cost no
-write I/O, since the `set_len` in step 1 realises them.
+write I/O, since the `set_len` in step 1 realizes them.
 
 ### Cycle blocks
 
-A `Cycle` block is the in-list form of a cyclic multi-region rotation (the same
-primitive as the standalone `CycleSwap` mode), so a transaction that rotates
-regions and changes length lands as one commit. Any number of `Cycle` blocks may
-appear in one tail; each touches only its own `k` regions, which the disjoint-
-target rule keeps disjoint from every other block, so cycles are independent of
-each other and of the literal/repeat blocks — cross-block replay order stays
-irrelevant.
+A `Cycle` block is the in-list form of a cyclic multi-region rotation, the same
+primitive as the planned standalone `CycleSwap` mode, so a transaction that
+rotates regions and changes length lands as one commit. A cycle of `k = 2` is a
+plain swap, so a two-region `Cycle` block is the `MultiAtrunc` equivalent of
+`cross_exchange`. A cycle of `k = 1` is a no-op and is not a valid block: the
+caller drops it before staging, and recovery rejects a tail containing one.
+
+Any number of `Cycle` blocks may appear in one tail. Each touches only its own
+`k` regions, which the disjoint-target rule keeps disjoint from every other
+block, so cycles are independent of each other and of the literal/repeat blocks.
+Replay order therefore does not affect the result, neither across blocks nor
+relative to any other operation in the transaction.
 
 Within one cycle the steps *are* ordered and resumable. A rotation of `k` regions
 is `k` copies; performed as `j = k-1` down to `0`, each step's source `off_{j-1}`
@@ -534,22 +539,25 @@ restarting it, which is what makes the 1-snapshot encoding re-run-safe.
 
 ### Crash-safety
 
-| Crash point | On-disk state | Recovery |
-|-------------|---------------|----------|
-| During step 1 | `wip_ptr == 0`, `clen` unchanged | base rule: truncate to `32 + clen` |
-| Between 1 and 2 | `wip_ptr == 0`, full tail staged | base rule: truncate — old payload intact |
-| During step 2 | `wip_ptr` either 0 or `32+clen'` (single block) | either truncate or roll forward |
-| After arm, before step 4 | `wip_ptr != 0`, old `clen` in header | read `clen'` from `wip_ptr`, replay all blocks — idempotent |
-| During step 4 | `clen'` + disarm in one block write | either old `clen` (re-replay) or new `clen'` + disarmed (truncate) |
-| After step 4 | `wip_ptr == 0`, `clen = clen'` | base rule: truncate to `32 + clen'` (drops staging) |
+| Crash point              | On-disk state                                   | Recovery                                                           |
+|--------------------------|-------------------------------------------------|--------------------------------------------------------------------|
+| During step 1            | `wip_ptr == 0`, `clen` unchanged                | base rule: truncate to `32 + clen`                                 |
+| Between 1 and 2          | `wip_ptr == 0`, full tail staged                | base rule: truncate — old payload intact                           |
+| During step 2            | `wip_ptr` either 0 or `32+clen'` (single block) | either truncate or roll forward                                    |
+| After arm, before step 4 | `wip_ptr != 0`, old `clen` in header            | read `clen'` from `wip_ptr`, replay all blocks — idempotent        |
+| During step 4            | `clen'` + disarm in one block write             | either old `clen` (re-replay) or new `clen'` + disarmed (truncate) |
+| After step 4             | `wip_ptr == 0`, `clen = clen'`                  | base rule: truncate to `32 + clen'` (drops staging)                |
 
-The arm is the commit point: once `wip_ptr != 0` with `MultiAtrunc`, recovery
-rolls **forward** (it cannot roll back — in-place writes destroy the old bytes,
-and the old length is no longer expressible without the staged tail). A
-legitimately-armed tail always validates, because the arm in step 2 follows the
-staged tail's sync in step 1. A tail that fails validation therefore means
-genuine corruption of already-synced bytes (outside the crash model); recovery
-then keeps the old length rather than committing a half-formed `clen'`.
+The arm is the commit point. Once `wip_ptr != 0` with `MultiAtrunc`:
+
+- Recovery rolls **forward**. It cannot roll back, because the in-place writes
+  destroy the old bytes, and the old length is no longer expressible without the
+  staged tail.
+- A legitimately-armed tail always validates, because the arm in step 2 follows
+  the sync of the staged tail in step 1.
+- A tail that fails validation therefore means genuine corruption of
+  already-synced bytes, which is outside the crash model. Recovery then keeps the
+  old length rather than committing a half-formed `clen'`.
 
 ### Recovery (`wip_ptr != 0`, `wip_aux == MultiAtrunc`)
 
@@ -587,9 +595,10 @@ corrupting it.
 Together: whenever the default rollback fires, the mode is non-destructive and
 no committed data is lost. Destructive modes are always gated behind a magic that
 older readers reject. This is the same mechanism that protected the 0.4.0 journal
-from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x); `MultiAtrunc` is such
-a destructive mode, gated behind the current magic so that an older reader
-rejects the file rather than rolling its replay back into a torn region.
+from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x). `MultiAtrunc`,
+introduced in 0.5.0, is such a destructive mode: it is gated behind the 0.5.0
+magic, so an older reader rejects the file rather than rolling its replay back
+into a torn region.
 
 ---
 

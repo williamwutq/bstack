@@ -757,11 +757,11 @@ use std::os::windows::io::AsRawHandle;
 /// On-disk **format** version encoded in the magic header. This is independent
 /// of the crate version: it bumps only when the file format changes in a way an
 /// older reader cannot handle. 0.4.0 introduced the 32-byte write-in-progress
-/// journal header (see `algos/WIP.md`); 0.5.0 adds the `MultiAtrunc` journal
-/// mode, which overwrites committed bytes in place before its commit point — a
-/// reader that does not recognize it cannot safely roll it back (WIP.md Rule 2),
-/// so the minor bumps to make older binaries reject the new files loudly instead
-/// of misreading them.
+/// journal header (see `algos/WIP.md`); 0.5.0 adds WIP journal mode changes,
+/// including the `MultiAtrunc` journal mode, which overwrites committed bytes in
+/// place before its commit point, so a reader that does not recognize it cannot
+/// safely roll it back (WIP.md Rule 2). In general, minor bumps make older
+/// binaries reject the new files loudly instead of misreading them.
 const FORMAT_MAJOR: u8 = 0;
 const FORMAT_MINOR: u8 = 5;
 const FORMAT_PATCH: u8 = 0;
