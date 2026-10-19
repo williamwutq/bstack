@@ -3225,8 +3225,8 @@ mod alloc_tests {
         assert!(dbg.contains("BStack"), "{dbg}");
         assert!(dbg.contains("version"), "{dbg}");
         assert!(dbg.contains("len"), "{dbg}");
-        // Version must be a recognisable semver string.
-        assert!(dbg.contains("0.4"), "{dbg}");
+        // Version must be a recognizable semver string.
+        assert!(dbg.contains("0.5"), "{dbg}");
     }
 
     #[test]
@@ -9491,6 +9491,518 @@ mod atomic_tests {
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(raw.len() as u64, crate::io_core::HEADER_SIZE + 300);
         assert_eq!(&raw[24..32], &[0u8; 8]);
+    }
+
+    // ---- MultiAtrunc journal (multi-region, length-changing commit) --------
+
+    // Pad a staged block to a multiple of 8 (blocks start 8-aligned in the tail).
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn ma_pad(mut b: Vec<u8>) -> Vec<u8> {
+        while !b.len().is_multiple_of(8) {
+            b.push(0);
+        }
+        b
+    }
+
+    // A staged MultiAtrunc literal block `[s | e | 0 | data]`, 8-padded.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn ma_lit(start: u64, data: &[u8]) -> Vec<u8> {
+        let mut b = start.to_le_bytes().to_vec();
+        b.extend_from_slice(&(start + data.len() as u64).to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // kind = literal
+        b.extend_from_slice(data);
+        ma_pad(b)
+    }
+
+    // A staged MultiAtrunc compact repeat block `[s | e | 1 | phase | plen | pattern]`
+    // filling `fill` bytes — staged in O(pattern) bytes regardless of `fill`, 8-padded.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn ma_rep(start: u64, fill: u64, pattern: &[u8], phase: u64) -> Vec<u8> {
+        let mut b = start.to_le_bytes().to_vec();
+        b.extend_from_slice(&(start + fill).to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes()); // kind = repeat
+        b.extend_from_slice(&phase.to_le_bytes());
+        b.extend_from_slice(&(pattern.len() as u64).to_le_bytes());
+        b.extend_from_slice(pattern);
+        ma_pad(b)
+    }
+
+    // A staged MultiAtrunc cycle block `[n | k | 2 | counter | offsets… | snapshot]`,
+    // 8-padded. `snapshot` is the caller-supplied original bytes of `offsets[k-1]`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn ma_cycle(n: u64, offsets: &[u64], counter: u64, snapshot: &[u8]) -> Vec<u8> {
+        let mut b = n.to_le_bytes().to_vec();
+        b.extend_from_slice(&(offsets.len() as u64).to_le_bytes()); // k
+        b.extend_from_slice(&2u64.to_le_bytes()); // kind = cycle
+        b.extend_from_slice(&counter.to_le_bytes());
+        for off in offsets {
+            b.extend_from_slice(&off.to_le_bytes());
+        }
+        b.extend_from_slice(snapshot);
+        ma_pad(b)
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn multi_atrunc_writer_grows_with_mixed_blocks() {
+        use crate::io_core::{MaSpec, OverlayData};
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'.'; 300]).unwrap();
+        drop(s);
+
+        // Grow 300 -> 400: a literal at [0,50) and a repeat filling the grown
+        // region [300,400); the gap [50,300) keeps its old committed bytes.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
+            let aaa = vec![b'A'; 50];
+            let mut clen = 300u64;
+            let blocks = [
+                MaSpec::Write(0, OverlayData::Literal(&aaa)),
+                MaSpec::Write(
+                    300,
+                    OverlayData::Repeat {
+                        pattern: b"Z",
+                        phase: 0,
+                        len: 100,
+                    },
+                ),
+            ];
+            crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 400, &blocks).unwrap();
+            assert_eq!(clen, 400);
+        }
+
+        let s2 = BStack::open(&p).unwrap();
+        let mut expect = vec![b'A'; 50];
+        expect.extend_from_slice(&[b'.'; 250]);
+        expect.extend_from_slice(&[b'Z'; 100]);
+        assert_eq!(s2.len().unwrap(), 400);
+        assert_eq!(s2.peek(0).unwrap(), expect);
+        drop(s2);
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::io_core::HEADER_SIZE + 400,
+            "staging tail not dropped"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not disarmed");
+        assert_eq!(&raw[24..32], &[0u8; 8], "wip_aux not disarmed");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn multi_atrunc_writer_shrinks() {
+        use crate::io_core::{MaSpec, OverlayData};
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(vec![b'.'; 300]).unwrap();
+        drop(s);
+
+        // Shrink 300 -> 200 while overwriting [0,50).
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
+            let aaa = vec![b'A'; 50];
+            let mut clen = 300u64;
+            let blocks = [MaSpec::Write(0, OverlayData::Literal(&aaa))];
+            crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 200, &blocks).unwrap();
+            assert_eq!(clen, 200);
+        }
+
+        let s2 = BStack::open(&p).unwrap();
+        let mut expect = vec![b'A'; 50];
+        expect.extend_from_slice(&[b'.'; 150]);
+        assert_eq!(s2.len().unwrap(), 200);
+        assert_eq!(s2.peek(0).unwrap(), expect);
+        drop(s2);
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(raw.len() as u64, crate::io_core::HEADER_SIZE + 200);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_forward_multi_atrunc_grow() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path = std::env::temp_dir().join(format!("bstack_ma_grow_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // Armed grow 300 -> 400 (S = clen' = 400): committed payload, the grown
+        // zero region [300,400), then two staged blocks. Crash was after the arm,
+        // before the in-place replay — nothing applied yet.
+        let mut file = mw_wip_header(300, h + 400, u64::MAX - 6);
+        file.extend_from_slice(&[b'.'; 300]); // committed [0,300)
+        file.extend_from_slice(&[0u8; 100]); // grown region [300,400)
+        file.extend_from_slice(&ma_lit(0, &[b'A'; 50]));
+        file.extend_from_slice(&ma_rep(300, 100, b"Z", 0));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'A'; 50];
+        expect.extend_from_slice(&[b'.'; 250]);
+        expect.extend_from_slice(&[b'Z'; 100]);
+        assert_eq!(s.len().unwrap(), 400, "clen' read from wip_ptr");
+        assert_eq!(s.peek(0).unwrap(), expect, "grow batch rolled forward");
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + 400);
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr not cleared");
+        assert_eq!(&raw[24..32], &[0u8; 8], "wip_aux not cleared");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_forward_multi_atrunc_shrink() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_shrink_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // Armed shrink 300 -> 200 (S = clen = 300): staging sits at 32 + align8(300)
+        // = 32 + 304, so a 4-byte alignment gap precedes the tail.
+        let mut file = mw_wip_header(300, h + 200, u64::MAX - 6);
+        file.extend_from_slice(&[b'.'; 300]);
+        file.extend_from_slice(&[0u8; 4]); // pad payload region to align8(S)
+        file.extend_from_slice(&ma_lit(0, &[b'A'; 50]));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect = vec![b'A'; 50];
+        expect.extend_from_slice(&[b'.'; 150]);
+        assert_eq!(s.len().unwrap(), 200);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + 200);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_back_corrupt_multi_atrunc_tail() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_corrupt_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // clen' = 400, but the second block ends at 420 > clen' — the whole tail
+        // is corrupt, so recovery applies nothing and keeps the old length.
+        let mut file = mw_wip_header(300, h + 400, u64::MAX - 6);
+        file.extend_from_slice(&[b'.'; 300]);
+        file.extend_from_slice(&[0u8; 100]);
+        file.extend_from_slice(&ma_lit(0, &[b'A'; 50]));
+        file.extend_from_slice(&ma_lit(380, &[b'B'; 40])); // end 420 > 400
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 300, "rolled back to old length");
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'.'; 300],
+            "corrupt tail applies nothing"
+        );
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + 300);
+        assert_eq!(&raw[24..32], &[0u8; 8]);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn multi_atrunc_repeat_stages_compactly() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_compact_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // A 100 KB region filled by one repeat block, staged as a single 48-byte
+        // descriptor (24 header + 8 phase + 8 plen + 1 pattern = 41, 8-padded to 48)
+        // — not a 100 KB literal expansion. Same-length commit (clen' == clen),
+        // S == clen.
+        let fill = 100_000u64;
+        let mut file = mw_wip_header(fill, h + fill, u64::MAX - 6);
+        file.extend_from_slice(&vec![b'.'; fill as usize]);
+        let block = ma_rep(0, fill, b"Z", 0);
+        assert_eq!(
+            block.len(),
+            48,
+            "repeat descriptor is O(pattern), not O(fill)"
+        );
+        file.extend_from_slice(&block);
+        assert_eq!(
+            file.len() as u64,
+            h + fill + 48,
+            "armed file stages the fill compactly"
+        );
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), fill);
+        assert_eq!(
+            s.peek(0).unwrap(),
+            vec![b'Z'; fill as usize],
+            "repeat expanded on replay"
+        );
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + fill, "staging dropped after recovery");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_replays_long_multi_atrunc_repeat() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_longrep_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // A pattern longer than the streaming buffer (copied file → file) and a
+        // short one (read onto the stack), both with a non-zero phase.
+        let clen = 16_000u64;
+        let long: Vec<u8> = (0..5000u32).map(|i| (i * 13 % 256) as u8).collect();
+        let mut file = mw_wip_header(clen, h + clen, u64::MAX - 6);
+        file.extend_from_slice(&vec![b'.'; clen as usize]);
+        file.extend_from_slice(&ma_rep(0, 12_000, &long, 1234));
+        file.extend_from_slice(&ma_rep(12_000, 4_000, b"xyz", 2));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        let mut expect: Vec<u8> = (0..12_000).map(|i| long[(1234 + i) % 5000]).collect();
+        expect.extend((0..4_000).map(|i| b"xyz"[(2 + i) % 3]));
+        assert_eq!(s.len().unwrap(), clen);
+        assert_eq!(s.peek(0).unwrap(), expect);
+    }
+
+    // Payload of three tagged 100-byte regions A, B, C.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn abc_payload() -> Vec<u8> {
+        let mut v = vec![b'A'; 100];
+        v.extend_from_slice(&[b'B'; 100]);
+        v.extend_from_slice(&[b'C'; 100]);
+        v
+    }
+
+    // Expected rotation of `abc_payload` by one slot (content of i moves to i+1):
+    // [C, A, B].
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn cab_payload() -> Vec<u8> {
+        let mut v = vec![b'C'; 100];
+        v.extend_from_slice(&[b'A'; 100]);
+        v.extend_from_slice(&[b'B'; 100]);
+        v
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn multi_atrunc_writer_cycle_rotates() {
+        use crate::io_core::MaSpec;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(abc_payload()).unwrap();
+        drop(s);
+
+        // Rotate the three regions: content of offsets[i] moves to offsets[i+1].
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
+            let mut clen = 300u64;
+            let offsets = [0u64, 100, 200];
+            let specs = [MaSpec::Cycle {
+                offsets: &offsets,
+                n: 100,
+            }];
+            crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 300, &specs).unwrap();
+            assert_eq!(clen, 300);
+        }
+
+        let s2 = BStack::open(&p).unwrap();
+        assert_eq!(
+            s2.peek(0).unwrap(),
+            cab_payload(),
+            "3-cycle rotated i -> i+1"
+        );
+        drop(s2);
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::io_core::HEADER_SIZE + 300,
+            "staging dropped"
+        );
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr disarmed");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn multi_atrunc_writer_cycle_with_write_and_grow() {
+        use crate::io_core::{MaSpec, OverlayData};
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(abc_payload()).unwrap();
+        drop(s);
+
+        // One commit: rotate [0,300) AND grow 300 -> 450 with a literal in the new tail.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .unwrap();
+            let mut clen = 300u64;
+            let offsets = [0u64, 100, 200];
+            let zzz = vec![b'Z'; 150];
+            let specs = [
+                MaSpec::Cycle {
+                    offsets: &offsets,
+                    n: 100,
+                },
+                MaSpec::Write(300, OverlayData::Literal(&zzz)),
+            ];
+            crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 450, &specs).unwrap();
+            assert_eq!(clen, 450);
+        }
+
+        let s2 = BStack::open(&p).unwrap();
+        let mut expect = cab_payload();
+        expect.extend_from_slice(&[b'Z'; 150]);
+        assert_eq!(s2.len().unwrap(), 450);
+        assert_eq!(
+            s2.peek(0).unwrap(),
+            expect,
+            "cycle + write + grow as one commit"
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_forward_multi_atrunc_cycle_fresh() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_cyc_fresh_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // Armed cycle, no step performed yet (counter == k == 3). Snapshot holds
+        // the original last region (C). S = clen = clen' = 300.
+        let mut file = mw_wip_header(300, h + 300, u64::MAX - 6);
+        file.extend_from_slice(&abc_payload());
+        file.extend_from_slice(&[0u8; 4]); // pad payload region to align8(S=300)=304
+        file.extend_from_slice(&ma_cycle(100, &[0, 100, 200], 3, &[b'C'; 100]));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(
+            s.peek(0).unwrap(),
+            cab_payload(),
+            "fresh cycle rolled forward"
+        );
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + 300, "staging dropped");
+        assert_eq!(&raw[16..24], &[0u8; 8], "wip_ptr cleared");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_resumes_multi_atrunc_cycle_midway() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_cyc_resume_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // Crash mid-cycle: steps j=2 and j=1 already applied on disk (so [200,300)=B
+        // and [100,200)=A), only the final step j=0 (off[0] <- snapshot) remains, so
+        // counter == 1 and off[0] still holds original A. The snapshot still holds C.
+        // Resuming from counter == 1 must yield [C, A, B]; wrongly restarting from
+        // k == 3 would instead give [C, A, A].
+        let mut on_disk = vec![b'A'; 100]; // off[0] not yet rotated
+        on_disk.extend_from_slice(&[b'A'; 100]); // off[1] already got A
+        on_disk.extend_from_slice(&[b'B'; 100]); // off[2] already got B
+        let mut file = mw_wip_header(300, h + 300, u64::MAX - 6);
+        file.extend_from_slice(&on_disk);
+        file.extend_from_slice(&[0u8; 4]); // pad payload region to align8(S=300)=304
+        file.extend_from_slice(&ma_cycle(100, &[0, 100, 200], 1, &[b'C'; 100]));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(
+            s.peek(0).unwrap(),
+            cab_payload(),
+            "cycle resumed from its counter, not restarted"
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_rolls_back_corrupt_multi_atrunc_cycle() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_cyc_bad_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // A cycle region runs past clen' (250 + 100 = 350 > 300): the tail is
+        // malformed, so recovery applies nothing and keeps the old length.
+        let mut file = mw_wip_header(300, h + 300, u64::MAX - 6);
+        file.extend_from_slice(&abc_payload());
+        file.extend_from_slice(&[0u8; 4]); // pad payload region to align8(S=300)=304
+        file.extend_from_slice(&ma_cycle(100, &[0, 100, 250], 3, &[b'C'; 100]));
+        std::fs::write(&path, &file).unwrap();
+
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(s.len().unwrap(), 300, "rolled back to old length");
+        assert_eq!(
+            s.peek(0).unwrap(),
+            abc_payload(),
+            "corrupt cycle applies nothing"
+        );
+        drop(s);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw.len() as u64, h + 300);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn recovery_checks_unsorted_multi_atrunc_cycle_disjointness() {
+        let h = crate::io_core::HEADER_SIZE;
+        let path =
+            std::env::temp_dir().join(format!("bstack_ma_cyc_unsorted_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // Disjoint but unsorted: C(200) → 0, A(0) → 100, B(100) → 200 gives [C, A, B].
+        // The snapshot holds the original last region, B.
+        let mut file = mw_wip_header(300, h + 300, u64::MAX - 6);
+        file.extend_from_slice(&abc_payload());
+        file.extend_from_slice(&[0u8; 4]); // pad payload region to align8(S=300)=304
+        file.extend_from_slice(&ma_cycle(100, &[200, 0, 100], 3, &[b'B'; 100]));
+        std::fs::write(&path, &file).unwrap();
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(
+            s.peek(0).unwrap(),
+            cab_payload(),
+            "unsorted cycle rolled forward"
+        );
+        drop(s);
+
+        // [150, 250) overlaps [200, 300), though neither adjacent pair in staged order
+        // overlaps: the tail is malformed, so recovery keeps the old payload.
+        let mut file = mw_wip_header(300, h + 300, u64::MAX - 6);
+        file.extend_from_slice(&abc_payload());
+        file.extend_from_slice(&[0u8; 4]);
+        file.extend_from_slice(&ma_cycle(100, &[200, 0, 150], 3, &[b'C'; 100]));
+        std::fs::write(&path, &file).unwrap();
+        let s = BStack::open(&path).unwrap();
+        assert_eq!(
+            s.peek(0).unwrap(),
+            abc_payload(),
+            "overlapping cycle applies nothing"
+        );
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]
