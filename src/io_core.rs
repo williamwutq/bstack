@@ -1308,16 +1308,24 @@ pub(crate) fn recover_multi_write(
 
 // --------------------------------------- Multi-atrunc journal --------------------------------------
 
-/// One entry in a [`journaled_multi_atrunc`] batch.
-///
-/// A `Write` places bytes into a single range; a `Cycle` rotates several equal-
-/// length regions. Both are staged as tagged blocks in the same tail. See the
+/// One raw operation in a [`journaled_multi_atrunc`] batch, referencing its
+/// source directly, either a caller buffer or a disk reference / region.
+/// Every kind is staged as a tagged block in the same tail. See the
 /// *Multi-atrunc journal* in `algos/WIP.md`.
 #[cfg(all(feature = "set", feature = "atomic"))]
 #[allow(dead_code)]
 pub(crate) enum MaSpec<'a> {
-    /// Write `data` into `[offset, offset + data.len())` (staged as `Literal`/`Repeat`).
-    Write(u64, OverlayData<'a>),
+    /// Write `data` into `[offset, offset + data.len())`.
+    Literal { offset: u64, data: &'a [u8] },
+    /// Fill `[offset, offset + len)` with `pattern` rotated to start at `phase`,
+    /// staged as a compact descriptor. `pattern` is non-empty and
+    /// `phase < pattern.len()`.
+    Repeat {
+        offset: u64,
+        pattern: &'a [u8],
+        phase: usize,
+        len: u64,
+    },
     /// Rotate `k` disjoint `n`-byte regions: the content of `offsets[i]` moves to
     /// `offsets[(i + 1) % k]` (and `offsets[k - 1]` to `offsets[0]`). Requires
     /// `k >= 2` and `n > 0`.
@@ -1335,10 +1343,8 @@ pub(crate) enum MaSpec<'a> {
 #[inline]
 fn ma_block_len(spec: &MaSpec) -> Option<u64> {
     let raw = match spec {
-        MaSpec::Write(_, OverlayData::Literal(x)) => 24u64.checked_add(x.len() as u64)?,
-        MaSpec::Write(_, OverlayData::Repeat { pattern, .. }) => {
-            40u64.checked_add(pattern.len() as u64)?
-        }
+        MaSpec::Literal { data, .. } => 24u64.checked_add(data.len() as u64)?,
+        MaSpec::Repeat { pattern, .. } => 40u64.checked_add(pattern.len() as u64)?,
         MaSpec::Cycle { offsets, n } => 32u64
             .checked_add((offsets.len() as u64).checked_mul(8)?)?
             .checked_add(*n)?,
@@ -1385,11 +1391,11 @@ fn replay_cycle(
 /// fuses an `atrunc` with a multi-write, which no single existing mode expresses
 /// ([`journaled_multi_set`] pins `clen`; a splice stages exactly one region).
 ///
-/// Each [`MaSpec::Write`] target and each [`MaSpec::Cycle`] region must lie in
+/// Each [`MaSpec`] target, including every [`MaSpec::Cycle`] region, must lie in
 /// `[0, clen_new)`, and all targets/regions across the batch must be pairwise
 /// non-overlapping. Gaps in `[0, clen_new)` keep whatever they held — old
 /// committed bytes below `min(clen, clen_new)`, or (on a grow) sparse zeros above
-/// the old end, which cost no write I/O. A [`OverlayData::Repeat`] stages a compact
+/// the old end, which cost no write I/O. A [`MaSpec::Repeat`] stages a compact
 /// descriptor (`O(pattern)`, not `O(count·len)`); a [`MaSpec::Cycle`] stages one
 /// region's snapshot regardless of `k`.
 ///
@@ -1445,29 +1451,33 @@ pub(crate) fn journaled_multi_atrunc(
     for spec in specs {
         let blen = ma_block_len(spec).ok_or_else(overflow)?;
         match spec {
-            MaSpec::Write(offset, d) => {
-                debug_assert!(
-                    offset.saturating_add(d.len()) <= clen_new,
-                    "block past clen'"
-                );
-                // `[s | e | kind]`, and `[phase | plen]` for a repeat.
+            MaSpec::Literal { offset, data } => {
+                let len = data.len() as u64;
+                debug_assert!(offset.saturating_add(len) <= clen_new, "block past clen'");
+                // `[s | e | kind]`.
+                let mut hdr = [0u8; 24];
+                hdr[0..8].copy_from_slice(&offset.to_le_bytes());
+                hdr[8..16].copy_from_slice(&(offset + len).to_le_bytes());
+                hdr[16..24].copy_from_slice(&MA_LITERAL.to_le_bytes());
+                write_at(file, pos, &hdr)?;
+                write_at(file, pos + 24, data)?;
+            }
+            MaSpec::Repeat {
+                offset,
+                pattern,
+                phase,
+                len,
+            } => {
+                debug_assert!(offset.saturating_add(*len) <= clen_new, "block past clen'");
+                // `[s | e | kind | phase | plen]`.
                 let mut hdr = [0u8; 40];
                 hdr[0..8].copy_from_slice(&offset.to_le_bytes());
-                hdr[8..16].copy_from_slice(&(offset + d.len()).to_le_bytes());
-                let (hlen, body) = match d {
-                    OverlayData::Literal(x) => {
-                        hdr[16..24].copy_from_slice(&MA_LITERAL.to_le_bytes());
-                        (24, *x)
-                    }
-                    OverlayData::Repeat { pattern, phase, .. } => {
-                        hdr[16..24].copy_from_slice(&MA_REPEAT.to_le_bytes());
-                        hdr[24..32].copy_from_slice(&(*phase as u64).to_le_bytes());
-                        hdr[32..40].copy_from_slice(&(pattern.len() as u64).to_le_bytes());
-                        (40, *pattern)
-                    }
-                };
-                write_at(file, pos, &hdr[..hlen])?;
-                write_at(file, pos + hlen as u64, body)?;
+                hdr[8..16].copy_from_slice(&(offset + len).to_le_bytes());
+                hdr[16..24].copy_from_slice(&MA_REPEAT.to_le_bytes());
+                hdr[24..32].copy_from_slice(&(*phase as u64).to_le_bytes());
+                hdr[32..40].copy_from_slice(&(pattern.len() as u64).to_le_bytes());
+                write_at(file, pos, &hdr)?;
+                write_at(file, pos + 40, pattern)?;
             }
             MaSpec::Cycle { offsets, n } => {
                 let k = offsets.len() as u64;
@@ -1515,15 +1525,13 @@ pub(crate) fn journaled_multi_atrunc(
     for spec in specs {
         let blen = ma_block_len(spec).ok_or_else(overflow)?;
         match spec {
-            MaSpec::Write(offset, OverlayData::Literal(x)) => write_at(file, *offset, x)?,
-            MaSpec::Write(
+            MaSpec::Literal { offset, data } => write_at(file, *offset, data)?,
+            MaSpec::Repeat {
                 offset,
-                OverlayData::Repeat {
-                    pattern,
-                    phase,
-                    len,
-                },
-            ) => {
+                pattern,
+                phase,
+                len,
+            } => {
                 file.seek(SeekFrom::Start(HEADER_SIZE + offset))?;
                 write_pattern(file, pattern, *phase, *len)?;
             }
@@ -1545,11 +1553,12 @@ pub(crate) fn journaled_multi_atrunc(
     file.set_len(HEADER_SIZE + clen_new)
 }
 
-/// One parsed block from a [`WipAux::MultiAtrunc`] staged tail, ready to replay
-/// into `[dst, dst + len)`. Offsets are logical (payload-relative, as everywhere
-/// else in this module); the staged source lies in the tail, disjoint from every
-/// target.
-enum MaBlock {
+/// A raw operation on the disk image: every source it references is a region of
+/// the file, not a caller buffer. Recovery parses one from each block of a
+/// [`WipAux::MultiAtrunc`] staged tail. Offsets are logical (payload-relative, as
+/// everywhere else in this module); each staged source lies in the tail, disjoint
+/// from every target.
+enum DiskOp {
     /// Copy `len` staged literal bytes (at logical `src_logical`) into the target.
     Literal {
         dst: u64,
@@ -1596,7 +1605,7 @@ fn walk_multi_atrunc_blocks(
     clen_new: u64,
     tail_start: u64,
     raw_size: u64,
-    mut apply: impl FnMut(&mut File, MaBlock) -> io::Result<()>,
+    mut apply: impl FnMut(&mut File, DiskOp) -> io::Result<()>,
 ) -> io::Result<bool> {
     let mut cursor = tail_start;
     while cursor < raw_size {
@@ -1623,7 +1632,7 @@ fn walk_multi_atrunc_blocks(
                 }
                 apply(
                     file,
-                    MaBlock::Literal {
+                    DiskOp::Literal {
                         dst: s,
                         src_logical: payload_phys - HEADER_SIZE,
                         len: fill,
@@ -1655,7 +1664,7 @@ fn walk_multi_atrunc_blocks(
                 }
                 apply(
                     file,
-                    MaBlock::Repeat {
+                    DiskOp::Repeat {
                         dst: s,
                         pattern_logical: pattern_phys - HEADER_SIZE,
                         plen,
@@ -1713,7 +1722,7 @@ fn walk_multi_atrunc_blocks(
                 }
                 apply(
                     file,
-                    MaBlock::Cycle {
+                    DiskOp::Cycle {
                         n,
                         k,
                         counter,
@@ -1774,19 +1783,19 @@ pub(crate) fn recover_multi_atrunc(
             tail_start,
             raw_size,
             |f, block| match block {
-                MaBlock::Literal {
+                DiskOp::Literal {
                     dst,
                     src_logical,
                     len,
                 } => move_chunked(f, src_logical, dst, len),
-                MaBlock::Repeat {
+                DiskOp::Repeat {
                     dst,
                     pattern_logical,
                     plen,
                     phase,
                     len,
                 } => replay_staged_pattern(f, pattern_logical, plen, phase, dst, len),
-                MaBlock::Cycle {
+                DiskOp::Cycle {
                     n,
                     k,
                     counter,

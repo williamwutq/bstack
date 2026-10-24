@@ -9545,7 +9545,7 @@ mod atomic_tests {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
     fn multi_atrunc_writer_grows_with_mixed_blocks() {
-        use crate::io_core::{MaSpec, OverlayData};
+        use crate::io_core::MaSpec;
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
         s.push(vec![b'.'; 300]).unwrap();
@@ -9562,15 +9562,16 @@ mod atomic_tests {
             let aaa = vec![b'A'; 50];
             let mut clen = 300u64;
             let blocks = [
-                MaSpec::Write(0, OverlayData::Literal(&aaa)),
-                MaSpec::Write(
-                    300,
-                    OverlayData::Repeat {
-                        pattern: b"Z",
-                        phase: 0,
-                        len: 100,
-                    },
-                ),
+                MaSpec::Literal {
+                    offset: 0,
+                    data: &aaa,
+                },
+                MaSpec::Repeat {
+                    offset: 300,
+                    pattern: b"Z",
+                    phase: 0,
+                    len: 100,
+                },
             ];
             crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 400, &blocks).unwrap();
             assert_eq!(clen, 400);
@@ -9597,7 +9598,7 @@ mod atomic_tests {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
     fn multi_atrunc_writer_shrinks() {
-        use crate::io_core::{MaSpec, OverlayData};
+        use crate::io_core::MaSpec;
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
         s.push(vec![b'.'; 300]).unwrap();
@@ -9612,7 +9613,10 @@ mod atomic_tests {
                 .unwrap();
             let aaa = vec![b'A'; 50];
             let mut clen = 300u64;
-            let blocks = [MaSpec::Write(0, OverlayData::Literal(&aaa))];
+            let blocks = [MaSpec::Literal {
+                offset: 0,
+                data: &aaa,
+            }];
             crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 200, &blocks).unwrap();
             assert_eq!(clen, 200);
         }
@@ -9843,7 +9847,7 @@ mod atomic_tests {
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
     fn multi_atrunc_writer_cycle_with_write_and_grow() {
-        use crate::io_core::{MaSpec, OverlayData};
+        use crate::io_core::MaSpec;
         let (s, p) = mk_stack();
         let _g = Guard(p.clone());
         s.push(abc_payload()).unwrap();
@@ -9864,7 +9868,10 @@ mod atomic_tests {
                     offsets: &offsets,
                     n: 100,
                 },
-                MaSpec::Write(300, OverlayData::Literal(&zzz)),
+                MaSpec::Literal {
+                    offset: 300,
+                    data: &zzz,
+                },
             ];
             crate::io_core::journaled_multi_atrunc(&mut f, &mut clen, 450, &specs).unwrap();
             assert_eq!(clen, 450);
