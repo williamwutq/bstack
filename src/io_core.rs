@@ -1317,6 +1317,8 @@ pub(crate) fn recover_multi_write(
 pub(crate) enum MaSpec<'a> {
     /// Write `data` into `[offset, offset + data.len())`.
     Literal { offset: u64, data: &'a [u8] },
+    /// As `Literal`, with bytes the batch owns, such as a materialized reference.
+    Owned { offset: u64, data: Vec<u8> },
     /// Fill `[offset, offset + len)` with `pattern` rotated to start at `phase`,
     /// staged as a compact descriptor. `pattern` is non-empty and
     /// `phase < pattern.len()`.
@@ -1344,12 +1346,32 @@ pub(crate) enum MaSpec<'a> {
 fn ma_block_len(spec: &MaSpec) -> Option<u64> {
     let raw = match spec {
         MaSpec::Literal { data, .. } => 24u64.checked_add(data.len() as u64)?,
+        MaSpec::Owned { data, .. } => 24u64.checked_add(data.len() as u64)?,
         MaSpec::Repeat { pattern, .. } => 40u64.checked_add(pattern.len() as u64)?,
         MaSpec::Cycle { offsets, n } => 32u64
             .checked_add((offsets.len() as u64).checked_mul(8)?)?
             .checked_add(*n)?,
     };
     raw.checked_next_multiple_of(8)
+}
+
+/// Stage a literal block `[s | e | kind | data]` at logical `pos`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn stage_literal(
+    file: &mut File,
+    pos: u64,
+    offset: u64,
+    data: &[u8],
+    clen_new: u64,
+) -> io::Result<()> {
+    let len = data.len() as u64;
+    debug_assert!(offset.saturating_add(len) <= clen_new, "block past clen'");
+    let mut hdr = [0u8; 24];
+    hdr[0..8].copy_from_slice(&offset.to_le_bytes());
+    hdr[8..16].copy_from_slice(&(offset + len).to_le_bytes());
+    hdr[16..24].copy_from_slice(&MA_LITERAL.to_le_bytes());
+    write_at(file, pos, &hdr)?;
+    write_at(file, pos + 24, data)
 }
 
 /// Run (or resume) a cyclic rotation's ordered steps, persisting progress after
@@ -1451,17 +1473,8 @@ pub(crate) fn journaled_multi_atrunc(
     for spec in specs {
         let blen = ma_block_len(spec).ok_or_else(overflow)?;
         match spec {
-            MaSpec::Literal { offset, data } => {
-                let len = data.len() as u64;
-                debug_assert!(offset.saturating_add(len) <= clen_new, "block past clen'");
-                // `[s | e | kind]`.
-                let mut hdr = [0u8; 24];
-                hdr[0..8].copy_from_slice(&offset.to_le_bytes());
-                hdr[8..16].copy_from_slice(&(offset + len).to_le_bytes());
-                hdr[16..24].copy_from_slice(&MA_LITERAL.to_le_bytes());
-                write_at(file, pos, &hdr)?;
-                write_at(file, pos + 24, data)?;
-            }
+            MaSpec::Literal { offset, data } => stage_literal(file, pos, *offset, data, clen_new)?,
+            MaSpec::Owned { offset, data } => stage_literal(file, pos, *offset, data, clen_new)?,
             MaSpec::Repeat {
                 offset,
                 pattern,
@@ -1526,6 +1539,7 @@ pub(crate) fn journaled_multi_atrunc(
         let blen = ma_block_len(spec).ok_or_else(overflow)?;
         match spec {
             MaSpec::Literal { offset, data } => write_at(file, *offset, data)?,
+            MaSpec::Owned { offset, data } => write_at(file, *offset, data)?,
             MaSpec::Repeat {
                 offset,
                 pattern,
@@ -1551,6 +1565,541 @@ pub(crate) fn journaled_multi_atrunc(
     durable_sync(file)?;
     // 5. Drop the staged tail, restoring `file_size == HEADER_SIZE + clen_new`.
     file.set_len(HEADER_SIZE + clen_new)
+}
+
+/// What one target range of a [`MaImage`] holds. Every piece references a real
+/// object: a caller buffer, bytes the image owns, or the committed disk image,
+/// never another piece.
+#[cfg(all(feature = "set", feature = "atomic"))]
+enum MaPiece<'a> {
+    Literal(&'a [u8]),
+    Owned(Vec<u8>),
+    /// `len` bytes of `pattern` rotated to start at `phase`; `phase < pattern.len()`.
+    Repeat {
+        pattern: &'a [u8],
+        phase: usize,
+        len: u64,
+    },
+    /// Region `index` of live cycle `cycle`: a reference to the committed bytes of
+    /// the cycle's previous region, as long as the cycle's `n`. Never split; the
+    /// cycle is materialized first.
+    Member {
+        cycle: usize,
+        index: usize,
+    },
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+impl<'a> MaPiece<'a> {
+    /// Byte length of the piece; a cycle region's comes from its live cycle.
+    fn len(&self, cycles: &[Option<(&[u64], u64)>]) -> u64 {
+        match self {
+            MaPiece::Literal(d) => d.len() as u64,
+            MaPiece::Owned(v) => v.len() as u64,
+            MaPiece::Repeat { len, .. } => *len,
+            MaPiece::Member { cycle, .. } => cycles[*cycle].expect("member of a live cycle").1,
+        }
+    }
+
+    /// The piece covering local `[a, b)`, consuming `self` so an owned piece keeps
+    /// its allocation.
+    fn sub(self, a: u64, b: u64) -> MaPiece<'a> {
+        match self {
+            MaPiece::Owned(mut v) => {
+                v.truncate(b as usize);
+                v.drain(..a as usize);
+                MaPiece::Owned(v)
+            }
+            p => p.sub_ref(a, b),
+        }
+    }
+
+    /// The piece covering local `[a, b)`; an owned piece copies its bytes.
+    fn sub_ref(&self, a: u64, b: u64) -> MaPiece<'a> {
+        match self {
+            MaPiece::Literal(d) => MaPiece::Literal(&d[a as usize..b as usize]),
+            MaPiece::Owned(v) => MaPiece::Owned(v[a as usize..b as usize].to_vec()),
+            MaPiece::Repeat { pattern, phase, .. } => MaPiece::Repeat {
+                pattern,
+                // Reduce `a` first so the sum cannot overflow (see `OverlayData::subrange`).
+                phase: (phase + (a % pattern.len() as u64) as usize) % pattern.len(),
+                len: b - a,
+            },
+            MaPiece::Member { .. } => unreachable!("cycle member split before materializing"),
+        }
+    }
+}
+
+/// Move `piece` out, leaving an empty literal to be overwritten.
+#[cfg(all(feature = "set", feature = "atomic"))]
+fn take_piece<'a>(piece: &mut MaPiece<'a>) -> MaPiece<'a> {
+    std::mem::replace(piece, MaPiece::Literal(&[]))
+}
+
+/// One piece of a [`MaImage`], starting at `start`; never empty.
+#[cfg(all(feature = "set", feature = "atomic"))]
+struct MaEntry<'a> {
+    start: u64,
+    piece: MaPiece<'a>,
+}
+
+/// The single zero byte that zero-filled pieces repeat.
+#[cfg(all(feature = "set", feature = "atomic"))]
+const ZERO: &[u8] = &[0];
+
+/// The payload a batch of edits makes the caller see, as if they had already
+/// committed, kept as references for [`journaled_multi_atrunc`]. The multi-atrunc
+/// counterpart of [`inplace_overlay_insert`] and [`inplace_overlay_read`].
+///
+/// Entries are sorted, non-overlapping pieces; a later edit wins on overlapping
+/// bytes. A gap below the committed length is the committed disk image there, and
+/// a gap above it reads as zero. A source range is resolved when the edit is
+/// issued, so every piece references a caller buffer, owned bytes, or the
+/// committed disk image, which stays unchanged until commit.
+///
+/// A rotation of untouched committed regions stays a reference, staged as one
+/// `Cycle`. Any edit that would break it, such as a write into one of its regions,
+/// a copy into one, or a shrink past one, first materializes the whole cycle into
+/// owned bytes, since its remaining references can no longer be staged as a cycle.
+///
+/// Marked `dead_code` until its caller lands, like [`journaled_multi_atrunc`].
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[allow(dead_code)]
+pub(crate) struct MaImage<'a> {
+    /// Committed payload length.
+    base_len: u64,
+    /// Payload length the caller sees.
+    len: u64,
+    entries: Vec<MaEntry<'a>>,
+    /// Cycles by id, `None` once materialized.
+    cycles: Vec<Option<(&'a [u64], u64)>>,
+}
+
+#[cfg(all(feature = "set", feature = "atomic"))]
+#[allow(dead_code)]
+impl<'a> MaImage<'a> {
+    /// An image with no edits over a committed payload of `base_len` bytes.
+    pub(crate) fn new(base_len: u64) -> Self {
+        MaImage {
+            base_len,
+            len: base_len,
+            entries: Vec::new(),
+            cycles: Vec::new(),
+        }
+    }
+
+    /// Payload length the caller sees.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Write `data` at `offset`. `[offset, offset + data.len())` must lie within
+    /// [`len`](Self::len).
+    pub(crate) fn write(&mut self, file: &mut File, offset: u64, data: &'a [u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.check_range(offset, data.len() as u64)?;
+        self.insert(file, offset, MaPiece::Literal(data))
+    }
+
+    /// As [`write`](Self::write), with bytes the image takes ownership of.
+    pub(crate) fn write_owned(
+        &mut self,
+        file: &mut File,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.check_range(offset, data.len() as u64)?;
+        self.insert(file, offset, MaPiece::Owned(data))
+    }
+
+    /// Fill `count` copies of `pattern` from `offset`.
+    pub(crate) fn repeat(
+        &mut self,
+        file: &mut File,
+        offset: u64,
+        pattern: &'a [u8],
+        count: u64,
+    ) -> io::Result<()> {
+        if pattern.is_empty() || count == 0 {
+            return Ok(());
+        }
+        let len = (pattern.len() as u64).checked_mul(count).ok_or_else(|| {
+            io_error!(
+                InvalidInput,
+                "multi-region commit: repeat length overflows u64"
+            )
+        })?;
+        self.check_range(offset, len)?;
+        let piece = MaPiece::Repeat {
+            pattern,
+            phase: 0,
+            len,
+        };
+        self.insert(file, offset, piece)
+    }
+
+    /// Copy `n` bytes of the image from `src` to `dst`, as `memmove`: the source
+    /// is read as it stands before the copy, so the ranges may overlap.
+    pub(crate) fn copy(&mut self, file: &mut File, src: u64, dst: u64, n: u64) -> io::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.check_range(src, n)?;
+        self.check_range(dst, n)?;
+        for (rel, piece) in self.resolve(file, src, n)? {
+            self.insert(file, dst + rel, piece)?;
+        }
+        Ok(())
+    }
+
+    /// Rotate `k = offsets.len()` disjoint `n`-byte regions: the content of
+    /// `offsets[i]` moves to `offsets[(i + 1) % k]`. `k < 2` or `n == 0` is a
+    /// no-op.
+    pub(crate) fn cycle(&mut self, file: &mut File, offsets: &'a [u64], n: u64) -> io::Result<()> {
+        let k = offsets.len();
+        if k < 2 || n == 0 {
+            return Ok(());
+        }
+        if usize::try_from(n).is_err() {
+            return Err(io_error!(
+                InvalidInput,
+                "multi-region commit: cycle region length exceeds usize"
+            ));
+        }
+        for &o in offsets {
+            self.check_range(o, n)?;
+        }
+        let mut sorted = offsets.to_vec();
+        sorted.sort_unstable();
+        // Equal lengths, so sorted regions are disjoint iff each ends by the next.
+        if sorted.windows(2).any(|w| w[0] + n > w[1]) {
+            return Err(io_error!(
+                InvalidInput,
+                "multi-region commit: cycle regions overlap"
+            ));
+        }
+        // Untouched committed regions: the rotation stays a reference.
+        let untouched = offsets.iter().all(|&o| {
+            let (lo, hi) = self.run(o, o + n);
+            o + n <= self.base_len && lo == hi
+        });
+        if untouched {
+            let cycle = self.cycles.len();
+            self.cycles.push(Some((offsets, n)));
+            self.entries
+                .extend(offsets.iter().enumerate().map(|(index, &start)| MaEntry {
+                    start,
+                    piece: MaPiece::Member { cycle, index },
+                }));
+            self.entries.sort_by_key(|e| e.start);
+            return Ok(());
+        }
+        // Otherwise resolve every source before writing any target.
+        let sources = offsets
+            .iter()
+            .map(|&o| self.resolve(file, o, n))
+            .collect::<io::Result<Vec<_>>>()?;
+        for (i, pieces) in sources.into_iter().enumerate() {
+            let dst = offsets[(i + 1) % k];
+            for (rel, piece) in pieces {
+                self.insert(file, dst + rel, piece)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Change the length to `new_len`. Bytes regrown below the committed length
+    /// read as zero, as after a shrink and a sparse extend.
+    pub(crate) fn resize(&mut self, file: &mut File, new_len: u64) -> io::Result<()> {
+        if new_len < self.len {
+            // A cycle with a region past the new end can no longer be staged.
+            self.break_cycles_in(file, new_len, self.len)?;
+            let i = self.entries.partition_point(|e| e.start < new_len);
+            self.entries.truncate(i);
+            if let Some(e) = self.entries.last_mut()
+                && e.start + e.piece.len(&self.cycles) > new_len
+            {
+                e.piece = take_piece(&mut e.piece).sub(0, new_len - e.start);
+            }
+        } else if self.len < self.base_len {
+            let zero_end = new_len.min(self.base_len);
+            if zero_end > self.len {
+                let piece = MaPiece::Repeat {
+                    pattern: ZERO,
+                    phase: 0,
+                    len: zero_end - self.len,
+                };
+                self.insert(file, self.len, piece)?;
+            }
+        }
+        self.len = new_len;
+        Ok(())
+    }
+
+    /// Read `[offset, offset + buf.len())` of the image into `buf`. Only gaps and
+    /// cycle regions touch the disk.
+    pub(crate) fn read(&self, file: &mut File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        let end = self.check_range(offset, buf.len() as u64)?;
+        let (lo, hi) = self.run(offset, end);
+        let mut at = offset;
+        for e in &self.entries[lo..hi] {
+            let s = e.start.max(offset);
+            let t = self.end(e).min(end);
+            if at < s {
+                self.read_gap(
+                    file,
+                    at,
+                    &mut buf[(at - offset) as usize..(s - offset) as usize],
+                )?;
+            }
+            let dst = &mut buf[(s - offset) as usize..(t - offset) as usize];
+            let rel = s - e.start;
+            match &e.piece {
+                MaPiece::Literal(d) => dst.copy_from_slice(&d[rel as usize..][..dst.len()]),
+                MaPiece::Owned(v) => dst.copy_from_slice(&v[rel as usize..][..dst.len()]),
+                MaPiece::Repeat { pattern, phase, .. } => {
+                    let plen = pattern.len();
+                    let base = (phase + (rel % plen as u64) as usize) % plen;
+                    for (i, b) in dst.iter_mut().enumerate() {
+                        *b = pattern[(base + i) % plen];
+                    }
+                }
+                MaPiece::Member { cycle, index } => {
+                    read_at(file, self.member_src(*cycle, *index) + rel, dst)?
+                }
+            }
+            at = t;
+        }
+        if at < end {
+            self.read_gap(file, at, &mut buf[(at - offset) as usize..])?;
+        }
+        Ok(())
+    }
+
+    /// The batch to commit: one spec per piece, plus one `Cycle` per live cycle.
+    pub(crate) fn into_specs(self) -> Vec<MaSpec<'a>> {
+        let mut specs = Vec::with_capacity(self.entries.len());
+        for e in self.entries {
+            specs.push(match e.piece {
+                MaPiece::Literal(data) => MaSpec::Literal {
+                    offset: e.start,
+                    data,
+                },
+                MaPiece::Owned(data) => MaSpec::Owned {
+                    offset: e.start,
+                    data,
+                },
+                MaPiece::Repeat {
+                    pattern,
+                    phase,
+                    len,
+                } => MaSpec::Repeat {
+                    offset: e.start,
+                    pattern,
+                    phase,
+                    len,
+                },
+                MaPiece::Member { .. } => continue,
+            });
+        }
+        specs.extend(
+            self.cycles
+                .into_iter()
+                .flatten()
+                .map(|(offsets, n)| MaSpec::Cycle { offsets, n }),
+        );
+        specs
+    }
+
+    /// Commit the image through [`journaled_multi_atrunc`]. `*clen` is the
+    /// committed length the image was built over.
+    pub(crate) fn commit(self, file: &mut File, clen: &mut u64) -> io::Result<()> {
+        debug_assert_eq!(*clen, self.base_len, "image built over another length");
+        let len = self.len;
+        journaled_multi_atrunc(file, clen, len, &self.into_specs())
+    }
+
+    /// Check `[offset, offset + len)` lies within the image; returns its end.
+    fn check_range(&self, offset: u64, len: u64) -> io::Result<u64> {
+        let end = crate::checked_end(offset, len, "multi-region commit: range end overflows u64")?;
+        if end > self.len {
+            return Err(io_error!(
+                InvalidInput,
+                format!(
+                    "multi-region commit: range [{offset}, {end}) exceeds payload size ({})",
+                    self.len
+                )
+            ));
+        }
+        Ok(end)
+    }
+
+    /// End of entry `e`.
+    fn end(&self, e: &MaEntry) -> u64 {
+        e.start + e.piece.len(&self.cycles)
+    }
+
+    /// Index range of the entries intersecting `[start, end)`.
+    fn run(&self, start: u64, end: u64) -> (usize, usize) {
+        let lo = self.entries.partition_point(|e| self.end(e) <= start);
+        let hi = self.entries.partition_point(|e| e.start < end);
+        (lo, hi)
+    }
+
+    /// Logical offset of the committed bytes cycle member `index` references.
+    fn member_src(&self, cycle: usize, index: usize) -> u64 {
+        let (offsets, _) = self.cycles[cycle].expect("member of a live cycle");
+        offsets[(index + offsets.len() - 1) % offsets.len()]
+    }
+
+    /// Read gap `[at, at + dst.len())`: committed bytes below `base_len`, zeros
+    /// above.
+    fn read_gap(&self, file: &mut File, at: u64, dst: &mut [u8]) -> io::Result<()> {
+        let disk = self.base_len.saturating_sub(at).min(dst.len() as u64) as usize;
+        read_at(file, at, &mut dst[..disk])?;
+        dst[disk..].fill(0);
+        Ok(())
+    }
+
+    /// Materialize every cycle with a region intersecting `[start, end)`.
+    fn break_cycles_in(&mut self, file: &mut File, start: u64, end: u64) -> io::Result<()> {
+        let (lo, hi) = self.run(start, end);
+        let mut ids: Vec<usize> = self.entries[lo..hi]
+            .iter()
+            .filter_map(|e| match e.piece {
+                MaPiece::Member { cycle, .. } => Some(cycle),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        for id in ids {
+            self.materialize_cycle(file, id)?;
+        }
+        Ok(())
+    }
+
+    /// Replace each region of cycle `id` with owned bytes read from its source.
+    fn materialize_cycle(&mut self, file: &mut File, id: usize) -> io::Result<()> {
+        let Some((offsets, n)) = self.cycles[id] else {
+            return Ok(());
+        };
+        // Read every region before changing any, so a failed read leaves the cycle whole.
+        let mut regions = Vec::with_capacity(offsets.len());
+        for index in 0..offsets.len() {
+            let mut bytes = vec![0u8; n as usize];
+            read_at(file, self.member_src(id, index), &mut bytes)?;
+            regions.push(bytes);
+        }
+        for (&start, bytes) in offsets.iter().zip(regions) {
+            let i = self.entries.partition_point(|e| e.start < start);
+            self.entries[i].piece = MaPiece::Owned(bytes);
+        }
+        self.cycles[id] = None;
+        Ok(())
+    }
+
+    /// Insert `piece` at `start`, keeping the surviving prefix and suffix of the
+    /// pieces it overlaps. `piece` is never a cycle region.
+    fn insert(&mut self, file: &mut File, start: u64, piece: MaPiece<'a>) -> io::Result<()> {
+        let end = start + piece.len(&self.cycles);
+        self.break_cycles_in(file, start, end)?;
+        let (mut lo, hi) = self.run(start, end);
+        // Only the run's first piece can start before `start`, and only its last
+        // can end after `end`; interior pieces are covered and dropped.
+        let mut suffix = None;
+        if lo < hi {
+            let last = &mut self.entries[hi - 1];
+            let last_len = last.piece.len(&self.cycles);
+            if last.start + last_len > end {
+                let rel = end - last.start;
+                // A last piece starting before `start` is also the first, which
+                // keeps its prefix below, so its suffix is a copy.
+                let piece = if last.start < start {
+                    last.piece.sub_ref(rel, last_len)
+                } else {
+                    take_piece(&mut last.piece).sub(rel, last_len)
+                };
+                suffix = Some(MaEntry { start: end, piece });
+            }
+            let first = &mut self.entries[lo];
+            if first.start < start {
+                // Keep the first piece in place, trimmed to its prefix.
+                first.piece = take_piece(&mut first.piece).sub(0, start - first.start);
+                lo += 1;
+            }
+        }
+        let repl = [Some(MaEntry { start, piece }), suffix];
+        self.entries.splice(lo..hi, repl.into_iter().flatten());
+        Ok(())
+    }
+
+    /// Resolve `[start, start + n)` of the image into pieces of real objects, as
+    /// `(offset from start, piece)`. Committed bytes are read into owned
+    /// pieces: outside an intact cycle, no staged block keeps a disk reference.
+    fn resolve(&self, file: &mut File, start: u64, n: u64) -> io::Result<Vec<(u64, MaPiece<'a>)>> {
+        let end = start + n;
+        let (lo, hi) = self.run(start, end);
+        let mut out = Vec::new();
+        let mut at = start;
+        for e in &self.entries[lo..hi] {
+            let s = e.start.max(start);
+            let t = self.end(e).min(end);
+            if at < s {
+                self.resolve_gap(file, at, s, start, &mut out)?;
+            }
+            let piece = match e.piece {
+                MaPiece::Member { cycle, index } => {
+                    let mut bytes = vec![0u8; (t - s) as usize];
+                    read_at(
+                        file,
+                        self.member_src(cycle, index) + (s - e.start),
+                        &mut bytes,
+                    )?;
+                    MaPiece::Owned(bytes)
+                }
+                ref p => p.sub_ref(s - e.start, t - e.start),
+            };
+            out.push((s - start, piece));
+            at = t;
+        }
+        if at < end {
+            self.resolve_gap(file, at, end, start, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Resolve gap `[a, b)`: committed bytes below `base_len` are read into an
+    /// owned piece, zeros above become a zero fill.
+    fn resolve_gap(
+        &self,
+        file: &mut File,
+        a: u64,
+        b: u64,
+        start: u64,
+        out: &mut Vec<(u64, MaPiece<'a>)>,
+    ) -> io::Result<()> {
+        let mid = b.min(self.base_len.max(a));
+        if a < mid {
+            let mut bytes = vec![0u8; (mid - a) as usize];
+            read_at(file, a, &mut bytes)?;
+            out.push((a - start, MaPiece::Owned(bytes)));
+        }
+        if mid < b {
+            let piece = MaPiece::Repeat {
+                pattern: ZERO,
+                phase: 0,
+                len: b - mid,
+            };
+            out.push((mid - start, piece));
+        }
+        Ok(())
+    }
 }
 
 /// A raw operation on the disk image: every source it references is a region of

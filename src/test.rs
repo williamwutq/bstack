@@ -10012,6 +10012,599 @@ mod atomic_tests {
         );
     }
 
+    // ---- MaImage (the multi-atrunc image) -----------------------------------
+
+    // One edit for `check_image`, owning its data so the image can borrow it.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    enum ImgOp {
+        Write(u64, Vec<u8>),
+        Owned(u64, Vec<u8>),
+        Repeat(u64, Vec<u8>, u64),
+        Copy(u64, u64, u64),
+        Cycle(Vec<u64>, u64),
+        Resize(u64),
+    }
+
+    // Distinct non-zero committed bytes, so zeros and misplaced bytes both show.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn img_base(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 % 255 + 1) as u8).collect()
+    }
+
+    // Apply `ops` to a `MaImage` over a stack holding `base` and to a plain model.
+    // After every op, check whole and windowed reads of the image against the
+    // model; then check the file was never written, commit, and check the stack
+    // holds the model.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn check_image(base: &[u8], ops: &[ImgOp]) {
+        use crate::io_core::MaImage;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        if !base.is_empty() {
+            s.push(base).unwrap();
+        }
+        drop(s);
+        let before = std::fs::read(&p).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p)
+            .unwrap();
+        let mut img = MaImage::new(base.len() as u64);
+        let mut model = base.to_vec();
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                ImgOp::Write(off, d) => {
+                    img.write(&mut f, *off, d).unwrap();
+                    model[*off as usize..][..d.len()].copy_from_slice(d);
+                }
+                ImgOp::Owned(off, d) => {
+                    img.write_owned(&mut f, *off, d.clone()).unwrap();
+                    model[*off as usize..][..d.len()].copy_from_slice(d);
+                }
+                ImgOp::Repeat(off, pat, count) => {
+                    img.repeat(&mut f, *off, pat, *count).unwrap();
+                    for j in 0..pat.len() * *count as usize {
+                        model[*off as usize + j] = pat[j % pat.len()];
+                    }
+                }
+                ImgOp::Copy(src, dst, n) => {
+                    img.copy(&mut f, *src, *dst, *n).unwrap();
+                    let (src, dst, n) = (*src as usize, *dst as usize, *n as usize);
+                    model.copy_within(src..src + n, dst);
+                }
+                ImgOp::Cycle(offs, n) => {
+                    img.cycle(&mut f, offs, *n).unwrap();
+                    let old = model.clone();
+                    let n = *n as usize;
+                    for (j, &o) in offs.iter().enumerate() {
+                        let dst = offs[(j + 1) % offs.len()] as usize;
+                        model[dst..dst + n].copy_from_slice(&old[o as usize..o as usize + n]);
+                    }
+                }
+                ImgOp::Resize(l) => {
+                    img.resize(&mut f, *l).unwrap();
+                    model.resize(*l as usize, 0);
+                }
+            }
+            assert_eq!(img.len(), model.len() as u64, "len after op {i}");
+            let mut buf = vec![0u8; model.len()];
+            img.read(&mut f, 0, &mut buf).unwrap();
+            assert_eq!(buf, model, "image after op {i}");
+            // Windows starting mid-piece and straddling piece boundaries.
+            for start in (0..model.len()).step_by(3) {
+                let end = (start + 11).min(model.len());
+                let mut w = vec![0u8; end - start];
+                img.read(&mut f, start as u64, &mut w).unwrap();
+                assert_eq!(w, &model[start..end], "read [{start}, {end}) after op {i}");
+            }
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "image edits wrote the file"
+        );
+        let mut clen = base.len() as u64;
+        img.commit(&mut f, &mut clen).unwrap();
+        assert_eq!(clen, model.len() as u64);
+        drop(f);
+        let s = BStack::open(&p).unwrap();
+        assert_eq!(s.peek(0).unwrap(), model, "committed payload");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_cycle_then_partial_writes() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 30, 60], 10),
+                // Inside one region.
+                ImgOp::Write(35, vec![0xAA; 3]),
+                // A gap and the start of a region.
+                ImgOp::Write(25, vec![0xBB; 10]),
+                // A whole region and past it.
+                ImgOp::Write(58, vec![0xCC; 14]),
+            ],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![10, 20, 30], 10), // adjacent regions
+                ImgOp::Write(19, vec![0xAA; 2]),    // straddles two regions
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_copies_through_cycle() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![10, 40, 70], 10),
+                ImgOp::Copy(40, 100, 10), // a whole region out
+                ImgOp::Copy(45, 0, 8),    // part of a region out
+                ImgOp::Copy(5, 72, 6),    // into a region
+                ImgOp::Write(12, vec![0xEE; 2]),
+            ],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![10, 40, 70], 10),
+                ImgOp::Copy(10, 40, 10), // one region onto another
+                ImgOp::Copy(35, 36, 40), // overlapping, across regions and gaps
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_repeated_and_reversed_cycles() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 20, 40], 10),
+                ImgOp::Cycle(vec![0, 20, 40], 10), // rotates the rotation
+                ImgOp::Cycle(vec![40, 20, 0], 10), // and back
+                ImgOp::Cycle(vec![20, 0], 10),     // a subset of the regions
+            ],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 20, 40], 10),
+                // Regions offset into the first cycle's regions and gaps.
+                ImgOp::Cycle(vec![5, 25, 45], 10),
+                ImgOp::Cycle(vec![90, 60, 75, 105], 15),
+                ImgOp::Cycle(vec![64, 3], 30), // across both earlier cycles
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_cycle_over_edited_and_grown_regions() {
+        check_image(
+            &img_base(80),
+            &[
+                ImgOp::Write(12, vec![1; 4]),
+                ImgOp::Cycle(vec![10, 30, 50], 10), // over a write
+                ImgOp::Resize(150),
+                ImgOp::Cycle(vec![100, 130, 20], 10), // grown zeros and committed bytes
+                ImgOp::Repeat(135, vec![9, 8, 7], 3),
+                ImgOp::Cycle(vec![130, 0, 75], 10), // straddles the committed end
+                ImgOp::Copy(70, 72, 60),
+            ],
+        );
+        // Nothing committed: every region starts as grown zeros.
+        check_image(
+            &[],
+            &[
+                ImgOp::Resize(60),
+                ImgOp::Write(5, vec![4; 10]),
+                ImgOp::Cycle(vec![0, 20, 40], 10),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_overlapping_copies_across_pieces() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Repeat(10, vec![1, 2, 3], 7),
+                ImgOp::Write(20, vec![5; 6]),
+                ImgOp::Owned(40, (100..115).collect()),
+                ImgOp::Copy(5, 12, 40),  // forward overlap
+                ImgOp::Copy(30, 22, 30), // backward overlap
+                ImgOp::Copy(0, 0, 120),  // onto itself
+                ImgOp::Copy(50, 51, 1),
+                ImgOp::Copy(119, 0, 1),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_splits_owned_and_repeat_pieces() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Owned(10, (0..40).collect()),
+                ImgOp::Write(20, vec![0xEE; 5]), // inside an owned piece
+                ImgOp::Owned(15, vec![0x77; 3]), // inside its prefix
+                ImgOp::Repeat(60, vec![1, 2, 3, 4, 5], 8),
+                ImgOp::Write(63, vec![0xDD; 4]), // inside a repeat, mid-period
+                ImgOp::Copy(61, 0, 15),          // a split repeat elsewhere
+                ImgOp::Write(25, vec![0x33; 40]), // across several pieces
+                ImgOp::Write(10, vec![0x44; 5]), // exactly one piece's bounds
+                ImgOp::Write(0, vec![0x11; 120]),
+                ImgOp::Write(119, vec![0x22]),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_shrink_and_regrow() {
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 40, 80], 10),
+                ImgOp::Resize(85),  // through a cycle region
+                ImgOp::Resize(150), // regrows zeros below and above the committed end
+                ImgOp::Write(118, vec![3; 4]),
+                ImgOp::Copy(80, 140, 10),
+                ImgOp::Resize(30),
+                ImgOp::Cycle(vec![0, 10], 10),
+                ImgOp::Resize(130),
+                ImgOp::Cycle(vec![25, 50], 10), // regrown zeros and committed bytes
+            ],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Owned(30, (0..50).collect()),
+                ImgOp::Resize(55), // through an owned piece
+                ImgOp::Resize(120),
+                ImgOp::Resize(0),
+                ImgOp::Resize(40),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_noop_edits() {
+        check_image(
+            &img_base(60),
+            &[
+                ImgOp::Write(5, vec![]),
+                ImgOp::Owned(60, vec![]),
+                ImgOp::Repeat(5, vec![], 3),
+                ImgOp::Repeat(5, vec![1], 0),
+                ImgOp::Copy(1, 2, 0),
+                ImgOp::Cycle(vec![3], 10),
+                ImgOp::Cycle(vec![0, 20], 0),
+                ImgOp::Resize(60),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_rejected_edits_leave_image_unchanged() {
+        use crate::io_core::MaImage;
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        s.push(img_base(60)).unwrap();
+        drop(s);
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p)
+            .unwrap();
+        let offsets = [0u64, 20, 40];
+        let mut img = MaImage::new(60);
+        img.cycle(&mut f, &offsets, 10).unwrap();
+        let mut expect = vec![0u8; 60];
+        img.read(&mut f, 0, &mut expect).unwrap();
+
+        let data = [1u8; 8];
+        let overlapping = [0u64, 5];
+        let past_end = [0u64, 55];
+        assert!(img.write(&mut f, 55, &data).is_err());
+        assert!(img.write(&mut f, u64::MAX, &data).is_err());
+        assert!(img.repeat(&mut f, 50, &data, 2).is_err());
+        assert!(img.repeat(&mut f, 0, &data, u64::MAX).is_err());
+        assert!(img.copy(&mut f, 55, 0, 10).is_err());
+        assert!(img.copy(&mut f, 0, 55, 10).is_err());
+        assert!(img.cycle(&mut f, &overlapping, 10).is_err());
+        assert!(img.cycle(&mut f, &past_end, 10).is_err());
+        assert!(img.read(&mut f, 55, &mut [0u8; 10]).is_err());
+
+        let mut got = vec![0u8; 60];
+        img.read(&mut f, 0, &mut got).unwrap();
+        assert_eq!(got, expect, "a rejected edit changed the image");
+        let mut clen = 60;
+        img.commit(&mut f, &mut clen).unwrap();
+        drop(f);
+        assert_eq!(BStack::open(&p).unwrap().peek(0).unwrap(), expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_cycles_in_grown_regions() {
+        // Every region is grown zeros, one partly written.
+        check_image(
+            &img_base(60),
+            &[
+                ImgOp::Resize(120),
+                ImgOp::Write(70, vec![0xA1; 5]),
+                ImgOp::Cycle(vec![60, 80, 100], 10),
+                ImgOp::Resize(85), // through the middle region
+                ImgOp::Resize(130),
+                ImgOp::Cycle(vec![60, 110], 10),
+                ImgOp::Resize(60), // back to the committed end
+            ],
+        );
+        // Committed and grown regions together, then a shrink below the committed end.
+        check_image(
+            &img_base(60),
+            &[
+                ImgOp::Resize(100),
+                ImgOp::Cycle(vec![10, 70, 40, 85], 10),
+                ImgOp::Resize(45), // through a committed region
+                ImgOp::Resize(100),
+                ImgOp::Write(55, vec![0xB2; 10]), // straddles the committed end
+                ImgOp::Cycle(vec![50, 20, 90], 10),
+                ImgOp::Resize(55),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_shrink_at_cycle_region_bounds() {
+        // Shrinking to a region's end keeps it whole.
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 40, 80], 10),
+                ImgOp::Resize(90),
+                ImgOp::Write(85, vec![1; 5]),
+            ],
+        );
+        // Shrinking to a region's start drops it.
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![0, 40, 80], 10),
+                ImgOp::Resize(80),
+                ImgOp::Resize(120),
+            ],
+        );
+        // A kept region's source lies past the new end.
+        check_image(
+            &img_base(120),
+            &[ImgOp::Cycle(vec![0, 40, 100], 10), ImgOp::Resize(90)],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Copy(100, 0, 20),
+                ImgOp::Resize(50),
+                ImgOp::Resize(120),
+            ],
+        );
+        // A region ending exactly at the committed end.
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![110, 0], 10),
+                ImgOp::Resize(150),
+                ImgOp::Cycle(vec![110, 140], 10),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_untouched_cycle_with_length_change() {
+        check_image(
+            &img_base(120),
+            &[ImgOp::Resize(70), ImgOp::Cycle(vec![0, 20, 40], 10)],
+        );
+        check_image(
+            &img_base(120),
+            &[ImgOp::Cycle(vec![0, 20, 40], 10), ImgOp::Resize(70)],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Resize(200),
+                ImgOp::Cycle(vec![0, 20, 100], 10),
+                ImgOp::Write(150, vec![7; 30]),
+            ],
+        );
+        check_image(
+            &img_base(120),
+            &[
+                ImgOp::Cycle(vec![30, 60], 30),
+                ImgOp::Resize(250),
+                ImgOp::Copy(30, 200, 50),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_truncated_pieces_regrow_as_zeros() {
+        check_image(
+            &img_base(80),
+            &[
+                ImgOp::Resize(140),
+                ImgOp::Write(90, vec![0xC3; 30]),
+                ImgOp::Resize(100), // through a literal in the grown region
+                ImgOp::Resize(140),
+                ImgOp::Repeat(20, vec![1, 2, 3], 10),
+                ImgOp::Resize(37), // through a repeat, mid-period
+                ImgOp::Resize(80),
+                ImgOp::Copy(25, 60, 15), // the repeat's tail and regrown zeros
+                ImgOp::Owned(0, (0..40).collect()),
+                ImgOp::Resize(10), // through an owned piece
+                ImgOp::Write(5, vec![0xD4; 5]),
+                ImgOp::Resize(90),
+            ],
+        );
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_repeated_resizes() {
+        check_image(
+            &img_base(64),
+            &[
+                ImgOp::Resize(64),
+                ImgOp::Resize(100),
+                ImgOp::Resize(64),
+                ImgOp::Resize(32),
+                ImgOp::Resize(64),
+                ImgOp::Resize(32),
+                ImgOp::Resize(128),
+                ImgOp::Resize(0),
+                ImgOp::Resize(0),
+                ImgOp::Resize(64),
+                ImgOp::Resize(65),
+            ],
+        );
+        check_image(
+            &img_base(64),
+            &[
+                ImgOp::Cycle(vec![0, 32], 16),
+                ImgOp::Resize(100),
+                ImgOp::Resize(48), // to a region's end
+                ImgOp::Resize(100),
+                ImgOp::Cycle(vec![40, 80], 16), // across a region and grown zeros
+                ImgOp::Resize(56),
+                ImgOp::Resize(100),
+            ],
+        );
+    }
+
+    // A seeded xorshift; `next(m)` is in `[0, m)`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    struct ImgRng(u64);
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    impl ImgRng {
+        fn next(&mut self, m: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % m
+        }
+    }
+
+    // A random script of 10 to 59 valid edits over a payload of `len` bytes.
+    // `resizes` weighs resizes against 6 for the other edits, and `resize_to`
+    // picks each new length.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    fn img_script(
+        rng: &mut ImgRng,
+        mut len: u64,
+        resizes: u64,
+        resize_to: impl Fn(&mut ImgRng) -> u64,
+    ) -> Vec<ImgOp> {
+        let mut ops = Vec::new();
+        for _ in 0..(10 + rng.next(50)) {
+            if len == 0 {
+                len = 1 + rng.next(256);
+                ops.push(ImgOp::Resize(len));
+                continue;
+            }
+            let op = match rng.next(6 + resizes) {
+                0 | 1 => {
+                    let n = 1 + rng.next(len.min(32));
+                    let data = (0..n).map(|_| rng.next(256) as u8).collect();
+                    let off = rng.next(len - n + 1);
+                    if rng.next(2) == 0 {
+                        ImgOp::Write(off, data)
+                    } else {
+                        ImgOp::Owned(off, data)
+                    }
+                }
+                2 => {
+                    let pat: Vec<u8> = (0..1 + rng.next(5)).map(|_| rng.next(256) as u8).collect();
+                    let count = 1 + rng.next(8);
+                    let total = pat.len() as u64 * count;
+                    if total > len {
+                        continue;
+                    }
+                    ImgOp::Repeat(rng.next(len - total + 1), pat, count)
+                }
+                3 => {
+                    let n = 1 + rng.next(len.min(48));
+                    ImgOp::Copy(rng.next(len - n + 1), rng.next(len - n + 1), n)
+                }
+                4 | 5 => {
+                    let k = 2 + rng.next(3);
+                    let n = 1 + rng.next(16);
+                    let slots = len / n;
+                    if slots < k {
+                        continue;
+                    }
+                    // Distinct slots, shifted together, in random order.
+                    let mut picked: Vec<u64> = Vec::new();
+                    while (picked.len() as u64) < k {
+                        let slot = rng.next(slots);
+                        if !picked.contains(&slot) {
+                            picked.push(slot);
+                        }
+                    }
+                    let shift = rng.next(len - slots * n + 1);
+                    ImgOp::Cycle(picked.iter().map(|s| s * n + shift).collect(), n)
+                }
+                _ => {
+                    len = resize_to(rng);
+                    ImgOp::Resize(len)
+                }
+            };
+            ops.push(op);
+        }
+        ops
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_matches_model() {
+        let mut rng = ImgRng(0x9e37_79b9_7f4a_7c15);
+        for seed in 0..48usize {
+            let base = img_base([0, 64, 200][seed % 3]);
+            let ops = img_script(&mut rng, base.len() as u64, 1, |r| r.next(320));
+            check_image(&base, &ops);
+        }
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn ma_image_matches_model_with_resizes() {
+        // Frequent resizes close to the committed end, so cycles and copies keep
+        // landing in grown, shrunk, and regrown regions.
+        let mut rng = ImgRng(0x2545_f491_4f6c_dd1d);
+        for seed in 0..48usize {
+            let base_len = [16u64, 64, 128][seed % 3];
+            let base = img_base(base_len as usize);
+            let ops = img_script(&mut rng, base_len, 4, |r| {
+                base_len.saturating_sub(48) + r.next(97)
+            });
+            check_image(&base, &ops);
+        }
+    }
+
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
     fn inplace_gen_reads_see_pending_writes() {
