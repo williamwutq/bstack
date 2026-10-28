@@ -41,8 +41,8 @@
 //! ```
 //!
 //! * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-//!   This version writes `BSTK\x00\x04\x07\x00` (0.4.7).  [`open`](BStack::open)
-//!   accepts any file whose first 6 bytes match `BSTK\x00\x04` (any 0.4.x) and
+//!   This version writes `BSTK\x00\x05\x00\x00` (format 0.5.0).  [`open`](BStack::open)
+//!   accepts any file whose first 6 bytes match `BSTK\x00\x05` (any 0.5.x) and
 //!   rejects anything with a different major or minor.
 //! * **`clen`** — little-endian `u64` recording the *committed* payload length.
 //!   It is updated atomically with each [`push`](BStack::push) or
@@ -76,6 +76,7 @@
 //! | `wip_ptr != 0`, `wip_aux = Repeat` | a `zero`/`repeat` crashed mid-fill | write `count` copies of the staged pattern into `[wip_ptr, …)`, disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux = Copy` | a disjoint `copy` crashed mid-copy | replay `move_chunked(src → wip_ptr)` from the untouched source (the tail stages only `[src \| n]`), disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | a length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail into `[wip_ptr, …)`, commit `clen'` while disarming, truncate |
+//! | `wip_ptr != 0`, `wip_aux = CycleSwap` | a `cross_rotate` of three or more regions crashed mid-rotation | resume at the step `wip_ptr` names, copying each region on from the next and the staged snapshot into `offsets[0]`, disarm, truncate |
 //! | `wip_ptr != 0`, `wip_aux` unrecognized | a mode armed by a newer build | roll back: disarm, truncate to `32 + clen` |
 //! | `wip_ptr == 0`, `wip_aux = MultiWrite` | a `set_batched`/`inplace_gen` multi-write batch crashed after all blocks were staged | replay each staged `[s \| e \| data]` block into `[s, e)`, disarm, truncate to `32 + clen` (a corrupt tail rolls back, applying nothing) |
 //! | `wip_ptr == 0`, `file_size − 32 > clen` | partial tail write (push, or a crashed journal or multi-write stage) before the header update | truncate to `32 + clen` |
@@ -116,8 +117,9 @@
 //! **In-place same-length writes** — [`set`](BStack::set), [`zero`](BStack::zero),
 //! [`repeat`](BStack::repeat), [`swap`](BStack::swap),
 //! [`swap_into`](BStack::swap_into), [`cas`](BStack::cas), [`copy`](BStack::copy),
-//! [`cross_exchange`](BStack::cross_exchange), [`process`](BStack::process),
-//! [`set_batched`](BStack::set_batched), [`inplace_gen`](BStack::inplace_gen), and
+//! [`cross_exchange`](BStack::cross_exchange), [`cross_rotate`](BStack::cross_rotate),
+//! [`process`](BStack::process), [`set_batched`](BStack::set_batched),
+//! [`inplace_gen`](BStack::inplace_gen), and
 //! the `crds` family — leave the payload length unchanged and are each
 //! **crash-atomic**, committing by one of three strategies (recovered on the next
 //! [`open`](BStack::open); see *Crash recovery*):
@@ -129,7 +131,8 @@
 //!   `durable_sync` → arm `wip_ptr` → `durable_sync` → write in place →
 //!   `durable_sync` → clear `wip_ptr` → `durable_sync` → `ftruncate` the backup.
 //!   `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange` stages one
-//!   region and commits at a single atomic `wip_ptr` flip; moves and fills stream
+//!   region and commits at a single atomic `wip_ptr` flip; `cross_rotate` stages
+//!   one region and advances `wip_ptr` as a step counter; moves and fills stream
 //!   through a bounded buffer (O(1) memory).
 //! * **Multi-write journal** — [`set_batched`](BStack::set_batched) and
 //!   [`inplace_gen`](BStack::inplace_gen) commit several non-overlapping in-place
@@ -165,6 +168,7 @@
 //! | `inplace_gen` *(features: set+atomic)* | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
 //! | `cross_exchange` *(features: set+atomic)* | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
+//! | `cross_rotate` *(features: set+atomic)* | `k < 2` → no-op; `k == 2` → as `cross_exchange`; otherwise rotation journal: stage `[n \| k \| offsets…]` and the last region → arm `CycleSwap` at the last offset → for each step, write the previous region into the current one and advance `wip_ptr` to the previous → write the snapshot into `offsets[0]` → disarm → `ftruncate` (a `durable_sync` at each barrier) |
 //! | `copy` *(features: set+atomic)* | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → **copy journal** (stage only `[src \| n]` → arm `Copy` → stream source→dest → disarm; recovery replays from the untouched source) |
 //! | `eq_crds`, `ne_crds` *(features: set+atomic)* | `read(a)` → compare — conditional *commit* of `b_buf` |
 //! | `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | `read(a)` → mask+compare — conditional *commit* of `b_buf` |
@@ -237,7 +241,7 @@
 //! | `try_discard(s, 0)` *(feature: atomic)* | **read** | **read** |
 //! | `get_batched`, `get_batched_into`, `get_batched_gen` *(feature: atomic)* | **read** | write |
 //! | `swap`, `swap_into`, `cas` *(features: set+atomic)* | write | write |
-//! | `cross_exchange`, `copy`, `process`, `process_gen`, `set_batched`, `inplace_gen` *(features: set+atomic)* | write | write |
+//! | `cross_exchange`, `cross_rotate`, `copy`, `process`, `process_gen`, `set_batched`, `inplace_gen` *(features: set+atomic)* | write | write |
 //! | `eq_crds`, `ne_crds`, `masked_eq_crds`, `masked_ne_crds` *(features: set+atomic)* | write | write |
 //! | `replace` *(feature: atomic)* | write | write |
 //! | `peek`, `peek_into`, `get`, `get_into` | **read** | write |
@@ -299,7 +303,8 @@
 //!   [`repeat`](BStack::repeat),
 //!   [`swap`](BStack::swap), [`swap_into`](BStack::swap_into),
 //!   [`cas`](BStack::cas), [`process`](BStack::process),
-//!   [`cross_exchange`](BStack::cross_exchange), [`copy`](BStack::copy)
+//!   [`cross_exchange`](BStack::cross_exchange),
+//!   [`cross_rotate`](BStack::cross_rotate), [`copy`](BStack::copy)
 //!   (destination only), [`eq_crds`](BStack::eq_crds),
 //!   [`ne_crds`](BStack::ne_crds), [`masked_eq_crds`](BStack::masked_eq_crds),
 //!   and [`masked_ne_crds`](BStack::masked_ne_crds) (region B) return
@@ -408,7 +413,7 @@
 //!
 //! | Trait | Semantics |
 //! |-------|-----------|
-//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.4.7"`) and `len` (`Option<u64>`, `None` on I/O failure). |
+//! | `Debug` | Shows `version` (semver string from the magic header, e.g. `"0.5.0"`) and `len` (`Option<u64>`, `None` on I/O failure). |
 //! | `PartialEq` / `Eq` | **Pointer identity.** Two values are equal iff they are the same instance. No two distinct `BStack` values in one process can refer to the same file. |
 //! | `Hash` | Hashes the instance address — consistent with pointer-identity `PartialEq`. |
 //!
@@ -756,12 +761,15 @@ use std::os::windows::io::AsRawHandle;
 
 /// On-disk **format** version encoded in the magic header. This is independent
 /// of the crate version: it bumps only when the file format changes in a way an
-/// older reader cannot handle. 0.4.0 introduces the 32-byte write-in-progress
-/// journal header (see `algos/WIP.md`); bumping the minor here makes older binaries
-/// reject the new files loudly instead of misreading them.
+/// older reader cannot handle. 0.4.0 introduced the 32-byte write-in-progress
+/// journal header (see `algos/WIP.md`); 0.5.0 adds the `CycleSwap` journal mode,
+/// which overwrites committed bytes in place before its commit point, so a reader
+/// that does not recognize it cannot safely roll it back (WIP.md Rule 2). In
+/// general, minor bumps make older binaries reject the new files loudly instead
+/// of misreading them.
 const FORMAT_MAJOR: u8 = 0;
-const FORMAT_MINOR: u8 = 4;
-const FORMAT_PATCH: u8 = 7;
+const FORMAT_MINOR: u8 = 5;
+const FORMAT_PATCH: u8 = 0;
 
 /// Full magic for files written by this version
 /// (`BSTK` + major + minor + patch + reserved(0)).
@@ -3497,6 +3505,87 @@ impl BStack {
         }
         fault_point!(self, "cross_exchange");
         Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
+    }
+
+    /// Atomically rotate `k` equal-size, pairwise-disjoint regions within the
+    /// file: the bytes at `offsets[i]` move to `offsets[i + 1]`, and the bytes at
+    /// the last offset move to `offsets[0]`.
+    ///
+    /// The rotation runs under a single write lock, so no other thread can
+    /// observe an intermediate state. Any rearrangement of regions decomposes
+    /// into disjoint rotations, each of which this performs atomically. `k == 2`
+    /// is exactly [`cross_exchange`](Self::cross_exchange); `k < 2` or `n = 0` is
+    /// a valid no-op (bounds are still checked). The at-rest file size is never
+    /// changed.
+    ///
+    /// # Crash atomicity
+    ///
+    /// Crash-safe: after a crash the regions hold either their original contents
+    /// or the fully rotated contents. Only the last region's bytes are staged, in
+    /// a tail backup of `16 + 8k + n` bytes, so staging does not grow with `k`.
+    /// Once armed, recovery on the next [`open`](Self::open) rolls the rotation
+    /// forward from the step it reached. The file grows by the staged tail during
+    /// the operation, which is dropped on completion.
+    ///
+    /// # Feature flags
+    ///
+    /// Only available when both the `set` and `atomic` Cargo features are
+    /// enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + n` overflows
+    /// `u64`, if any two regions overlap, if any region exceeds the current
+    /// payload size, or if any region overlaps the locked prefix. Propagates any
+    /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cross_rotate(&self, offsets: &[u64], n: u64) -> io::Result<()> {
+        let mut max_end = 0u64;
+        for &o in offsets {
+            max_end = max_end.max(checked_end(o, n, "cross_rotate: offset + n overflows u64")?);
+        }
+        if n > 0 && !pairwise_disjoint(offsets.to_vec(), n) {
+            return Err(io_error!(InvalidInput, "cross_rotate: regions overlap"));
+        }
+        let mut guard = self.write_lock()?;
+        let (file, clen, replay) = &mut *guard;
+        let locked = self.locked.load(Ordering::Acquire);
+        if let Some(&o) = offsets.iter().find(|&&o| o < locked) {
+            return Err(io_error!(
+                InvalidInput,
+                format!("cross_rotate: region at {o} overlaps locked region [0, {locked})")
+            ));
+        }
+        let data_size = *clen;
+        if max_end > data_size {
+            return Err(io_error!(
+                InvalidInput,
+                format!(
+                    "cross_rotate: region ending at {max_end} exceeds payload size ({data_size})"
+                )
+            ));
+        }
+        match offsets {
+            _ if n == 0 => Ok(()),
+            [] | [_] => Ok(()),
+            &[a, b] => {
+                fault_point!(self, "cross_rotate");
+                Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
+            }
+            _ => {
+                // The staged tail `[n | k | offsets… | snapshot]` must fit past the payload.
+                let room = (u64::MAX - HEADER_SIZE).saturating_sub(data_size);
+                let offsets_len = size_of_val(offsets) as u64;
+                if n > room.saturating_sub(16).saturating_sub(offsets_len) {
+                    return Err(io_error!(
+                        InvalidInput,
+                        "cross_rotate: staged tail overflows u64"
+                    ));
+                }
+                fault_point!(self, "cross_rotate");
+                Self::mark_replay(replay, journaled_rotate(file, data_size, offsets, n))
+            }
+        }
     }
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.

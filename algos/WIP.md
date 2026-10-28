@@ -44,14 +44,19 @@ u64::MAX - 2     SpliceShrink — length-shrinking tail replace (clen' < clen)
 u64::MAX - 3     Repeat       — repeating-pattern fill
 u64::MAX - 4     Copy         — disjoint in-file copy (coordinate-only staging)
 u64::MAX - 5     MultiWrite   — multi-write intent-complete sentinel
+u64::MAX - 6     (reserved for MultiAtrunc)
+u64::MAX - 7     CycleSwap    — cyclic rotation of k disjoint regions
 other            unknown      — roll back on recovery
 ```
 
 Non-zero modes take values near `u64::MAX`, decrementing as modes are added,
 so the low-value range is free for future packed encodings and unrecognized
 values are unmistakable. `u64::MAX` should never be used. An unrecognized value
-is always treated as unknown and triggers rollback. All modes in the current list
-shipped in 0.4.0, so every 0.4.0 reader recognizes all of them.
+is always treated as unknown and triggers rollback. Every mode through
+`MultiWrite` shipped in 0.4.0 and is non-destructive under that rollback;
+`CycleSwap` is not as it overwrites committed bytes before its commit point. It
+requires the 0.5.0 format magic (Rule 2 below): a reader of an older format
+rejects the file at open rather than meeting a mode it cannot safely roll back.
 
 ---
 
@@ -427,10 +432,68 @@ require `wip_ptr != 0`). The intent-complete sentinel is only valid when
 
 ---
 
+## Mode: CycleSwap
+
+**Backs:** `cross_rotate` with `k >= 3` regions (`k == 2` is `cross_exchange`'s
+exchange journal; `k < 2` is a no-op).
+
+**Precondition:** `k >= 3` pairwise-disjoint regions `[off_i, off_i + n)`, all
+within `[0, clen)` and outside the locked prefix, `n > 0`. The rotation moves the
+content of `off_i` to `off_{i+1}` and the content of `off_{k-1}` to `off_0`.
+
+### Protocol
+
+Let `P = clen`. The tail is `[n | k | off_0 … off_{k-1} | snapshot]`, where the
+snapshot holds the original bytes of `off_{k-1}` — `16 + 8k + n` bytes, one region
+of payload no matter how large `k` is. `wip_ptr = 32 + off_s` names the
+destination of the next unperformed step `s`, so it doubles as the progress
+counter; it is always non-zero, and each offset is distinct, so it identifies `s`.
+
+1. **Stage.** Write `[n | k | offsets…]` at `32+P`, then `move_chunked(off_{k-1} →
+   snapshot)` → sync.
+2. **Arm** at `s = k-1`: `write_wip(file, 32 + off_{k-1}, CycleSwap)` → sync.
+3. **Steps** for `s` from `k-1` down to `1`: `move_chunked(off_{s-1} → off_s)` →
+   sync → `write_wip(file, 32 + off_{s-1}, CycleSwap)` → sync.
+4. **Final step** (`s = 0`): `move_chunked(snapshot → off_0)` → sync.
+5. **Disarm.** `write_wip(file, 0, WipAux::Set)` → sync.
+6. **Truncate.** `file.set_len(32 + P)`.
+
+Each step is a **commit point**: the file is at a fully defined intermediate state
+of the rotation, and `wip_ptr` names the next step. Replaying step `s` is
+idempotent because its source, `off_{s-1}`, is not written until step `s-1`, so
+the snapshot only has to cover `off_{k-1}`, the one region overwritten before it
+is read. Keeping the counter in the header rather than the staged tail makes it
+non-tearing (see *Derived atomicity*), at one 16-byte header write per step.
+
+Arming is the commit point of the whole rotation: once armed, recovery always
+rolls forward. Cost is `n` staged bytes and `2k + 2` syncs.
+
+### Crash-safety
+
+| Crash point | Recovery |
+|-------------|----------|
+| During or after step 1 | `wip_ptr == 0` → truncate, regions intact |
+| After arm, before step `s` lands | `wip_ptr == 32 + off_s` → replay step `s` (idempotent), then every later step |
+| Mid-step (torn copy) | same — the step's source is untouched, so the replay rewrites the destination whole |
+| After step 4 | armed at `off_0`, complete → one more (no-op) replay of the final step |
+| After disarm | `wip_ptr == 0` → truncate the tail |
+
+### Recovery (`wip_ptr != 0`, `wip_aux == CycleSwap`)
+
+Read `n` and `k` (16 bytes at `tail_start`), then the `k` offsets. Validate:
+`tail_len == 16 + 8k + n`, `n > 0`, `k >= 2`, every `off_i + n <= clen`, the
+regions pairwise disjoint, and `wip_ptr - 32` equal to some `off_s`. If valid,
+run steps 3–4 from `s`, advancing `wip_ptr` after each step exactly as the
+writer does — a recovery that crashes resumes from the counter it last advanced,
+never re-running a step whose source a later step has overwritten. Then
+finalize. Any invalid tail rolls back.
+
+---
+
 ## Forward compatibility of `wip_aux`
 
 The mode space is open: future releases may define new modes by decrementing
-from `u64::MAX - 5`. Two rules keep this safe across versions:
+from `u64::MAX - 7`. Two rules keep this safe across versions:
 
 **Rule 1 — Unknown modes roll back.** A reader that sees an unrecognized
 `wip_aux` does not guess at the staging format. It applies the default: roll back
@@ -449,8 +512,8 @@ corrupting it.
 Together: whenever the default rollback fires, the mode is non-destructive and
 no committed data is lost. Destructive modes are always gated behind a magic that
 older readers reject. This is the same mechanism that protected the 0.4.0 journal
-from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x); the rule bites again
-only for modes introduced after 0.4.0.
+from 0.1.x readers (the 0.4.0 magic bump away from 0.1.x); it bites again for
+`CycleSwap`, which bumps the format to 0.5.0.
 
 ---
 
@@ -471,12 +534,14 @@ wip_ptr  wip_aux          action
   !=0      Copy           disjoint copy: read [src|n] from tail, move_chunked(src→wip_ptr-32), finalize
   !=0      SpliceGrow     derive clen', replay move_chunked(S→a), finalize with clen'
   !=0      SpliceShrink   derive clen', replay move_chunked(S→a), finalize with clen'
+  !=0      CycleSwap      read [n|k|offsets] from tail, resume the rotation at wip_ptr-32, finalize
   !=0      other          unknown: roll back (finalize with clen unchanged)
 ```
 
 All replay operations are idempotent: the staged tail is immutable and disjoint
 from its target (or, for Copy, the source is disjoint from the destination and
-was never modified). A crash during recovery is safe to re-run from the
+was never modified; for CycleSwap, the current step's source is untouched and
+the counter advances only after a step lands). A crash during recovery is safe to re-run from the
 beginning.
 
 After recovery, `durable_sync` ensures the repaired state is on stable storage

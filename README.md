@@ -234,6 +234,12 @@ impl BStack {
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cross_exchange(&self, a: u64, b: u64, n: u64) -> io::Result<()>;
 
+    /// Atomically rotate `k` disjoint byte regions of length `n` under one write lock:
+    /// `offsets[i]` moves to `offsets[i + 1]`, the last to `offsets[0]`.
+    /// Requires the `set` and `atomic` features.
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    pub fn cross_rotate(&self, offsets: &[u64], n: u64) -> io::Result<()>;
+
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
     /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice, Sparse}`; at
@@ -622,8 +628,8 @@ A fixed 32-byte header precedes the payload:
 ```
 
 * **`magic`** — 8 bytes: `BSTK` + major(1 B) + minor(1 B) + patch(1 B) + reserved(1 B).
-  This version writes `BSTK\x00\x04\x07\x00` (0.4.7).  `open` accepts any
-  0.4.x file (first 6 bytes `BSTK\x00\x04`) and rejects a different major or
+  This version writes `BSTK\x00\x05\x00\x00` (format 0.5.0).  `open` accepts any
+  0.5.x file (first 6 bytes `BSTK\x00\x05`) and rejects a different major or
   minor as incompatible.  Legacy `0.1.x` files can be upgraded in place with
   `BStack::migrate`.
 * **`clen`** — little-endian `u64` recording the last successfully committed
@@ -646,7 +652,7 @@ All user-visible offsets (returned by `push`, accepted by `peek`/`get`) are
 ## Durability
 
 **In-place same-length writes** — `set`, `zero`, `repeat`, `swap`, `swap_into`,
-`cas`, `copy`, `cross_exchange`, `process`, `set_batched`, `inplace_gen`, and the
+`cas`, `copy`, `cross_exchange`, `cross_rotate`, `process`, `set_batched`, `inplace_gen`, and the
 `crds` family — never change the payload length and are each **crash-atomic**,
 committing by one of three strategies (recovered on the next `open`):
 
@@ -655,7 +661,8 @@ committing by one of three strategies (recovered on the next `open`):
 * **Write-in-progress journal** — otherwise: stage a backup past `clen` → sync →
   arm `wip_ptr` → sync → write in place → sync → clear `wip_ptr` → sync →
   `ftruncate`.  `zero`/`repeat` stage only `[count | pattern]`; `cross_exchange`
-  stages one region and commits at a single atomic `wip_ptr` flip; moves and
+  stages one region and commits at a single atomic `wip_ptr` flip; `cross_rotate`
+  stages one region and advances `wip_ptr` as a step counter; moves and
   fills stream through a bounded buffer.
 * **Multi-write journal** — `set_batched` and `inplace_gen` commit several
   non-overlapping in-place writes as one unit: stage every `[s | e | data]` block
@@ -693,6 +700,7 @@ before it is read/compare/callback work under the lock.
 | `inplace_gen` *(set+atomic)*           | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`), on `Abort` they are discarded and nothing reaches the file |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
 | `cross_exchange` *(set+atomic)*        | `read(a)`, `read(b)` → exchange journal: stage `a` → arm at `a` → write `b`→`a` → flip `wip_ptr` to `b` → write `a`→`b` → disarm → `ftruncate` (sync at each barrier) |
+| `cross_rotate` *(set+atomic)*          | `k < 2` → no-op; `k == 2` → as `cross_exchange`; otherwise rotation journal: stage `[n \| k \| offsets…]` and the last region → arm `CycleSwap` at the last offset → for each step, write the previous region into the current one and advance `wip_ptr` to the previous → write the snapshot into `offsets[0]` → disarm → `ftruncate` (sync at each barrier) |
 | `copy` *(set+atomic)*                  | same-location → no-op; single-block dest → *commit*; overlapping → stream source→tail→dest (`Set` journal); disjoint → copy journal (stage only `[src \| n]`, arm `Copy`, stream source→dest; recovery replays from the untouched source) |
 | `eq_crds`, `ne_crds` *(set+atomic)*    | `read(a)` → compare → conditional *commit* of `b_buf`                                      |
 | `masked_eq_crds`, `masked_ne_crds` *(set+atomic)* | `read(a)` → mask+compare → conditional *commit* of `b_buf`                     |
@@ -726,6 +734,7 @@ size:
 | `wip_ptr != 0`, `wip_aux = Repeat`             | `zero`/`repeat` crashed mid-fill                             | write `count` copies of the staged pattern, disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = Copy`               | disjoint `copy` crashed mid-copy                            | replay `move_chunked(src → wip_ptr)` from the untouched source (tail stages only `[src \| n]`), disarm, truncate |
 | `wip_ptr != 0`, `wip_aux = SpliceGrow`/`SpliceShrink` | length-changing `atrunc`/`splice`/`splice_into`/`replace` crashed mid-replace | derive `clen'` from the file size and direction, replay the staged new tail, commit `clen'` while disarming, truncate |
+| `wip_ptr != 0`, `wip_aux = CycleSwap`          | `cross_rotate` of three or more regions crashed mid-rotation | resume at the step `wip_ptr` names (each step is a commit point), disarm, truncate |
 | `wip_ptr != 0`, `wip_aux` unrecognized         | mode armed by a newer build                                 | roll back: disarm, truncate to `32 + clen`                   |
 | `wip_ptr == 0`, `wip_aux = MultiWrite`         | `set_batched`/`inplace_gen` batch crashed after all blocks were staged | replay each staged `[s \| e \| data]` block into `[s, e)`, disarm, truncate (a corrupt tail rolls back, applying nothing) |
 | `wip_ptr == 0`, `file_size − 32 > clen`        | partial tail write (crashed before header update)           | truncate to `32 + clen`, durable-sync                        |
@@ -815,7 +824,7 @@ read and in-place write use it without a `File::metadata` or `lseek` syscall.
 | `process`, `process_gen` *(set+atomic)*                         | write                 | write        |
 | `set_batched`, `inplace_gen` *(set+atomic)*                     | write                 | write        |
 | `replace` *(atomic)*                                            | write                 | write        |
-| `cross_exchange`, `copy` *(set+atomic)*                         | write                 | write        |
+| `cross_exchange`, `cross_rotate`, `copy` *(set+atomic)*         | write                 | write        |
 | `eq_crds`, `ne_crds` *(set+atomic)*                             | write                 | write        |
 | `masked_eq_crds`, `masked_ne_crds` *(set+atomic)*               | write                 | write        |
 | `peek`, `peek_into`, `get`, `get_into`                          | **read**              | write        |
