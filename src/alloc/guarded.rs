@@ -71,15 +71,6 @@ use std::{borrow::Cow, io, ops::Range};
 /// why a transforming guard (encryption, compression) can implement just
 /// [`len`](BStackGuardedSlice::len), [`raw_block`], [`decode`], and [`encode`].
 ///
-/// ## Deprecated hooks
-///
-/// The former hooks are **deprecated since 0.4.4** and removed in 0.5.0:
-/// `post_read` → [`decode`], `pre_write` → [`encode`], `pre_read` → [`on_read`],
-/// `post_write` → [`on_write`]. Note `pre_read`'s offset was *absolute* whereas
-/// [`on_read`]'s is *relative*. The new hooks bridge to the old ones by default,
-/// so an implementor overriding only the old hooks keeps working unchanged until
-/// 0.5.0.
-///
 /// # Borrow semantics
 ///
 /// A guard sits at the same semantic position as [`BStackSlice`]: a borrowed I/O
@@ -176,12 +167,10 @@ where
     /// decryption, decompression, or other transformations. The transformed
     /// length should equal [`len`](BStackGuardedSlice::len).
     ///
-    /// Defaults to the deprecated [`post_read`](BStackGuardedSlice::post_read)
-    /// (identity), for back-compat during the deprecation window.
+    /// Defaults to identity.
     #[inline]
     fn decode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-        #[allow(deprecated)]
-        self.post_read(data)
+        Ok(Cow::Borrowed(data))
     }
 
     /// Transform apparent bytes into the raw bytes written to the underlying store.
@@ -191,12 +180,10 @@ where
     /// `Cow::Borrowed` to pass through, or `Cow::Owned` for encryption,
     /// compression, or other transformations.
     ///
-    /// Defaults to the deprecated [`pre_write`](BStackGuardedSlice::pre_write)
-    /// (identity), for back-compat during the deprecation window.
+    /// Defaults to identity.
     #[inline]
     fn encode<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-        #[allow(deprecated)]
-        self.pre_write(data)
+        Ok(Cow::Borrowed(data))
     }
 
     /// Observe or deny a read of `len` raw bytes at `offset`.
@@ -205,15 +192,10 @@ where
     /// raw bytes about to be read (before [`decode`](BStackGuardedSlice::decode)).
     /// Return `Err` to deny.
     ///
-    /// Defaults to bridging the deprecated
-    /// [`pre_read`](BStackGuardedSlice::pre_read), whose offset was *absolute*: the
-    /// bridge adds the slice start, so an implementor overriding only `pre_read`
-    /// still receives the absolute offset it expects.
+    /// Defaults to a no-op.
     #[inline]
-    fn on_read(&self, offset: u64, len: u64) -> io::Result<()> {
-        let start = unsafe { self.raw_block() }.start();
-        #[allow(deprecated)]
-        self.pre_read(start.saturating_add(offset), len)
+    fn on_read(&self, _offset: u64, _len: u64) -> io::Result<()> {
+        Ok(())
     }
 
     /// Observe a completed write of `len` logical bytes at `offset`.
@@ -222,43 +204,9 @@ where
     /// apparent bytes written (before [`encode`](BStackGuardedSlice::encode)). The
     /// write has already succeeded; use for auditing or metadata.
     ///
-    /// Defaults to the deprecated [`post_write`](BStackGuardedSlice::post_write),
-    /// whose offset was already relative.
+    /// Defaults to a no-op.
     #[inline]
-    fn on_write(&self, offset: u64, len: u64) -> io::Result<()> {
-        #[allow(deprecated)]
-        self.post_write(offset, len)
-    }
-
-    /// Deprecated: renamed to [`on_read`](BStackGuardedSlice::on_read); its offset
-    /// is now **relative** to the slice, not absolute.
-    #[deprecated(
-        since = "0.4.4",
-        note = "renamed to `on_read`; offset is now relative to the slice"
-    )]
-    #[inline]
-    fn pre_read(&self, _offset: u64, _len: u64) -> io::Result<()> {
-        Ok(())
-    }
-
-    /// Deprecated: renamed to [`decode`](BStackGuardedSlice::decode).
-    #[deprecated(since = "0.4.4", note = "renamed to `decode`")]
-    #[inline]
-    fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-        Ok(Cow::Borrowed(data))
-    }
-
-    /// Deprecated: renamed to [`encode`](BStackGuardedSlice::encode).
-    #[deprecated(since = "0.4.4", note = "renamed to `encode`")]
-    #[inline]
-    fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-        Ok(Cow::Borrowed(data))
-    }
-
-    /// Deprecated: renamed to [`on_write`](BStackGuardedSlice::on_write).
-    #[deprecated(since = "0.4.4", note = "renamed to `on_write`")]
-    #[inline]
-    fn post_write(&self, _offset: u64, _len: u64) -> io::Result<()> {
+    fn on_write(&self, _offset: u64, _len: u64) -> io::Result<()> {
         Ok(())
     }
 
@@ -1327,64 +1275,6 @@ mod tests {
 
         // Neither attempt mutated the raw block.
         assert_eq!(region(&stack, 0, 4).read().unwrap(), b"abcd");
-    }
-
-    /// A guard overriding only the **deprecated** hooks keeps working, and the
-    /// bridges preserve each hook's original offset convention: `pre_read`
-    /// absolute, `post_write` relative.
-    #[cfg(feature = "set")]
-    #[test]
-    #[allow(deprecated)]
-    fn deprecated_hook_bridge() {
-        struct Legacy<'a> {
-            slice: BStackSlice<'a>,
-            key: u8,
-            pre_read_off: Cell<u64>,
-            post_write_off: Cell<u64>,
-        }
-        #[allow(deprecated)]
-        impl<'a> BStackGuardedSlice<'a, A> for Legacy<'a> {
-            fn len(&self) -> u64 {
-                self.slice.len()
-            }
-            unsafe fn raw_block(&self) -> BStackSlice<'a> {
-                self.slice.clone()
-            }
-            fn post_read<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
-            }
-            fn pre_write<'d>(&self, data: &'d [u8]) -> io::Result<Cow<'d, [u8]>> {
-                Ok(Cow::Owned(data.iter().map(|b| b ^ self.key).collect()))
-            }
-            fn pre_read(&self, offset: u64, _len: u64) -> io::Result<()> {
-                self.pre_read_off.set(offset);
-                Ok(())
-            }
-            fn post_write(&self, offset: u64, _len: u64) -> io::Result<()> {
-                self.post_write_off.set(offset);
-                Ok(())
-            }
-        }
-        let (stack, _c) = mk_stack();
-        stack.push([0u8; 16]).unwrap(); // 8 bytes padding, then the region
-        let key = 0x5A;
-        let g = Legacy {
-            slice: region(&stack, 8, 4),
-            key,
-            pre_read_off: Cell::new(u64::MAX),
-            post_write_off: Cell::new(u64::MAX),
-        };
-        // write() -> encode bridges to the deprecated pre_write (XOR).
-        g.write(b"WXYZ").unwrap();
-        // post_write bridged with the RELATIVE offset 0.
-        assert_eq!(g.post_write_off.get(), 0);
-        let raw = region(&stack, 8, 4).read().unwrap();
-        let expect: Vec<u8> = b"WXYZ".iter().map(|b| b ^ key).collect();
-        assert_eq!(raw, expect);
-        // read() -> decode bridges to the deprecated post_read (XOR back).
-        assert_eq!(g.read().unwrap(), b"WXYZ");
-        // pre_read bridged with the ABSOLUTE offset = slice.start() = 8.
-        assert_eq!(g.pre_read_off.get(), 8);
     }
 
     // ---- atomic read-modify-write (features `set` + `atomic`) ----
