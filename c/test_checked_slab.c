@@ -1651,6 +1651,26 @@ static int test_foreign_slice_is_rejected(void)
  * main
  * ====================================================================== */
 
+/* A tail-changing call's error may follow its truncation, so a failed tail
+ * shrink or free is a loss (-2). Locking the payload forces that call to err. */
+static int test_tail_free_error_reports_lost(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    checked_slab_bstack_allocator_t *a = checked_slab_bstack_allocator_new(bs, 24);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+    bstack_slice_t s;
+    uint64_t len;
+
+    CHECK(bstack_allocator_alloc(al, 100, &s) == 0);
+    CHECK(bstack_len(bs, &len) == 0 && bstack_lock_up_to(bs, len) == 0);
+    CHECK(bstack_allocator_dealloc(al, s) == -2);
+
+    bstack_close(checked_slab_bstack_allocator_into_stack(a));
+    csl_unlink(tmp); return 0;
+}
+
 int main(void)
 {
     /* ── new() / open() ─────────────────────────────────────────────────── */
@@ -1658,6 +1678,7 @@ int main(void)
     T(test_new_rejects_small_data_size);
     T(test_new_rejects_nonempty_stack);
     T(test_open_rejects_empty_stack);
+    T(test_tail_free_error_reports_lost);
     T(test_open_rejects_bad_magic);
     T(test_open_rejects_misaligned_tail);
     T(test_open_restores_data_size);

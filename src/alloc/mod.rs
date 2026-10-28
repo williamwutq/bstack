@@ -297,8 +297,10 @@ pub struct BStackAllocError<'a, A: BStackAllocator + 'a> {
     /// AVL insert: a torn insert must not be retried, so that path returns
     /// `None`. Built-in [`dealloc`](BStackAllocator::dealloc) likewise returns
     /// `None` on its free-list / AVL-insert paths, where handing back a
-    /// partially-freed block would risk a double-free. Treat `None` as "not
-    /// recoverable here," not as something that never happens.
+    /// partially-freed block would risk a double-free. A tail shrink or tail
+    /// free also returns `None` when its truncating [`BStack`] call errs, since
+    /// that error may follow the truncation. Treat `None` as "not recoverable
+    /// here," not as something that never happens.
     pub handle: Option<A::Allocated<'a>>,
 }
 

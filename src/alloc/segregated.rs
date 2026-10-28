@@ -2514,7 +2514,8 @@ impl SegregatedBStackAllocator {
             return Ok(());
         }
         // Set once a free-list splice is attempted: a torn/failed atomic push
-        // must not hand back a handle that could double-free.
+        // must not hand back a handle that could double-free. Also set when a
+        // tail discard errs.
         let mut lost = false;
         let result = (|| -> io::Result<()> {
             let block_start = Self::block_start_of(start)?;
@@ -2539,11 +2540,16 @@ impl SegregatedBStackAllocator {
                 // the free list. Under `atomic`, `try_discard` fuses the tail check
                 // and the drop; otherwise check `len` then `discard`.
                 #[cfg(feature = "atomic")]
-                if self.stack.try_discard(end, size)? {
+                if self
+                    .stack
+                    .try_discard(end, size)
+                    .inspect_err(|_| lost = true)?
+                {
                     return Ok(());
                 }
                 #[cfg(not(feature = "atomic"))]
                 if end == self.stack.len()? {
+                    lost = true;
                     self.stack.discard(size)?;
                     return Ok(());
                 }
@@ -2635,6 +2641,8 @@ impl SegregatedBStackAllocator {
         let recovered = (start, old_len);
         #[cfg(not(feature = "atomic"))]
         let mut recovered = (start, old_len);
+        // Set by an in-block tail shrink whose `Atrunc` errs.
+        let mut lost = false;
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
@@ -2651,7 +2659,15 @@ impl SegregatedBStackAllocator {
                 // The request fits the current physical block — no bigger block
                 // needed, and never a move. Shared with `realloc_inplace`, whose
                 // append-only in-block case is exactly this path.
-                return self.resize_in_block(block_start, start, old_len, new_len, old_size, init);
+                return self.resize_in_block(
+                    block_start,
+                    start,
+                    old_len,
+                    new_len,
+                    old_size,
+                    init,
+                    &mut lost,
+                );
             }
 
             // The request needs a physically larger block (`new_need > old_size`,
@@ -2704,10 +2720,12 @@ impl SegregatedBStackAllocator {
         })();
         result.map_err(|source| BStackAllocError {
             source,
-            // SAFETY: `recovered` names a live region owned by the caller.
-            handle: Some(unsafe {
-                BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
-            }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: `recovered` names a live region owned by the caller.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1) })
+            },
         })
     }
 
@@ -2723,10 +2741,12 @@ impl SegregatedBStackAllocator {
     /// * Visible shrink (`new_len < old_len`): retain the excess in place with zero
     ///   writes, except a *tail* shrink whose excess clears `SPLIT_MIN` under
     ///   `atomic`, which reclaims via one `Len` + `Atrunc`. The caller's original
-    ///   `(start, old_len)` block stays intact on a mid-op failure, so it is always
-    ///   safe to return as the surviving handle.
+    ///   `(start, old_len)` block stays intact on a mid-op failure, so it is the
+    ///   surviving handle, unless the `Atrunc` errs, which may follow its commit
+    ///   and so sets `lost`.
     ///
     /// `new_len == old_len` is handled by the callers before they reach here.
+    #[allow(clippy::too_many_arguments)] // `lost` is an out-parameter for both callers
     fn resize_in_block<'a>(
         &'a self,
         block_start: u64,
@@ -2735,11 +2755,12 @@ impl SegregatedBStackAllocator {
         new_len: u64,
         old_size: u64,
         init: bool,
+        lost: &mut bool,
     ) -> io::Result<BStackOwnedSlice<'a, Self>> {
         // `block_start` and `old_size` drive only the `atomic` shrink reclaim
         // below; without `atomic` a shrink always retains in place.
         #[cfg(not(feature = "atomic"))]
-        let _ = (block_start, old_size);
+        let _ = (block_start, old_size, &lost);
         if new_len > old_len {
             // Visible grow within the block: zero the newly-exposed bytes
             // (a prior shrink may have left stale data there) and retain.
@@ -2782,7 +2803,7 @@ impl SegregatedBStackAllocator {
                 let cur_ptr: *mut u64 = &mut cur_len;
                 let mut phase = 0u8;
                 let mut truncated = false;
-                self.stack.process_gen(|| match phase {
+                let result = self.stack.process_gen(|| match phase {
                     0 => {
                         phase = 1;
                         // SAFETY: `process_gen` invokes this closure strictly
@@ -2806,7 +2827,11 @@ impl SegregatedBStackAllocator {
                         }
                     }
                     _ => None,
-                })?;
+                });
+                // An `Atrunc` error may follow its commit; a `Len` error precedes
+                // any mutation.
+                *lost = truncated;
+                result?;
                 if truncated {
                     // SAFETY: block replaced in place at the same offset,
                     // shrunk to the new class with its prefix preserved.
@@ -3019,7 +3044,9 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
         }
 
         // Every supported path below leaves the caller's original block intact on
-        // failure, so the surviving handle is always `(start, old_len)`.
+        // failure, so the surviving handle is `(start, old_len)`, unless a tail
+        // shrink's `Atrunc` errs, which sets `lost`.
+        let mut lost = false;
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let word = u64::from_le_bytes(read_bstack!(self.stack, block_start => u64));
             if word & Self::IN_USE_BIT == 0 {
@@ -3047,12 +3074,24 @@ impl BStackInPlaceResizeAllocator for SegregatedBStackAllocator {
                     "realloc_inplace: back grow would relocate a non-tail block"
                 ));
             }
-            self.resize_in_block(block_start, start, old_len, new_len, old_size, true)
+            self.resize_in_block(
+                block_start,
+                start,
+                old_len,
+                new_len,
+                old_size,
+                true,
+                &mut lost,
+            )
         })();
         result.map_err(|source| BStackAllocError {
             source,
-            // SAFETY: (start, old_len) still names the caller's live, intact block.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still names the caller's live, intact block.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
         })
     }
 }
@@ -4931,5 +4970,44 @@ mod bulk_fault_tests {
         let mut reused = [r1.start(), r2.start()];
         reused.sort_unstable();
         assert_eq!(reused, freed[..], "popped blocks were not reclaimed");
+    }
+}
+
+// A tail-changing call's error may follow its truncation, so every tail shrink
+// or free reports its handle lost. Locking the payload forces that call to err.
+#[cfg(all(test, feature = "set"))]
+mod tail_error_tests {
+    use super::SegregatedBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+    #[cfg(feature = "atomic")]
+    use crate::alloc::BStackInPlaceResizeAllocator;
+
+    #[test]
+    fn tail_shrink_and_free_errors_report_lost() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_seg_tail_err_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let alloc = SegregatedBStackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        // A fresh oversized tail allocation, locked so its truncation errs.
+        let locked_tail = || {
+            let h = alloc.alloc(4500).unwrap();
+            alloc.stack().lock_up_to(alloc.len().unwrap()).unwrap();
+            h
+        };
+
+        let err = alloc.dealloc(locked_tail()).unwrap_err();
+        assert!(err.handle.is_none(), "dealloc");
+        // Only `atomic` reclaims a tail shrink (one `Len` + `Atrunc`).
+        #[cfg(feature = "atomic")]
+        {
+            let err = alloc.realloc(locked_tail(), 100).unwrap_err();
+            assert!(err.handle.is_none(), "realloc shrink");
+            let err = alloc.realloc_inplace(locked_tail(), 0, -4400).unwrap_err();
+            assert!(err.handle.is_none(), "realloc_inplace shrink");
+        }
+
+        drop(alloc);
+        let _ = std::fs::remove_file(&path);
     }
 }

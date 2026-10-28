@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Allocators could return an out-of-bounds handle after a failed tail shrink or tail free (Rust and C).** A `discard`, `try_discard`, or tail-replace error may follow the truncation, but `LinearBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator`, and `GhostTreeBstackAllocator` handed back the original handle. Their tail `realloc` shrinks, `realloc_inplace` (Rust), `dealloc`, and Linear's `dealloc_bulk` now report it lost on such an error (`handle: None` / empty `handles`; C: `-2`). The slab allocators' `alloc_bulk` cleanup also no longer recycles a fresh tail onto the free list after its truncation errs, which could hand out blocks past the stack end.
+
 ## [0.4.7] - 2026-10-16
 
 ### Changed

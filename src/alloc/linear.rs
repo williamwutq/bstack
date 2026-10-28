@@ -49,6 +49,9 @@ use std::{fmt, io};
 /// | `dealloc` (tail)     | [`BStack::discard`] | [`BStack::try_discard`] |
 /// | `dealloc` (non-tail) | no-op               | no-op                   |
 ///
+/// A `discard` / `try_discard` error may follow the truncation, so a failed
+/// shrink or tail free reports its handle lost (`None`).
+///
 /// # Thread safety
 ///
 /// Without the `atomic` feature, `LinearBStackAllocator` is **`Send`** but
@@ -165,13 +168,18 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
+        // Set before the shrink's `discard`: its error may follow the truncation.
+        let mut lost = false;
         // handle is dropped here (no-op Drop); we reconstruct below on success
-        (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let current_tail = self.stack.len()?;
             if end != current_tail {
-                return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                return Err(io_error!(
+                    Unsupported,
+                    "LinearBStackAllocator does not support reallocation of non-tail slices; \
                      callers must alloc a new region and copy manually. \
-                     Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
+                     Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."
+                ));
             }
             match new_len.cmp(&old_len) {
                 std::cmp::Ordering::Equal => {
@@ -184,17 +192,21 @@ impl BStackAllocator for LinearBStackAllocator {
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
                 std::cmp::Ordering::Less => {
+                    lost = true;
                     self.stack.discard(old_len - new_len)?;
                     // SAFETY: tail was shrunk in place
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
             }
-        })()
-        .map_err(|source| BStackAllocError {
+        })();
+        result.map_err(|source| BStackAllocError {
             source,
-            // Every failure path above leaves the original region intact.
-            // SAFETY: (start, old_len) still describes the live, unmodified allocation.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still describes the live, unmodified allocation.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
         })
     }
 
@@ -212,8 +224,10 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let old_len = handle.len();
         let end = handle.end();
+        // Set when the shrink's `try_discard` errs: the error may follow the truncation.
+        let mut lost = false;
         // handle dropped (no-op); reconstruct below on success
-        (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             match new_len.cmp(&old_len) {
                 std::cmp::Ordering::Equal => {
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
@@ -224,29 +238,42 @@ impl BStackAllocator for LinearBStackAllocator {
                     // realised by one `set_len` on a sparse file, so the zeros
                     // cost no write I/O and no heap staging.
                     if !self.stack.try_extend_zeros(end, new_len - old_len)? {
-                        return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                        return Err(io_error!(
+                            Unsupported,
+                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
                              callers must alloc a new region and copy manually. \
-                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."
+                        ));
                     }
                     // SAFETY: tail atomically extended in place
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
                 std::cmp::Ordering::Less => {
-                    if !self.stack.try_discard(end, old_len - new_len)? {
-                        return Err(io_error!(Unsupported, "LinearBStackAllocator does not support reallocation of non-tail slices; \
+                    if !self
+                        .stack
+                        .try_discard(end, old_len - new_len)
+                        .inspect_err(|_| lost = true)?
+                    {
+                        return Err(io_error!(
+                            Unsupported,
+                            "LinearBStackAllocator does not support reallocation of non-tail slices; \
                              callers must alloc a new region and copy manually. \
-                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."));
+                             Note: dealloc of the old (non-tail) slice is also a no-op and leaks the region."
+                        ));
                     }
                     // SAFETY: tail atomically shrunk in place
                     Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, start, new_len) })
                 }
             }
-        })()
-        .map_err(|source| BStackAllocError {
+        })();
+        result.map_err(|source| BStackAllocError {
             source,
-            // Every failure path above leaves the original region intact.
-            // SAFETY: (start, old_len) still describes the live, unmodified allocation.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, old_len) still describes the live, unmodified allocation.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, old_len) })
+            },
         })
     }
 
@@ -259,18 +286,24 @@ impl BStackAllocator for LinearBStackAllocator {
         let start = handle.start();
         let end = handle.end();
         let len = handle.len();
-        (|| -> io::Result<()> {
+        // Set before the `discard`: its error may follow the truncation.
+        let mut lost = false;
+        let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
             if end == current_tail {
+                lost = true;
                 self.stack.discard(len)?;
             }
             Ok(())
-        })()
-        .map_err(|source| BStackAllocError {
+        })();
+        result.map_err(|source| BStackAllocError {
             source,
-            // A failed discard leaves the region still allocated.
-            // SAFETY: (start, len) still describes the live allocation.
-            handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) }),
+            handle: if lost {
+                None
+            } else {
+                // SAFETY: (start, len) still describes the live allocation.
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) })
+            },
         })
     }
 
@@ -280,19 +313,12 @@ impl BStackAllocator for LinearBStackAllocator {
         handle: BStackOwnedSlice<'a, Self>,
     ) -> Result<(), BStackAllocError<'a, Self>> {
         let handle = ensure_own_handle(self, handle, "LinearBStackAllocator::dealloc")?;
-        let start = handle.start();
-        let end = handle.end();
-        let len = handle.len();
         // try_discard is a no-op when the tail has moved, matching non-tail dealloc semantics.
+        // Its error may follow the truncation, so the handle is reported lost.
         self.stack
-            .try_discard(end, len)
+            .try_discard(handle.end(), handle.len())
             .map(|_| ())
-            .map_err(|source| BStackAllocError {
-                source,
-                // A failed discard leaves the region still allocated.
-                // SAFETY: (start, len) still describes the live allocation.
-                handle: Some(unsafe { BStackOwnedSlice::from_raw_parts(self, start, len) }),
-            })
+            .map_err(BStackAllocError::lost)
     }
 }
 
@@ -423,6 +449,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
+        let mut lost = false;
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
             let mut discard_start = current_tail;
@@ -433,15 +460,15 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             }
             let to_discard = current_tail - discard_start;
             if to_discard > 0 {
+                lost = true;
                 self.stack.discard(to_discard)?;
             }
             Ok(())
         })();
-        // The discard is a single call: on failure nothing was freed, so every
-        // handle is still owned by the caller.
+        // A `discard` error may follow the truncation, so no handle is returned.
         result.map_err(|source| BStackBulkAllocError {
             source,
-            handles: sorted,
+            handles: if lost { Vec::new() } else { sorted },
         })
     }
 
@@ -460,6 +487,7 @@ impl BStackBulkAllocator for LinearBStackAllocator {
         }
         let mut sorted = ensure_own_handles(self, owned, "LinearBStackAllocator::dealloc_bulk")?;
         sorted.sort_by_key(|s| std::cmp::Reverse(s.end()));
+        let mut lost = false;
         let result = (|| -> io::Result<()> {
             let current_tail = self.stack.len()?;
             let mut discard_start = current_tail;
@@ -470,15 +498,15 @@ impl BStackBulkAllocator for LinearBStackAllocator {
             }
             let to_discard = current_tail - discard_start;
             if to_discard > 0 {
+                lost = true;
                 self.stack.try_discard(current_tail, to_discard)?;
             }
             Ok(())
         })();
-        // The try_discard is a single call: on failure nothing was freed, so
-        // every handle is still owned by the caller.
+        // A `try_discard` error may follow the truncation, so no handle is returned.
         result.map_err(|source| BStackBulkAllocError {
             source,
-            handles: sorted,
+            handles: if lost { Vec::new() } else { sorted },
         })
     }
 }
@@ -550,18 +578,16 @@ mod fault_tests {
         assert_eq!(s.read().unwrap(), vec![7u8; 64]);
     }
 
-    // Tail `dealloc` faults on its `discard` (after the `len` tail check, before
-    // any mutation): the region survives, so the error must hand the handle back
-    // and a retry must succeed.
+    // Tail `dealloc` faults on its `discard`. A `discard` error may follow the
+    // truncation, so the handle is reported lost even though this fault fires
+    // before it.
     #[test]
-    fn dealloc_tail_discard_fault_returns_handle() {
+    fn dealloc_tail_discard_fault_reports_lost() {
         let path = temp_path("lin_dealloc");
         let _g = Guard(path.clone());
         let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
 
-        let mut s = alloc.alloc(64).unwrap();
-        s.write([9u8; 64]).unwrap();
-        let (start, len) = (s.start(), s.len());
+        let s = alloc.alloc(64).unwrap();
 
         arm(&alloc, FailOpAt::new("discard", 0, ErrorKind::Other));
         let err = alloc
@@ -569,14 +595,11 @@ mod fault_tests {
             .expect_err("dealloc must fail when discard faults");
         disarm(&alloc);
 
-        let handle = err
-            .handle
-            .expect("linear dealloc leaves the region live, so the handle must be returned");
-        assert_eq!((handle.start(), handle.len()), (start, len));
-        assert_eq!(handle.read().unwrap(), vec![9u8; 64], "data must be intact");
-
-        // Retrying the free (unarmed) reclaims the tail cleanly.
-        alloc.dealloc(handle).unwrap();
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        assert!(
+            err.handle.is_none(),
+            "a discard error reports the handle lost"
+        );
     }
 
     // `realloc` reads the payload size to decide whether the handle is still at
@@ -681,5 +704,39 @@ mod inplace_resize_tests {
             assert_eq!(err.source.kind(), ErrorKind::Unsupported);
             assert!(err.handle.is_some());
         }
+    }
+}
+
+// A tail-changing call's error may follow its truncation, so every tail shrink
+// or free reports its handle lost. Locking the payload forces that call to err
+// in both builds.
+#[cfg(all(test, feature = "alloc"))]
+mod tail_error_tests {
+    use super::LinearBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::{BStackAllocator, BStackBulkAllocator};
+
+    #[test]
+    fn tail_shrink_and_free_errors_report_lost() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_lin_tail_err_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let alloc = LinearBStackAllocator::new(BStack::open(&path).unwrap());
+        // A fresh tail allocation, locked so its discard errs.
+        let locked_tail = || {
+            let h = alloc.alloc(64).unwrap();
+            alloc.stack().lock_up_to(alloc.len().unwrap()).unwrap();
+            h
+        };
+
+        let err = alloc.realloc(locked_tail(), 32).unwrap_err();
+        assert!(err.handle.is_none(), "realloc shrink");
+        let err = alloc.dealloc(locked_tail()).unwrap_err();
+        assert!(err.handle.is_none(), "dealloc");
+        let err = alloc.dealloc_bulk(vec![locked_tail()]).unwrap_err();
+        assert!(err.handles.is_empty(), "dealloc_bulk");
+
+        drop(alloc);
+        let _ = std::fs::remove_file(&path);
     }
 }

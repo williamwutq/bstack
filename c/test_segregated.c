@@ -1659,6 +1659,36 @@ static int test_concurrent_coalesce_never_doubles_blocks(void)
  * main
  * ====================================================================== */
 
+/* A tail-changing call's error may follow its truncation, so a failed tail
+ * shrink or free is a loss (-2). Locking the payload forces that call to err. */
+static int test_tail_errors_report_lost(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    segregated_bstack_allocator_t *a = segregated_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+    bstack_slice_t s;
+    uint64_t len;
+
+    CHECK(bstack_allocator_alloc(al, 4500, &s) == 0); /* oversized, at the tail */
+    CHECK(bstack_len(bs, &len) == 0 && bstack_lock_up_to(bs, len) == 0);
+    CHECK(bstack_allocator_dealloc(al, s) == -2);
+
+#ifdef BSTACK_FEATURE_ATOMIC
+    {
+        /* Only atomic reclaims a tail shrink (one LEN + SPLICE). */
+        bstack_slice_t out;
+        CHECK(bstack_allocator_alloc(al, 4500, &s) == 0);
+        CHECK(bstack_len(bs, &len) == 0 && bstack_lock_up_to(bs, len) == 0);
+        CHECK(bstack_allocator_realloc(al, s, 100, &out) == -2);
+    }
+#endif
+
+    bstack_close(segregated_bstack_allocator_into_stack(a));
+    sg_unlink(tmp); return 0;
+}
+
 int main(void)
 {
     T(test_new_initialises_header);
@@ -1666,6 +1696,7 @@ int main(void)
     T(test_reopen_rejects_bad_magic);
     T(test_reopen_rejects_misaligned_arena);
     T(test_alloc_zero_is_empty);
+    T(test_tail_errors_report_lost);
     T(test_alloc_roundtrip_all_ranges);
     T(test_dealloc_reuses_block);
     T(test_double_free_and_mismatch_detected);

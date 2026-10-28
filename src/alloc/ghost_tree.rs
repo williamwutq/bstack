@@ -1203,16 +1203,14 @@ impl GhostTreeBstackAllocator {
                 }
 
                 // Non-atomic tail shrink. No `atrunc`/`process_gen` without the
-                // `atomic` feature, so discard FIRST (a fault there fires before
-                // any mutation → the original is fully intact → `Some(old_len)`),
-                // then mark the shrink committed and zero the sub-block padding. A
-                // fault at that zero can no longer hand back the (now-shrunk)
-                // original, so `lost` makes the caller get `None` rather than a
-                // partially-zeroed "original".
+                // `atomic` feature, so discard first, then zero the sub-block
+                // padding. A `discard` error may follow the truncation, and past
+                // it the (now-shrunk) original cannot be handed back, so both
+                // report `None`.
                 #[cfg(not(feature = "atomic"))]
                 if start + aligned_old == self.stack.len()? {
-                    self.stack.discard(freed_tail)?;
                     lost = true;
+                    self.stack.discard(freed_tail)?;
                     if new_len < aligned_new {
                         self.stack.zero(start + new_len, aligned_new - new_len)?;
                     }
@@ -1600,8 +1598,8 @@ impl BStackAllocator for GhostTreeBstackAllocator {
         // in-process, so the block can no longer be returned for a retry —
         // re-inserting an already-linked node would corrupt the free tree
         // (self-cycle / duplicate parent link → the same region handed to two
-        // allocations). Failures before this point (validation, or the atomic
-        // tail discard, which frees nothing on failure) keep the handle.
+        // allocations). A tail discard error may follow the truncation, so it
+        // sets `lost` too. Validation failures keep the handle.
         let mut lost = false;
         let result = (|| -> io::Result<()> {
             if slice.is_empty() {
@@ -1627,13 +1625,18 @@ impl BStackAllocator for GhostTreeBstackAllocator {
             // making the check-and-discard atomic w.r.t. other threads' pushes.
             // If it fails the block is no longer at the tail; fall through to insert.
             #[cfg(feature = "atomic")]
-            if self.stack.try_discard(ptr + true_len, true_len)? {
+            if self
+                .stack
+                .try_discard(ptr + true_len, true_len)
+                .inspect_err(|_| lost = true)?
+            {
                 return Ok(());
             }
 
             // Tail optimisation: truncate instead of recycling through the AVL tree.
             #[cfg(not(feature = "atomic"))]
             if ptr + true_len == self.stack.len()? {
+                lost = true;
                 return self.stack.discard(true_len);
             }
 
@@ -3425,5 +3428,37 @@ mod fault_tests {
         assert_eq!((handle.start(), handle.len()), (start, len));
         assert_eq!(handle.read().unwrap(), vec![5u8; 64], "data must be intact");
         alloc.dealloc(handle).unwrap();
+    }
+}
+
+// A tail-changing call's error may follow its truncation, so every tail shrink
+// or free reports its handle lost. Locking the payload forces that call to err
+// in both builds.
+#[cfg(all(test, feature = "alloc", feature = "set"))]
+mod tail_error_tests {
+    use super::GhostTreeBstackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+
+    #[test]
+    fn tail_shrink_and_free_errors_report_lost() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_gt_tail_err_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let alloc = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        // A fresh tail allocation, locked so its truncation errs.
+        let locked_tail = || {
+            let h = alloc.alloc(128).unwrap();
+            alloc.stack().lock_up_to(alloc.len().unwrap()).unwrap();
+            h
+        };
+
+        let err = alloc.realloc(locked_tail(), 64).unwrap_err();
+        assert!(err.handle.is_none(), "realloc shrink");
+        let err = alloc.dealloc(locked_tail()).unwrap_err();
+        assert!(err.handle.is_none(), "dealloc");
+
+        drop(alloc);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1919,11 +1919,10 @@ static int linear_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
     if (check_own_slice(self, slice) != 0) { *out = slice; return -1; }
 
     /*
-     * Every failure path below leaves the original region untouched: the
-     * validation checks reject before any mutation, and the extend/discard
-     * calls are each a single bstack operation that either fully commits or
-     * leaves the stack unchanged. So every failure here is survivable (-1),
-     * never a loss (-2).
+     * Every failure path below but the shrink leaves the original region
+     * untouched (-1): the validation checks reject before any mutation, and
+     * a failed extend leaves the stack unchanged. A discard error may follow
+     * the truncation, so a failed shrink is a loss (-2).
      */
     if (bstack_len(a->bs, &cur_tail) != 0) {
         *out = slice;
@@ -1960,10 +1959,7 @@ static int linear_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
             return -1;
         }
 #endif
-        if (bstack_discard(a->bs, (size_t)shrink) != 0) {
-            *out = slice;
-            return -1;
-        }
+        if (bstack_discard(a->bs, (size_t)shrink) != 0) return -2;
     }
     out->allocator = self;
     out->offset    = slice.offset;
@@ -1979,9 +1975,8 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
     if (check_own_slice(self, slice) != 0) return -1;
 
     /*
-     * discard is a single bstack operation: on failure the stack is
-     * unchanged, so slice always survives a failed dealloc here (-1),
-     * never -2.
+     * A discard error may follow the truncation, so a failed tail free is a
+     * loss (-2).
      */
     if (bstack_len(a->bs, &cur_tail) != 0)
         return -1;
@@ -1992,7 +1987,7 @@ static int linear_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
             return -1;
         }
 #endif
-        return bstack_discard(a->bs, (size_t)slice.len) == 0 ? 0 : -1;
+        return bstack_discard(a->bs, (size_t)slice.len) == 0 ? 0 : -2;
     }
     return 0; /* non-tail slice: no-op */
 }
@@ -5159,11 +5154,12 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
 #endif
 
 #ifdef BSTACK_FEATURE_ATOMIC
-    /* Atomic tail path: check-and-discard under BStack's own write lock. */
+    /* Atomic tail path: check-and-discard under BStack's own write lock. An
+     * error may follow the truncation, so it reports the block lost (-2). */
     {
         int ok = 0;
         if (bstack_try_discard(a->bs, slice.offset + true_len,
-                               (size_t)true_len, &ok) != 0) return -1;
+                               (size_t)true_len, &ok) != 0) return -2;
         if (ok) return 0;
     }
     /* Not at tail: zero block (caller owns it; no lock), then insert under lock.
@@ -5189,8 +5185,8 @@ static int gt_vt_dealloc(bstack_allocator_t *self, bstack_slice_t slice)
         if (bstack_len(a->bs, &stack_len) != 0) return -1;
         if (slice.offset + true_len == stack_len) {
             /* Tail block: truncate instead of recycling through the tree.
-             * A single atomic bstack call — on failure nothing changed. */
-            return bstack_discard(a->bs, (size_t)true_len) == 0 ? 0 : -1;
+             * An error may follow the truncation, so it is a loss (-2). */
+            return bstack_discard(a->bs, (size_t)true_len) == 0 ? 0 : -2;
         }
         /* Non-tail: zero entire block (upholds zeroed-memory invariant), insert.
          * The zero leaves the block intact on failure (-1); past that point a
@@ -5328,15 +5324,11 @@ static int gt_vt_realloc(bstack_allocator_t *self, bstack_slice_t slice,
 #if UINT64_MAX > SIZE_MAX
             if (freed_tail > (uint64_t)SIZE_MAX) { errno = EINVAL; *out = recovered; return -1; }
 #endif
-            /* Discard the freed tail FIRST: a fault here fires before any
-             * mutation, so the original is fully intact (-1, survived). Only
-             * once the shrink is committed do we zero the retained block's
-             * padding — a fault there can no longer hand back the (now
-             * shorter) original, since the stack no longer covers old_len. */
-            if (bstack_discard(a->bs, (size_t)freed_tail) != 0) {
-                *out = recovered;
-                return -1;
-            }
+            /* Discard the freed tail first, then zero the retained block's
+             * padding. A discard error may follow the truncation, and past it
+             * the (now shorter) original cannot be handed back, so both
+             * report the block lost (-2). */
+            if (bstack_discard(a->bs, (size_t)freed_tail) != 0) return -2;
             if (new_len < aligned_new) {
                 uint64_t gap = aligned_new - new_len;
 #if UINT64_MAX > SIZE_MAX
@@ -6198,7 +6190,8 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
 
     /* Tail discard path: only for oversized allocations (> 1 block).
      * try_discard atomically checks tail == slice_end and removes backing_size
-     * bytes under BStack's own write lock — no allocator lock needed. */
+     * bytes under BStack's own write lock — no allocator lock needed. A
+     * discard error may follow the truncation, so it is a loss (-2). */
     if (s.len > a->block_size) {
         if (s.offset > UINT64_MAX - backing_size) { errno = EINVAL; return -1; }
 #if UINT64_MAX > SIZE_MAX
@@ -6208,7 +6201,7 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
         {
             int ok = 0;
             if (bstack_try_discard(a->bs, s.offset + backing_size,
-                                   (size_t)backing_size, &ok) != 0) return -1;
+                                   (size_t)backing_size, &ok) != 0) return -2;
             if (ok) return 0;
         }
 #else
@@ -6216,7 +6209,7 @@ static int slab_vtbl_dealloc(bstack_allocator_t *base, bstack_slice_t s)
             uint64_t tail;
             if (bstack_len(a->bs, &tail) != 0) return -1;
             if (s.offset + backing_size == tail)
-                return bstack_discard(a->bs, (size_t)backing_size);
+                return bstack_discard(a->bs, (size_t)backing_size) == 0 ? 0 : -2;
         }
 #endif
     }
@@ -6414,11 +6407,9 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
 #ifdef BSTACK_FEATURE_ATOMIC
         {
             int ok = 0;
+            /* An error may follow the truncation: a loss (-2). */
             if (bstack_try_discard(a->bs, sentinel,
-                                   (size_t)to_discard, &ok) != 0) {
-                *out = recovered;
-                return -1;
-            }
+                                   (size_t)to_discard, &ok) != 0) return -2;
             if (ok) tail_done = 1;
         }
 #else
@@ -6426,10 +6417,8 @@ static int slab_vtbl_realloc(bstack_allocator_t *base, bstack_slice_t s,
             uint64_t tail;
             if (bstack_len(a->bs, &tail) != 0) { *out = recovered; return -1; }
             if (sentinel == tail) {
-                if (bstack_discard(a->bs, (size_t)to_discard) != 0) {
-                    *out = recovered;
-                    return -1;
-                }
+                /* An error may follow the truncation: a loss (-2). */
+                if (bstack_discard(a->bs, (size_t)to_discard) != 0) return -2;
                 tail_done = 1;
             }
         }
@@ -6618,7 +6607,8 @@ static int slab_splice_blocks_onto_free_list(bstack_t *bs,
 }
 
 /* Best-effort cleanup after an alloc_bulk failure: truncate the fresh tail
- * first, else recycle it onto the free list alongside the popped blocks. */
+ * first, else (tail moved) recycle it onto the free list alongside the popped
+ * blocks. */
 static void slab_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
                                              const uint64_t *popped, size_t pcount,
                                              uint64_t ext_base, uint64_t ext_bytes)
@@ -6628,7 +6618,8 @@ static void slab_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
         truncated = 1;
     } else {
         int ok = 0;
-        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) == 0 && ok)
+        /* An error may follow the cut, so the tail is then leaked, not recycled. */
+        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) != 0 || ok)
             truncated = 1;
     }
     if (truncated) {
@@ -8296,12 +8287,12 @@ static int alck_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
 #endif
 
     /* Tail path: try_discard atomically checks tail == slice_end and removes
-     * backing bytes under bstack's own write lock — no allocator lock needed. */
+     * backing bytes under bstack's own write lock — no allocator lock needed.
+     * A discard error may follow the truncation, so it is a loss (-2). */
 #ifdef BSTACK_FEATURE_ATOMIC
     {
         int ok = 0;
-        if (bstack_try_discard(a->bs, slice_end, (size_t)backing, &ok) != 0)
-            return -1;
+        if (bstack_try_discard(a->bs, slice_end, (size_t)backing, &ok) != 0) return -2;
         if (ok) return 0;
     }
 #else
@@ -8309,7 +8300,7 @@ static int alck_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
         uint64_t tail;
         if (bstack_len(a->bs, &tail) != 0) return -1;
         if (slice_end == tail)
-            return bstack_discard(a->bs, (size_t)backing);
+            return bstack_discard(a->bs, (size_t)backing) == 0 ? 0 : -2;
     }
 #endif
 
@@ -8853,7 +8844,8 @@ static void alck_reclaim_after_alloc_failure(bstack_t *bs, uint64_t block_size,
         truncated = 1;
     } else {
         int ok = 0;
-        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) == 0 && ok)
+        /* An error may follow the cut, so the tail is then leaked, not recycled. */
+        if (bstack_try_discard(bs, ext_base + ext_bytes, (size_t)ext_bytes, &ok) != 0 || ok)
             truncated = 1;
     }
     if (truncated) {
@@ -10737,11 +10729,12 @@ static int alsg_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
         if (size > (uint64_t)SIZE_MAX) RETURN_INVALID;
 #endif
 #undef RETURN_INVALID
-        /* Oversized tail block: hand its bytes back to the stack. */
+        /* Oversized tail block: hand its bytes back to the stack. A discard
+         * error may follow the truncation, so it is a loss (-2). */
 #ifdef BSTACK_FEATURE_ATOMIC
         {
             int ok = 0;
-            if (bstack_try_discard(bs, end, (size_t)size, &ok)) return -1;
+            if (bstack_try_discard(bs, end, (size_t)size, &ok)) return -2;
             if (ok) return 0;
         }
 #else
@@ -10749,7 +10742,7 @@ static int alsg_dealloc_impl(bstack_allocator_t *base, bstack_slice_t s)
             uint64_t tail;
             if (bstack_len(bs, &tail)) return -1;
             if (end == tail)
-                return bstack_discard(bs, (size_t)size) == 0 ? 0 : -1;
+                return bstack_discard(bs, (size_t)size) == 0 ? 0 : -2;
         }
 #endif /* BSTACK_FEATURE_ATOMIC */
     }
@@ -10792,7 +10785,8 @@ static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
 
     /* The surviving allocation to hand back on failure — the original block,
      * updated to the new region only once a move has committed it.  Every path
-     * below leaves it valid, so `goto fail_recover` always fails -1 (survived).
+     * below leaves it valid, so `goto fail_recover` always fails -1 (survived);
+     * the tail shrink's SPLICE error returns -2 directly.
      * `result` is the region to hand back on success (`goto success`). */
     recovered.allocator = base; recovered.offset = start; recovered.len = old_len;
 
@@ -10866,7 +10860,12 @@ static int alsg_realloc_impl(bstack_allocator_t *base, bstack_slice_t s,
             c.new_len       = (size_t)new_size;
             rc = bstack_process_gen(bs, bstack_alloc_tail_shrink_gen, &c);
             free(nb);
-            if (rc) goto fail_recover;
+            /* A SPLICE error may follow its commit (-2); a LEN error precedes
+             * any mutation. */
+            if (rc) {
+                if (c.truncated) return -2;
+                goto fail_recover;
+            }
             if (c.truncated) { result.offset = start; result.len = new_len; goto success; }
             /* Non-tail: fall through and retain the excess in place. */
         }

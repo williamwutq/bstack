@@ -2044,6 +2044,31 @@ static int test_poisoned_allocator_refuses_until_reopen(void)
     return 0;
 }
 
+/* A tail-changing call's error may follow its truncation, so a failed tail
+ * shrink or free is a loss (-2). Locking the payload forces that call to err. */
+static int test_tail_errors_report_lost(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp); CHECK(bs);
+    ghost_tree_bstack_allocator_t *a = ghost_tree_bstack_allocator_new(bs);
+    CHECK(a);
+    bstack_allocator_t *al = (bstack_allocator_t *)a;
+    bstack_slice_t s, out;
+    uint64_t len;
+
+    CHECK(bstack_allocator_alloc(al, 128, &s) == 0);
+    CHECK(bstack_len(bs, &len) == 0 && bstack_lock_up_to(bs, len) == 0);
+    CHECK(bstack_allocator_realloc(al, s, 64, &out) == -2);
+
+    CHECK(bstack_allocator_alloc(al, 128, &s) == 0);
+    CHECK(bstack_len(bs, &len) == 0 && bstack_lock_up_to(bs, len) == 0);
+    CHECK(bstack_allocator_dealloc(al, s) == -2);
+
+    bstack_close(ghost_tree_bstack_allocator_into_stack(a));
+    gt_unlink(tmp);
+    return 0;
+}
+
 int main(void)
 {
     /* Unit */
@@ -2051,6 +2076,7 @@ int main(void)
     T(test_alloc_zero_len);
     T(test_dealloc_zero_len_noop);
     T(test_dealloc_tail_shrinks_stack);
+    T(test_tail_errors_report_lost);
     T(test_dealloc_nontail_reuses);
     T(test_freed_block_is_zeroed);
     T(test_alignment);

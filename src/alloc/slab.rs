@@ -586,6 +586,8 @@ impl SlabBStackAllocator {
         // commits the retained region (both distinct from any blocks being
         // freed, so the handle is always safe to return).
         let mut recovered = (start, old_len);
+        // Set when a tail-shrink discard errs: the error may follow the truncation.
+        let mut lost = false;
         let result = (|| -> io::Result<BStackOwnedSlice<'a, Self>> {
             let old_n = self.blocks_needed(slice.len());
             let new_n = self.blocks_needed(new_len);
@@ -689,7 +691,8 @@ impl SlabBStackAllocator {
             #[cfg(feature = "atomic")]
             if self
                 .stack
-                .try_discard(checked_len, old_backing - new_backing)?
+                .try_discard(checked_len, old_backing - new_backing)
+                .inspect_err(|_| lost = true)?
             {
                 // SAFETY: slice shrunk in place at the tail
                 return Ok(unsafe {
@@ -699,6 +702,7 @@ impl SlabBStackAllocator {
 
             #[cfg(not(feature = "atomic"))]
             if checked_len == self.stack.len()? {
+                lost = true;
                 self.stack.discard(old_backing - new_backing)?;
                 // SAFETY: slice shrunk in place at the tail
                 return Ok(unsafe {
@@ -723,9 +727,11 @@ impl SlabBStackAllocator {
         result.map_err(|source| BStackAllocError {
             source,
             // SAFETY: `recovered` names a live region owned by the caller.
-            handle: Some(unsafe {
-                BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1)
-            }),
+            handle: if lost {
+                None
+            } else {
+                Some(unsafe { BStackOwnedSlice::from_raw_parts(self, recovered.0, recovered.1) })
+            },
         })
     }
 }
@@ -788,7 +794,8 @@ impl BStackAllocator for SlabBStackAllocator {
         let start = slice.start();
         let len = slice.len();
         // Set once the caller's blocks may have been partially freed, after
-        // which returning the handle for retry would risk a double-free.
+        // which returning the handle for retry would risk a double-free, or
+        // when a tail discard errs (the error may follow the truncation).
         let mut lost = false;
         let result = (|| -> io::Result<()> {
             if slice.is_empty() && slice.start() == Self::SENTINEL {
@@ -808,12 +815,18 @@ impl BStackAllocator for SlabBStackAllocator {
             // try_discard atomically checks tail == slice_end and removes backing_size
             // bytes under BStack's own write lock — no allocator lock needed.
             #[cfg(feature = "atomic")]
-            if slice.len() > self.block_size && self.stack.try_discard(slice_end, backing_size)? {
+            if slice.len() > self.block_size
+                && self
+                    .stack
+                    .try_discard(slice_end, backing_size)
+                    .inspect_err(|_| lost = true)?
+            {
                 return Ok(());
             }
 
             #[cfg(not(feature = "atomic"))]
             if slice.len() > self.block_size && slice_end == self.stack.len()? {
+                lost = true;
                 return self.stack.discard(backing_size);
             }
 
@@ -1307,13 +1320,14 @@ impl SlabBStackAllocator {
     /// Best-effort cleanup after an `alloc_bulk` extend path fails partway.
     ///
     /// Truncating the fresh tail is preferred (it shrinks the file); the popped
-    /// blocks then go back to the free list. If the truncation cannot happen (I/O
-    /// error, or another thread grew the tail past ours), the `remainder` fresh
-    /// blocks are recycled onto the free list alongside the popped ones instead
-    /// of being leaked. `ext_bytes == 0` means no tail was created (the extend
-    /// itself failed), so only the popped blocks are returned. Every step is
-    /// best-effort: a failure here leaves the blocks leaked (the free list stays
-    /// consistent; `recover` reclaims them for the checked variant).
+    /// blocks then go back to the free list. If another thread grew the tail
+    /// past ours, the `remainder` fresh blocks are recycled onto the free list
+    /// alongside the popped ones instead of being leaked. A truncation error may
+    /// follow the cut, so the fresh tail is then leaked rather than recycled.
+    /// `ext_bytes == 0` means no tail was created (the extend itself failed), so
+    /// only the popped blocks are returned. Every step is best-effort: a failure
+    /// here leaves the blocks leaked (the free list stays consistent; `recover`
+    /// reclaims them for the checked variant).
     fn reclaim_after_alloc_failure(&self, popped: &[u64], ext_base: u64, ext_bytes: u64) {
         let bs = self.block_size;
         // 1. Try to truncate the fresh tail first.
@@ -1321,9 +1335,10 @@ impl SlabBStackAllocator {
             || self
                 .stack
                 .try_discard(ext_base + ext_bytes, ext_bytes)
-                .unwrap_or(false);
+                .unwrap_or(true);
         if truncated {
-            // 2. Tail gone (or never created): return only the popped blocks.
+            // 2. Tail gone, never created, or possibly gone after an error:
+            //    return only the popped blocks.
             let _ = self.splice_blocks_onto_free_list(popped);
         } else {
             // 3. Could not truncate: return the popped blocks AND the fresh tail.
@@ -2632,15 +2647,14 @@ mod bulk_fault_tests {
         );
     }
 
-    // When cleanup cannot truncate the fresh tail (here the truncate is faulted),
-    // the extend path recycles those blocks onto the free list too, so nothing
-    // leaks — the whole arena stays reusable without any further extend.
+    // A faulted cleanup truncate may still have cut the fresh tail, so those
+    // blocks are leaked rather than recycled; only the popped blocks return.
     #[test]
-    fn alloc_bulk_cleanup_recycles_tail_when_discard_fails() {
+    fn alloc_bulk_cleanup_leaks_tail_when_discard_fails() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // Fail the first claim (`inplace_gen`) to trigger cleanup, then fail the
-        // cleanup's truncate (`try_discard`) so the tail is recycled instead.
+        // cleanup's truncate (`try_discard`).
         struct FailClaimThenDiscard {
             claim: AtomicBool,
             discard: AtomicBool,
@@ -2676,17 +2690,15 @@ mod bulk_fault_tests {
         disarm(&alloc);
         assert_eq!(err.kind(), ErrorKind::Other);
 
-        // All five arena blocks (two popped + three fresh tail) are back on the
-        // free list, so five allocations reuse them without growing the stack.
+        // The two popped blocks are back on the free list; the fresh tail is
+        // not, so a third allocation grows the stack.
         let len_before = alloc.stack().len().unwrap();
-        let mut held = Vec::new();
-        for _ in 0..5 {
-            held.push(alloc.alloc(BLOCK).unwrap());
-        }
-        assert_eq!(
-            alloc.stack().len().unwrap(),
-            len_before,
-            "the fresh tail was leaked instead of recycled onto the free list"
+        let _held = [alloc.alloc(BLOCK).unwrap(), alloc.alloc(BLOCK).unwrap()];
+        assert_eq!(alloc.stack().len().unwrap(), len_before);
+        let third = alloc.alloc(BLOCK).unwrap();
+        assert!(
+            third.start() >= len_before,
+            "the possibly-cut fresh tail must not be recycled onto the free list"
         );
     }
 }
@@ -2695,8 +2707,8 @@ mod bulk_fault_tests {
 // the `atomic` build). Slab has no recovery routine — consistency rests entirely
 // on write ordering (payload before `free_head`), so a fault during a free-list
 // push leaks at most the in-flight block and never corrupts the list. The tests
-// pin the handle contract for the retained (oversized tail) and lost (free-list)
-// paths and confirm a reopen sees an intact, usable arena.
+// pin the handle contract for the oversized-tail and free-list paths (both
+// lost) and confirm a reopen sees an intact, usable arena.
 #[cfg(all(
     test,
     debug_assertions,
@@ -2743,18 +2755,16 @@ mod fault_tests {
         assert_eq!(s.read().unwrap(), vec![7u8; BLOCK as usize]);
     }
 
-    // Freeing an oversized tail allocation is a single `discard` with no `lost`
-    // marking; a fault there leaves the region live, so the handle comes back and
-    // a retry succeeds.
+    // Freeing an oversized tail allocation is a single `discard`. Its error may
+    // follow the truncation, so the handle is reported lost even though this
+    // fault fires before it.
     #[test]
-    fn dealloc_oversized_tail_discard_fault_returns_handle() {
+    fn dealloc_oversized_tail_discard_fault_reports_lost() {
         let path = temp_path("slab_tail");
         let _g = Guard(path.clone());
         let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), BLOCK).unwrap();
 
-        let mut s = alloc.alloc(200).unwrap(); // oversized (4 blocks), at the tail
-        s.write([3u8; 200]).unwrap();
-        let (start, len) = (s.start(), s.len());
+        let s = alloc.alloc(200).unwrap(); // oversized (4 blocks), at the tail
 
         arm(&alloc, FailOpAt::new("discard", 0, ErrorKind::Other));
         let err = alloc
@@ -2762,16 +2772,11 @@ mod fault_tests {
             .expect_err("tail dealloc must fail when discard faults");
         disarm(&alloc);
 
-        let handle = err
-            .handle
-            .expect("oversized-tail dealloc leaves the region live");
-        assert_eq!((handle.start(), handle.len()), (start, len));
-        assert_eq!(
-            handle.read().unwrap(),
-            vec![3u8; 200],
-            "data must be intact"
+        assert_eq!(err.source.kind(), ErrorKind::Other);
+        assert!(
+            err.handle.is_none(),
+            "a discard error reports the handle lost"
         );
-        alloc.dealloc(handle).unwrap();
     }
 
     // A single-block, non-tail free enters the free-list push, which sets `lost`
@@ -2868,5 +2873,37 @@ mod read_fault_tests {
             freed,
             "the faulted chase must leave the block on the free list"
         );
+    }
+}
+
+// A tail-changing call's error may follow its truncation, so every tail shrink
+// or free reports its handle lost. Locking the payload forces that call to err
+// in both builds.
+#[cfg(all(test, feature = "set"))]
+mod tail_error_tests {
+    use super::SlabBStackAllocator;
+    use crate::BStack;
+    use crate::alloc::BStackAllocator;
+
+    #[test]
+    fn tail_shrink_and_free_errors_report_lost() {
+        let path =
+            std::env::temp_dir().join(format!("bstack_slab_tail_err_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let alloc = SlabBStackAllocator::new(BStack::open(&path).unwrap(), 64).unwrap();
+        // A fresh oversized tail allocation, locked so its discard errs.
+        let locked_tail = || {
+            let h = alloc.alloc(200).unwrap();
+            alloc.stack().lock_up_to(alloc.len().unwrap()).unwrap();
+            h
+        };
+
+        let err = alloc.realloc(locked_tail(), 100).unwrap_err();
+        assert!(err.handle.is_none(), "realloc shrink");
+        let err = alloc.dealloc(locked_tail()).unwrap_err();
+        assert!(err.handle.is_none(), "dealloc");
+
+        drop(alloc);
+        let _ = std::fs::remove_file(&path);
     }
 }
