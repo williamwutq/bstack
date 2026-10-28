@@ -518,3 +518,26 @@ let guard = BStackGuardedBuilder::over(slice) // innermost = closest to storage
 - **Static vs dynamic stacks.** A tuple/HList builder monomorphizes and inlines the fold with zero per-layer dispatch but fixes the layer count at the type level; a `Vec<Box<dyn BStackGuardedUnit>>` allows runtime-assembled pipelines at the cost of a virtual call and a heap indirection per layer. Pick the static form as the default and let a `Box<dyn>` unit holding a `Vec` cover the dynamic case, or offer both.
 - **Length bookkeeping.** For a length-changing stack `len()` (apparent) must be derived, and the atomic in-place methods (`write_range`/`process`/…) do not apply — they require `encode` to preserve the raw block length. The builder should surface whether the composed stack is length-preserving, so those methods are available exactly when every unit is.
 - **Relationship to the deprecation question.** If `BStackTransaction` subsumes cross-boundary atomicity and `guarded` is reduced to byte transformation (see "`guarded` semantics under `BStackTransaction`"), the unit/builder *is* that reduced core — the transform surface without the storage/atomicity trait machinery. These entries should be resolved together.
+
+## `DebugCheckingAllocator` support for concurrent operations (0.5.0)
+
+**Feature flag:** `alloc`.
+**Breaking change:** No. `Send` / `Sync` are unchanged.
+**Related:** Implemented on the `0.4-debug-checking` and `0.2-debug-checking` branches; this entry brings the same change to master.
+
+### Motivation
+
+`DebugCheckingAllocator<A>` is `Sync` whenever `A` is, yet its *Thread Safety* docs say concurrent use is unsupported without external synchronization. Each operation runs the inner call and the tracking update as separate steps, so another thread's operation can land in between. One thread frees a region in the inner allocator, a second is handed the same region before the free is recorded, and the wrapper panics with a false overlap; a real double-free can likewise slip past. Safe code can reach this, so the `Sync` impl and the docs disagree.
+
+### Design
+
+- Hold the tracking mutex across each inner call: `alloc`, `alloc_uninit`, `realloc`, `realloc_uninit`, `realloc_inplace`, `dealloc`, `alloc_bulk`, `dealloc_bulk`. Operations through the wrapper are then serialized and its checks stay exact. A `lock_state()` helper takes the lock and recovers from poisoning, since a panicked check poisons it.
+- Make `record_allocation`, `record_deallocation`, and `forget_region` methods on `DebugState`, called on the held guard instead of each locking on its own.
+- Rewrite *Thread Safety*: `Send` / `Sync` exactly when `A` is; operations are serialized; calls made directly on the inner allocator are not tracked.
+- No deadlock risk: each wrapper method calls the inner allocator once and never re-enters itself, and the inner allocator does not know the wrapper.
+- Test: a concurrent alloc → realloc → dealloc loop through one shared wrapper over a `Sync` inner allocator. A `Sync` mock whose `dealloc` lingers after freeing pins the race deterministically and needs no `atomic`.
+
+### Open questions
+
+- **`Sync` under new invariants.** If 0.5.0 reshapes the allocator API, the serialized wrapper must still be genuinely `Sync` under whatever invariants the new API adds, especially *`BStackTransaction`*: operations buffered in a transaction and committed later must not let the tracking sets drift from what the inner allocator actually committed.
+- **Allocator authority under range access control.** If *Range access control on `BStack` and `BStackOwnedSlice`* lands for allocators, the wrapper must be a clean pass-through of the inner allocator's authority: it holds no token of its own, never widens or leaks the inner one, and its checks never run as a privileged access to a protected range. All these must be done without or with minimal `unsafe` operations.
