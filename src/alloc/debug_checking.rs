@@ -70,7 +70,7 @@ use crate::BStack;
 use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// Returns `true` if two half-open byte ranges overlap.
 fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
@@ -254,6 +254,38 @@ struct DebugState {
     freed: HashSet<Range<u64>>,
 }
 
+impl DebugState {
+    /// Record a newly allocated region after validation.
+    fn record_allocation(&mut self, offset: u64, len: u64) {
+        record_allocated_region(self, offset..offset + len, "Newly allocated region", "");
+    }
+
+    /// Record a deallocation after validation.
+    fn record_deallocation(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let region = offset..offset + len;
+        let was_in_allocated = check_deallocation(&region, self, &HashSet::new());
+        if was_in_allocated {
+            self.allocated.remove(&region);
+        }
+        self.freed.insert(region);
+    }
+
+    /// Remove a region from the allocated set without inserting it into freed.
+    ///
+    /// Used when the inner allocator reports a lost handle (`handle: None` in
+    /// [`BStackAllocError`]): the region's fate is unknown, so tracking it as
+    /// either "live" or "freed" would produce false positives.
+    fn forget_region(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.allocated.remove(&(offset..offset + len));
+    }
+}
+
 /// Debug-only allocator wrapper that validates allocations and deallocations.
 ///
 /// Wraps any allocator whose `Allocated` type is [`BStackOwnedSlice`] and whose
@@ -272,10 +304,11 @@ struct DebugState {
 ///
 /// # Thread Safety
 ///
-/// The internal tracking sets are protected by a `Mutex` for internal bookkeeping, but
-/// allocation operations and tracking updates must not be assumed to be an atomic,
-/// cross-thread synchronization boundary. Concurrent use of this debug wrapper is therefore
-/// not supported unless the caller provides external synchronization.
+/// `DebugCheckingAllocator<A>` is `Send` / `Sync` exactly when `A` is. Every
+/// operation holds the tracking mutex across its inner call, so operations
+/// through the wrapper are serialized and the checks stay exact when it is
+/// shared across threads. Operations on the inner allocator that bypass the
+/// wrapper are not tracked.
 pub struct DebugCheckingAllocator<A>
 where
     A: BStackAllocator<Error = io::Error>,
@@ -289,7 +322,7 @@ where
     A: BStackAllocator<Error = io::Error> + std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock_state();
         f.debug_struct("DebugCheckingAllocator")
             .field("inner", &self.inner)
             .field("allocated_count", &state.allocated.len())
@@ -360,39 +393,11 @@ where
         self.inner
     }
 
-    /// Record a newly allocated region after validation.
-    fn record_allocation(&self, offset: u64, len: u64) {
-        let region = offset..offset + len;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        record_allocated_region(&mut state, region, "Newly allocated region", "");
-    }
-
-    /// Record a deallocation after validation.
-    fn record_deallocation(&self, offset: u64, len: u64) {
-        if len == 0 {
-            return;
-        }
-        let region = offset..offset + len;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let was_in_allocated = check_deallocation(&region, &state, &HashSet::new());
-        if was_in_allocated {
-            state.allocated.remove(&region);
-        }
-        state.freed.insert(region);
-    }
-
-    /// Remove a region from the allocated set without inserting it into freed.
-    ///
-    /// Used when the inner allocator reports a lost handle (`handle: None` in
-    /// [`BStackAllocError`]): the region's fate is unknown, so tracking it as
-    /// either "live" or "freed" would produce false positives.
-    fn forget_region(&self, offset: u64, len: u64) {
-        if len == 0 {
-            return;
-        }
-        let region = offset..offset + len;
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.allocated.remove(&region);
+    /// Lock the tracking state. Every operation holds the guard across its
+    /// inner call, so the inner allocator and the tracking sets change as one
+    /// step. A panicked check poisons the lock; the state is still usable.
+    fn lock_state(&self) -> MutexGuard<'_, DebugState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -410,11 +415,13 @@ where
         &'a self,
         inner_op: impl FnOnce(&'a A) -> io::Result<BStackOwnedSlice<'a, A>>,
     ) -> io::Result<BStackOwnedSlice<'a, Self>> {
+        let mut state = self.lock_state();
         let inner_slice = inner_op(&self.inner)?;
         let offset = inner_slice.start();
         let len = inner_slice.len();
 
-        self.record_allocation(offset, len);
+        state.record_allocation(offset, len);
+        drop(state);
 
         // SAFETY: The inner allocator successfully returned this region.
         Ok(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) })
@@ -449,6 +456,7 @@ where
         let inner_handle =
             unsafe { BStackOwnedSlice::from_raw_parts(&self.inner, old_offset, old_len) };
 
+        let mut state = self.lock_state();
         let new_inner_handle = match inner_op(&self.inner, inner_handle, new_len) {
             Ok(h) => h,
             Err(inner_err) => {
@@ -462,7 +470,7 @@ where
                         Some(unsafe { BStackOwnedSlice::from_raw_parts(self, o, l) })
                     }
                     None => {
-                        self.forget_region(old_offset, old_len);
+                        state.forget_region(old_offset, old_len);
                         None
                     }
                 };
@@ -478,7 +486,6 @@ where
         let new_len = new_inner_slice.len();
         let new_region = new_offset..new_offset + new_len;
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let overlapping_allocation = state
             .allocated
             .iter()
@@ -542,10 +549,8 @@ where
         let offset = handle.start();
         let len = handle.len();
 
-        {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            check_deallocation(&(offset..offset + len), &state, &HashSet::new());
-        }
+        let mut state = self.lock_state();
+        check_deallocation(&(offset..offset + len), &state, &HashSet::new());
 
         // SAFETY: Reconstructing the inner handle from coordinates that were
         // originally produced by the inner allocator.
@@ -560,7 +565,7 @@ where
                     Some(unsafe { BStackOwnedSlice::from_raw_parts(self, o, l) })
                 }
                 None => {
-                    self.forget_region(offset, len);
+                    state.forget_region(offset, len);
                     None
                 }
             };
@@ -570,7 +575,7 @@ where
             });
         }
 
-        self.record_deallocation(offset, len);
+        state.record_deallocation(offset, len);
         Ok(())
     }
 }
@@ -614,6 +619,7 @@ where
     for<'b> A: BStackAllocator<Allocated<'b> = BStackOwnedSlice<'b, A>>,
 {
     fn alloc_bulk(&self, lengths: impl AsRef<[u64]>) -> io::Result<Vec<Self::Allocated<'_>>> {
+        let mut state = self.lock_state();
         let inner_handles = self.inner.alloc_bulk(lengths)?;
 
         let inner_slices: Vec<BStackOwnedSlice<'_, A>> = inner_handles.into_iter().collect();
@@ -622,7 +628,7 @@ where
         for inner_slice in inner_slices {
             let offset = inner_slice.start();
             let len = inner_slice.len();
-            self.record_allocation(offset, len);
+            state.record_allocation(offset, len);
 
             // SAFETY: The inner allocator successfully returned this region.
             result.push(unsafe { BStackOwnedSlice::from_raw_parts(self, offset, len) });
@@ -641,16 +647,14 @@ where
         // Pass 1: extract coordinates and validate all handles.
         let mut coords: Vec<(u64, u64)> = Vec::with_capacity(handles.len());
         let mut pending_freed: HashSet<Range<u64>> = HashSet::with_capacity(handles.len());
-        {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for handle in &handles {
-                let offset = handle.start();
-                let len = handle.len();
-                let region = offset..offset + len;
-                check_deallocation(&region, &state, &pending_freed);
-                pending_freed.insert(region);
-                coords.push((offset, len));
-            }
+        let mut state = self.lock_state();
+        for handle in &handles {
+            let offset = handle.start();
+            let len = handle.len();
+            let region = offset..offset + len;
+            check_deallocation(&region, &state, &pending_freed);
+            pending_freed.insert(region);
+            coords.push((offset, len));
         }
 
         // Convert to inner handles.
@@ -687,7 +691,7 @@ where
                 for &(offset, len) in &coords {
                     let region = offset..offset + len;
                     if !surviving_set.contains(&region) {
-                        self.forget_region(offset, len);
+                        state.forget_region(offset, len);
                     }
                 }
             }
@@ -700,7 +704,7 @@ where
 
         // Pass 2: commit tracking updates.
         for (offset, len) in coords {
-            self.record_deallocation(offset, len);
+            state.record_deallocation(offset, len);
         }
 
         Ok(())
@@ -744,6 +748,7 @@ where
         let inner_handle =
             unsafe { BStackOwnedSlice::from_raw_parts(&self.inner, old_offset, old_len) };
 
+        let mut state = self.lock_state();
         let new_inner_slice = match self.inner.realloc_inplace(inner_handle, prepend, append) {
             Ok(h) => h,
             Err(inner_err) => {
@@ -757,7 +762,7 @@ where
                         Some(unsafe { BStackOwnedSlice::from_raw_parts(self, o, l) })
                     }
                     None => {
-                        self.forget_region(old_offset, old_len);
+                        state.forget_region(old_offset, old_len);
                         None
                     }
                 };
@@ -785,7 +790,6 @@ where
             new_offset + new_len,
         );
 
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let overlapping_allocation = state
             .allocated
             .iter()
@@ -852,15 +856,15 @@ mod tests {
     #[test]
     fn test_alloc_dealloc_basic() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
     fn test_adjacent_allocs_do_not_overlap() {
         let c = checker();
-        c.record_allocation(0, 50);
-        c.record_allocation(50, 50);
+        c.lock_state().record_allocation(0, 50);
+        c.lock_state().record_allocation(50, 50);
     }
 
     #[test]
@@ -870,7 +874,7 @@ mod tests {
             core::iter::once(0..100),
             core::iter::once(200..300),
         );
-        c.record_allocation(120, 50);
+        c.lock_state().record_allocation(120, 50);
 
         let state = c.state.lock().unwrap();
         assert!(state.allocated.contains(&(0..100)));
@@ -881,65 +885,65 @@ mod tests {
     #[test]
     fn test_dealloc_untracked_region_is_allowed() {
         let c = checker();
-        c.record_deallocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
     #[should_panic(expected = "double-free")]
     fn test_double_free_panics() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
-        c.record_deallocation(0, 100);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
     #[should_panic(expected = "double-free")]
     fn test_partial_overlap_with_freed_region_panics() {
         let c = checker();
-        c.record_deallocation(0, 100);
-        c.record_deallocation(50, 25);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_deallocation(50, 25);
     }
 
     #[test]
     #[should_panic(expected = "overlaps with existing allocated region")]
     fn test_overlapping_alloc_panics() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_allocation(50, 100);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_allocation(50, 100);
     }
 
     #[test]
     #[should_panic(expected = "Partial deallocations are not allowed")]
     fn test_partial_free_panics() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 50);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 50);
     }
 
     #[test]
     #[should_panic(expected = "Partial deallocations are not allowed")]
     fn test_superset_free_panics() {
         let c = checker();
-        c.record_allocation(20, 50);
-        c.record_deallocation(0, 100);
+        c.lock_state().record_allocation(20, 50);
+        c.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
     #[should_panic(expected = "spans multiple allocated regions")]
     fn test_spanning_free_panics() {
         let c = checker();
-        c.record_allocation(0, 50);
-        c.record_allocation(50, 50);
-        c.record_deallocation(0, 100);
+        c.lock_state().record_allocation(0, 50);
+        c.lock_state().record_allocation(50, 50);
+        c.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
     fn test_freed_region_split_on_reallocation() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
-        c.record_allocation(20, 30);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_allocation(20, 30);
 
         let state = c.state.lock().unwrap();
         assert!(state.freed.contains(&(0..20)));
@@ -951,9 +955,9 @@ mod tests {
     #[test]
     fn test_freed_region_split_left_edge() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
-        c.record_allocation(0, 30);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_allocation(0, 30);
 
         let state = c.state.lock().unwrap();
         assert!(!state.freed.contains(&(0..100)));
@@ -964,9 +968,9 @@ mod tests {
     #[test]
     fn test_freed_region_split_right_edge() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
-        c.record_allocation(70, 30);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_allocation(70, 30);
 
         let state = c.state.lock().unwrap();
         assert!(!state.freed.contains(&(0..100)));
@@ -977,9 +981,9 @@ mod tests {
     #[test]
     fn test_freed_region_exact_reuse_removes_entry() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_deallocation(0, 100);
-        c.record_allocation(0, 100);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_deallocation(0, 100);
+        c.lock_state().record_allocation(0, 100);
 
         let state = c.state.lock().unwrap();
         assert!(state.freed.is_empty());
@@ -989,9 +993,9 @@ mod tests {
     #[test]
     fn test_forget_region_removes_from_allocated_only() {
         let c = checker();
-        c.record_allocation(0, 100);
-        c.record_allocation(200, 50);
-        c.forget_region(0, 100);
+        c.lock_state().record_allocation(0, 100);
+        c.lock_state().record_allocation(200, 50);
+        c.lock_state().forget_region(0, 100);
 
         let state = c.state.lock().unwrap();
         assert!(!state.allocated.contains(&(0..100)));
@@ -1822,7 +1826,7 @@ mod tests {
 
         let handle = alloc.alloc(100).unwrap();
         alloc.dealloc(handle).ok().unwrap();
-        alloc.record_deallocation(0, 100);
+        alloc.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
@@ -1934,7 +1938,7 @@ mod tests {
 
         let handles = alloc.alloc_bulk([100, 200]).unwrap();
         alloc.dealloc_bulk(handles).ok().unwrap();
-        alloc.record_deallocation(0, 100);
+        alloc.lock_state().record_deallocation(0, 100);
     }
 
     #[test]
@@ -2061,5 +2065,40 @@ mod tests {
         let foreign = handles.next().unwrap();
         a2.dealloc(own).map_err(|e| e.source).unwrap();
         a1.dealloc(foreign).map_err(|e| e.source).unwrap();
+    }
+}
+
+// Operations are serialized under the tracking mutex, so sharing the wrapper
+// across threads never trips a false overlap or double-free panic.
+#[cfg(all(test, feature = "set", feature = "atomic"))]
+mod concurrency_tests {
+    use super::DebugCheckingAllocator;
+    use crate::alloc::BStackAllocator;
+    use crate::{BStack, GhostTreeBstackAllocator};
+
+    #[test]
+    fn shared_across_threads_tracks_exactly() {
+        let path = std::env::temp_dir().join(format!(
+            "bstack_debug_concurrent_{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let inner = GhostTreeBstackAllocator::new(BStack::open(&path).unwrap()).unwrap();
+        let alloc = DebugCheckingAllocator::new(inner);
+
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let alloc = &alloc;
+                s.spawn(move || {
+                    for i in 0..300u64 {
+                        let h = alloc.alloc(32 + (t + i) % 4 * 32).unwrap();
+                        let h = alloc.realloc(h, 32).unwrap();
+                        alloc.dealloc(h).unwrap();
+                    }
+                });
+            }
+        });
+        drop(alloc);
+        let _ = std::fs::remove_file(&path);
     }
 }

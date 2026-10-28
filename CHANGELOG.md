@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`DebugCheckingAllocator` supports concurrent operations (Rust).** When its inner allocator is `Sync`, the wrapper can be shared across threads without external synchronization; operations through it are serialized, so its overlap and double-free checks stay exact.
+
 ### Fixed
 
 - **Allocators could return an out-of-bounds handle after a failed tail shrink or tail free (Rust and C).** A `discard`, `try_discard`, or tail-replace error may follow the truncation, but `LinearBStackAllocator`, `SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator`, and `GhostTreeBstackAllocator` handed back the original handle. Their tail `realloc` shrinks, `realloc_inplace` (Rust), `dealloc`, and Linear's `dealloc_bulk` now report it lost on such an error (`handle: None` / empty `handles`; C: `-2`). The slab allocators' `alloc_bulk` cleanup also no longer recycles a fresh tail onto the free list after its truncation errs, which could hand out blocks past the stack end.
+- **`DebugCheckingAllocator` was `Sync` although its docs said concurrent use was unsupported (Rust).** It is `Sync` whenever its inner allocator is. However, its checks could false-panic or miss a double-free since it does not truly support concurrent operations. Concurrent use is now supported (see *Changed*) such that the `Sync` impl matches the docs.
 
 ## [0.4.7] - 2026-10-16
 
