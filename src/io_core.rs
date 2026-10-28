@@ -413,6 +413,14 @@ pub(crate) enum WipAux {
     /// `HEADER_SIZE + clen` to `file_size`; recovery replays each into
     /// `[s, e)`. See [`journaled_multi_set`] and [`recover_multi_write`].
     MultiWrite = u64::MAX - 5,
+    /// Cyclic rotation of `k` disjoint `n`-byte regions: the content of
+    /// `offsets[i]` moves to `offsets[i + 1]`, the last to `offsets[0]`. The tail
+    /// holds `[n | k | offsets… | snapshot of offsets[k - 1]]`; `wip_ptr` is
+    /// `HEADER_SIZE + offsets[s]`, the destination of the next unperformed step,
+    /// so it doubles as the progress counter. Each step is a commit point, and
+    /// recovery resumes at `s`. See [`journaled_rotate`]. `u64::MAX - 6` is
+    /// reserved for `MultiAtrunc`.
+    CycleSwap = u64::MAX - 7,
 }
 
 impl From<WipAux> for u64 {
@@ -434,6 +442,7 @@ impl TryFrom<u64> for WipAux {
             v if v == WipAux::Repeat as u64 => Ok(WipAux::Repeat),
             v if v == WipAux::Copy as u64 => Ok(WipAux::Copy),
             v if v == WipAux::MultiWrite as u64 => Ok(WipAux::MultiWrite),
+            v if v == WipAux::CycleSwap as u64 => Ok(WipAux::CycleSwap),
             _ => Err(()),
         }
     }
@@ -445,7 +454,7 @@ impl TryFrom<u64> for WipAux {
 /// Both fields lie within the first 32 bytes (one aligned block), so the write
 /// is atomic at the storage level: recovery never observes `wip_ptr` and
 /// `wip_aux` out of step. `wip_ptr == 0` is the disarmed (steady) state.
-#[cfg(any(feature = "set", feature = "atomic"))]
+/// Not feature-gated: recovery advances the [`WipAux::CycleSwap`] counter.
 pub(crate) fn write_wip(file: &mut File, wip_ptr: u64, wip_aux: WipAux) -> io::Result<()> {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&wip_ptr.to_le_bytes());
@@ -486,6 +495,8 @@ pub(crate) fn write_header_commit(
 ///   `s` into `[wip_ptr, wip_ptr + k*s.len())`.
 /// - [`WipAux::Copy`] reads `[src | n]` from that tail and replays
 ///   `move_chunked(src → wip_ptr)` from the untouched (disjoint) source.
+/// - [`WipAux::CycleSwap`] reads `[n | k | offsets…]` from that tail and resumes
+///   the rotation at the step `wip_ptr` names (see [`rotate_steps`]).
 /// - [`WipAux::SpliceGrow`]/[`WipAux::SpliceShrink`] replay the staged new tail
 ///   into `[a, clen')`, deriving `clen'` from the file size and direction, and
 ///   commit the new length.
@@ -535,9 +546,16 @@ pub(crate) fn recover_wip(
                     && k > 0
                     && wip_ptr >= HEADER_SIZE
                     && wip_ptr.saturating_add(total) <= tail_start
-                    && let Ok(s_len_usize) = usize::try_from(s_len)
                 {
-                    let mut s = vec![0u8; s_len_usize];
+                    // Too large for a `Vec` (`isize`) is an error, not a roll-back:
+                    // the fill is destructive, so the file stays armed.
+                    let s_len = isize::try_from(s_len).map_err(|_| {
+                        io_error!(
+                            OutOfMemory,
+                            "recovery: Repeat pattern too large for this platform"
+                        )
+                    })? as usize;
+                    let mut s = vec![0u8; s_len];
                     file.read_exact(&mut s)?;
                     write_repeated(file, wip_ptr, &s, k)?;
                     durable_sync(file)?;
@@ -607,6 +625,12 @@ pub(crate) fn recover_wip(
                     }
                 }
             }
+        }
+        Ok(WipAux::CycleSwap) => {
+            // Tail is `[n | k | offsets… | snapshot]`; `wip_ptr - HEADER_SIZE`
+            // names the next step. Every step before it has landed, so resume
+            // there. Roll back on a corrupt or inconsistent tail.
+            recover_rotation(file, committed_len, tail_start, tail_len, wip_ptr)?;
         }
         // The multi-write sentinel is only ever armed with `wip_ptr == 0`, so
         // seeing it here (`recover_wip` runs only when `wip_ptr != 0`) is an
@@ -827,6 +851,134 @@ pub(crate) fn journaled_exchange(
     move_chunked(file, data_size, b, n)?;
     durable_sync(file)?;
     // 6. Disarm and drop the staged tail.
+    write_wip(file, 0, WipAux::Set)?;
+    durable_sync(file)?;
+    file.set_len(HEADER_SIZE + data_size)
+}
+
+// ------------------------------------------ Rotate ------------------------------------------
+
+/// Run the rotation steps from `s` down to `0`, each a commit point.
+///
+/// `offset(i)` is `offsets[i]`. Step `s >= 1` copies `offsets[s - 1]` →
+/// `offsets[s]`, then advances `wip_ptr` to `offsets[s - 1]`; step `0` copies
+/// the staged snapshot (logical `snapshot`) → `offsets[0]`. Replaying a step is idempotent: its source is
+/// not written until the following step, and the snapshot covers the one region
+/// overwritten before it is read. Shared by the writer and recovery, so a crash
+/// during recovery resumes from the counter it last advanced. Not
+/// feature-gated (recovery needs it).
+pub(crate) fn rotate_steps(
+    file: &mut File,
+    offset: impl Fn(usize) -> u64,
+    n: u64,
+    snapshot: u64,
+    s: usize,
+) -> io::Result<()> {
+    for i in (1..=s).rev() {
+        move_chunked(file, offset(i - 1), offset(i), n)?;
+        durable_sync(file)?;
+        write_wip(file, HEADER_SIZE + offset(i - 1), WipAux::CycleSwap)?;
+        durable_sync(file)?;
+    }
+    move_chunked(file, snapshot, offset(0), n)?;
+    durable_sync(file)
+}
+
+/// Parse and validate an armed [`WipAux::CycleSwap`] tail, then resume the
+/// rotation at the step `wip_ptr` names. An invalid tail applies nothing, so the
+/// caller's finalize rolls back.
+///
+/// Requires `tail_len == 16 + 8k + n`, `n > 0`, `k >= 2`, every
+/// `offset + n <= committed_len`, pairwise-disjoint regions, and `wip_ptr`
+/// naming one of the offsets.
+fn recover_rotation(
+    file: &mut File,
+    committed_len: u64,
+    tail_start: u64,
+    tail_len: u64,
+    wip_ptr: u64,
+) -> io::Result<()> {
+    if tail_len < 16 || wip_ptr < HEADER_SIZE {
+        return Ok(());
+    }
+    let mut meta = [0u8; 16];
+    file.seek(SeekFrom::Start(tail_start))?;
+    file.read_exact(&mut meta)?;
+    let n = u64::from_le_bytes(meta[0..8].try_into().unwrap());
+    let k = u64::from_le_bytes(meta[8..16].try_into().unwrap());
+    // `tail_len == 16 + 8k + n`: what is left after the header and the snapshot
+    // must be exactly the `k` offsets. A short tail saturates to `0`, which
+    // `k >= 2` rejects.
+    let rest = tail_len.saturating_sub(16).saturating_sub(n);
+    if n == 0 || k < 2 || rest % 8 != 0 || rest / 8 != k {
+        return Ok(());
+    }
+    // `rest == 8k <= tail_len`, an on-disk size, so the allocation is bounded by
+    // the file. Too large for a `Vec` (`isize`) is an OOM error.
+    let raw_len = isize::try_from(rest).map_err(|_| {
+        io_error!(
+            OutOfMemory,
+            "recovery: CycleSwap offsets too large for this platform"
+        )
+    })? as usize;
+    let mut raw = vec![0u8; raw_len];
+    file.read_exact(&mut raw)?;
+    let chunks = raw.as_chunks::<8>().0; // Alignment checked before in "rest % 8 != 0"
+    let offsets = || chunks.iter().map(|c| u64::from_le_bytes(*c));
+    if offsets().any(|o| o.checked_add(n).is_none_or(|e| e > committed_len))
+        || !pairwise_disjoint(offsets().collect(), n)
+    {
+        return Ok(());
+    }
+    let target = wip_ptr - HEADER_SIZE;
+    let Some(s) = offsets().position(|o| o == target) else {
+        return Ok(());
+    };
+    let snapshot = committed_len + 16 + rest;
+    rotate_steps(file, |i| u64::from_le_bytes(chunks[i]), n, snapshot, s)
+}
+
+/// `true` if the `n`-byte regions at `offsets` are pairwise disjoint; sorts
+/// `offsets` in place. Callers guarantee every `offset + n` fits in `u64`.
+pub(crate) fn pairwise_disjoint(mut sorted: Vec<u64>, n: u64) -> bool {
+    sorted.sort_unstable();
+    sorted.windows(2).all(|w| w[0] + n <= w[1])
+}
+
+/// Crash-atomically rotate `k >= 3` disjoint `n`-byte payload regions: the
+/// content of `offsets[i]` moves to `offsets[i + 1]`, the last to `offsets[0]`.
+///
+/// Only `offsets[k - 1]` is snapshotted, so staging is `16 + 8k + n` bytes no
+/// matter how large `k` is, and memory is O(k). Arming is the commit point:
+/// recovery always rolls forward from the step `wip_ptr` names (see
+/// [`rotate_steps`]). `data_size` is the current payload length; callers have
+/// validated the regions (in range, unlocked, pairwise disjoint, `n > 0`) and
+/// that the staged tail fits in `u64`.
+#[cfg(all(feature = "set", feature = "atomic"))]
+pub(crate) fn journaled_rotate(
+    file: &mut File,
+    data_size: u64,
+    offsets: &[u64],
+    n: u64,
+) -> io::Result<()> {
+    let k = offsets.len();
+    // 1. Stage `[n | k | offsets…]`, then snapshot the last region after it.
+    let mut meta = Vec::with_capacity(16 + 8 * k);
+    meta.extend_from_slice(&n.to_le_bytes());
+    meta.extend_from_slice(&(k as u64).to_le_bytes());
+    for o in offsets {
+        meta.extend_from_slice(&o.to_le_bytes());
+    }
+    write_at(file, data_size, &meta)?;
+    let snapshot = data_size + meta.len() as u64;
+    move_chunked(file, offsets[k - 1], snapshot, n)?;
+    durable_sync(file)?;
+    // 2. Arm at the first step, `s = k - 1` — the commit point.
+    write_wip(file, HEADER_SIZE + offsets[k - 1], WipAux::CycleSwap)?;
+    durable_sync(file)?;
+    // 3. Perform every step, advancing the counter after each.
+    rotate_steps(file, |i| offsets[i], n, snapshot, k - 1)?;
+    // 4. Disarm and drop the staged tail.
     write_wip(file, 0, WipAux::Set)?;
     durable_sync(file)?;
     file.set_len(HEADER_SIZE + data_size)

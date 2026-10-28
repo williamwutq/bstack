@@ -2516,6 +2516,128 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // cross_rotate recovery (ungated: a CycleSwap journal recovers in any build)
+    // -------------------------------------------------------------------------
+
+    /// Oracle: the content of `offsets[i]` moves to `offsets[i + 1]`, the last
+    /// to `offsets[0]`.
+    pub(super) fn rotated(payload: &[u8], offsets: &[u64], n: u64) -> Vec<u8> {
+        let (k, n) = (offsets.len(), n as usize);
+        let mut out = payload.to_vec();
+        for i in 0..k {
+            let (src, dst) = (offsets[i] as usize, offsets[(i + 1) % k] as usize);
+            out[dst..dst + n].copy_from_slice(&payload[src..src + n]);
+        }
+        out
+    }
+
+    /// A raw file a `cross_rotate` crashed in: `payload` committed, the journal
+    /// armed at step `s`, and the tail staged with the original last region.
+    fn crashed_rotation(
+        payload: &[u8],
+        original: &[u8],
+        offsets: &[u64],
+        n: u64,
+        s: usize,
+    ) -> Vec<u8> {
+        let mut f = MAGIC.to_vec();
+        f.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        f.extend_from_slice(&(HEADER_SIZE + offsets[s]).to_le_bytes());
+        f.extend_from_slice(&(u64::MAX - 7).to_le_bytes()); // WipAux::CycleSwap
+        f.extend_from_slice(payload);
+        f.extend_from_slice(&n.to_le_bytes());
+        f.extend_from_slice(&(offsets.len() as u64).to_le_bytes());
+        for o in offsets {
+            f.extend_from_slice(&o.to_le_bytes());
+        }
+        let last = offsets[offsets.len() - 1] as usize;
+        f.extend_from_slice(&original[last..last + n as usize]);
+        f
+    }
+
+    #[test]
+    fn recovery_resumes_rotation_from_every_step() {
+        let offsets = [120u64, 0, 300, 200, 60];
+        let n = 40u64;
+        let k = offsets.len();
+        let original: Vec<u8> = (0..400u32).map(|i| (i * 7 % 256) as u8).collect();
+        let expect = rotated(&original, &offsets, n);
+        let path = std::env::temp_dir().join(format!("bstack_rot_rec_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+
+        // `done` steps have landed, so the journal names step `s = k - 1 - done`.
+        // Each case is replayed clean and with the pending step's destination torn.
+        for done in 0..k {
+            let s = k - 1 - done;
+            let mut state = original.clone();
+            for i in (s + 1..k).rev() {
+                let (src, dst) = (offsets[i - 1] as usize, offsets[i] as usize);
+                let bytes = state[src..src + n as usize].to_vec();
+                state[dst..dst + n as usize].copy_from_slice(&bytes);
+            }
+            for torn in [false, true] {
+                let mut payload = state.clone();
+                if torn {
+                    let dst = offsets[s] as usize;
+                    payload[dst..dst + n as usize / 2].fill(0xEE);
+                }
+                std::fs::write(&path, crashed_rotation(&payload, &original, &offsets, n, s))
+                    .unwrap();
+                let st = BStack::open(&path).unwrap();
+                assert_eq!(st.peek(0).unwrap(), expect, "s={s}, torn={torn}");
+                drop(st);
+                let raw = std::fs::read(&path).unwrap();
+                assert_eq!(
+                    raw.len() as u64,
+                    HEADER_SIZE + 400,
+                    "s={s}: tail not truncated"
+                );
+                assert_eq!(&raw[16..32], &[0u8; 16], "s={s}: journal not disarmed");
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rolls_back_corrupt_rotation_tail() {
+        let offsets = [0u64, 100, 200];
+        let n = 50u64;
+        let original: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        let path = std::env::temp_dir().join(format!("bstack_rot_bad_{}.bin", std::process::id()));
+        let _g = Guard(path.clone());
+        let good = crashed_rotation(&original, &original, &offsets, n, 2);
+        let tail = HEADER_SIZE as usize + 300;
+        let field =
+            |f: &mut Vec<u8>, at: usize, v: u64| f[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+        let mut f = good.clone();
+        field(&mut f, 16, HEADER_SIZE + 50); // wip_ptr names no offset
+        cases.push(("wip_ptr", f));
+        let mut f = good.clone();
+        f.pop(); // tail_len != 16 + 8k + n
+        cases.push(("tail length", f));
+        let mut f = good.clone();
+        field(&mut f, tail + 16 + 8, 30); // offsets[1] = 30 overlaps offsets[0]
+        cases.push(("overlap", f));
+        let mut f = good.clone();
+        field(&mut f, tail + 16, 260); // offsets[0]: 260 + 50 > clen
+        cases.push(("bounds", f));
+        let mut f = good.clone();
+        field(&mut f, tail, 0); // n == 0
+        cases.push(("n", f));
+
+        for (what, file) in cases {
+            std::fs::write(&path, file).unwrap();
+            let st = BStack::open(&path).unwrap();
+            assert_eq!(st.peek(0).unwrap(), original, "{what}: must roll back");
+            drop(st);
+            let raw = std::fs::read(&path).unwrap();
+            assert_eq!(raw.len() as u64, HEADER_SIZE + 300, "{what}");
+            assert_eq!(&raw[16..32], &[0u8; 16], "{what}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Deferred replay
     // -------------------------------------------------------------------------
 
@@ -3226,7 +3348,7 @@ mod alloc_tests {
         assert!(dbg.contains("version"), "{dbg}");
         assert!(dbg.contains("len"), "{dbg}");
         // Version must be a recognisable semver string.
-        assert!(dbg.contains("0.4"), "{dbg}");
+        assert!(dbg.contains("0.5"), "{dbg}");
     }
 
     #[test]
@@ -10705,6 +10827,105 @@ mod atomic_tests {
         drop(s);
         let s2 = BStack::open(&p).unwrap();
         assert_eq!(s2.peek(0).unwrap(), b"XYab");
+    }
+
+    // -----------------------------------------------------------------------
+    // cross_rotate  (require set + atomic; recovery is tested in `tests`)
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_rotates_three_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"AAABBBCCC").unwrap();
+        s.cross_rotate(&[0, 3, 6], 3).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"CCCAAABBB");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_unordered_offsets_journal_and_reopen_clean() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        let payload: Vec<u8> = (0..400u32).map(|i| (i % 251) as u8).collect();
+        s.push(&payload).unwrap();
+        let offsets = [300, 20, 150, 90];
+        s.cross_rotate(&offsets, 50).unwrap();
+        let expect = super::tests::rotated(&payload, &offsets, 50);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            crate::HEADER_SIZE + 400,
+            "tail not truncated"
+        );
+        assert_eq!(&raw[16..32], &[0u8; 16], "journal not disarmed");
+        assert_eq!(BStack::open(&p).unwrap().peek(0).unwrap(), expect);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_two_regions_is_an_exchange() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.cross_rotate(&[0, 5], 5).unwrap();
+        assert_eq!(s.peek(0).unwrap(), b"worldhello");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_trivial_cases_are_noops() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        s.cross_rotate(&[], 5).unwrap();
+        s.cross_rotate(&[3], 5).unwrap();
+        s.cross_rotate(&[0, 0, 0], 0).unwrap(); // n == 0: no overlap check
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+        // Bounds are still checked on a no-op.
+        let err = s.cross_rotate(&[8], 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_rejects_bad_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let bad: [(&[u64], u64); 4] = [
+            (&[0, 2, 6], 3),        // overlap
+            (&[0, 4, 0], 3),        // duplicate
+            (&[0, 3, 8], 3),        // past the payload
+            (&[0, 3, u64::MAX], 3), // offset + n overflows
+        ];
+        for (offsets, n) in bad {
+            let err = s.cross_rotate(offsets, n).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{offsets:?}, n={n}");
+        }
+        s.lock_up_to(2).unwrap();
+        let err = s.cross_rotate(&[0, 3, 6], 2).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "locked prefix");
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn cross_rotate_streams_large_regions() {
+        let (s, p) = mk_stack();
+        let _g = Guard(p.clone());
+        let n = 10 * 1024u64; // > MOVE_CHUNK
+        let payload: Vec<u8> = (0..4 * n).map(|i| (i % 253) as u8).collect();
+        s.push(&payload).unwrap();
+        let offsets = [0, n, 2 * n, 3 * n];
+        s.cross_rotate(&offsets, n).unwrap();
+        let expect = super::tests::rotated(&payload, &offsets, n);
+        assert_eq!(s.peek(0).unwrap(), expect);
+        drop(s);
+        assert_eq!(BStack::open(&p).unwrap().peek(0).unwrap(), expect);
     }
 
     // -----------------------------------------------------------------------
