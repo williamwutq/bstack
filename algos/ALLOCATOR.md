@@ -217,7 +217,7 @@ Implements both `BStackAllocator` and `BStackBulkAllocator`.
 ┌─────────────────────────────┐  payload offset 0
 │   User-reserved (32 bytes)  │
 ├─────────────────────────────┤  offset 32
-│   Magic number (8 bytes)    │  "ALGT\x00\x01\x05\x00"
+│   Magic number (8 bytes)    │  "ALGT\x00\x01\x06\x00"
 ├─────────────────────────────┤  offset 40
 │   AVL root pointer (8 B)    │  absolute payload offset of the root node
 ├─────────────────────────────┤  offset 48  ← arena start (32-byte aligned)
@@ -321,7 +321,7 @@ block; live allocations carry zero metadata overhead.
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALSL\x00\x01\x01\x00"` (version 0.1.1).
+* **`magic`** — `"ALSL\x00\x01\x03\x00"` (version 0.1.3).
 * **`block_size`** — fixed size of every arena block, little-endian `u64`.
 * **`free_head`** — payload offset of the first free block's first byte, or `0` (sentinel).
 * **Free block** — first 8 bytes hold the payload offset of the next free block (`u64` LE, `0` = end of list); remaining bytes belong to the caller when live.
@@ -400,7 +400,7 @@ The constructor takes `data_size` — the number of usable bytes per block (must
   user data       offset 48 (arena start)
 ```
 
-* **`magic`** — `"ALCK\x00\x01\x04\x00"` (version 0.1.4).
+* **`magic`** — `"ALCK\x00\x01\x05\x00"` (version 0.1.5).
 * **`block_size`** — `data_size + 8`, little-endian `u64`.
 * **`free_head`** — block start offset of the first free block, or `0` (sentinel; no valid block starts at offset 0).
 
@@ -506,7 +506,7 @@ round_up(len + 8, 16)`; `class_blocksize(need)` snaps up to the enclosing class;
 
 ```text
 offset  0  reserved (user)                24 B
-offset 24  magic  "ALSG\x00\x02\x03\x00"   8 B
+offset 24  magic  "ALSG\x00\x02\x04\x00"   8 B
 offset 32  _reserved                       8 B
 offset 40  free_head[33] : u64           264 B   # last entry = oversized list
 offset 304 arena start (16-B aligned)
