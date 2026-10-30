@@ -819,7 +819,7 @@ int first_fit_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..32)  — reserved (user area)
- *   [32..40) — magic: "ALGT\x00\x01\x04\x00"
+ *   [32..40) — magic: "ALGT\x00\x01\x05\x00"
  *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
  *   [48..)   — block arena (32-byte aligned)
  *
