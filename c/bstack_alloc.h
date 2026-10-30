@@ -1110,7 +1110,7 @@ int first_fit_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..32)  — reserved (user area)
- *   [32..40) — magic: "ALGT\x00\x01\x05\x00"
+ *   [32..40) — magic: "ALGT\x00\x01\x06\x00"
  *   [40..48) — AVL root pointer (8 B LE) — absolute payload offset of root
  *   [48..)   — block arena (32-byte aligned)
  *
@@ -1209,7 +1209,7 @@ int ghost_tree_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSL\x00\x01\x02\x00"
+ *   [24..32) — magic: "ALSL\x00\x01\x03\x00"
  *   [32..40) — block_size (8 B LE)
  *   [40..48) — free_head  (8 B LE) — payload offset of first free block, or 0
  *   [48..)   — block arena
@@ -1340,7 +1340,7 @@ int slab_bstack_allocator_stats(
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
  *   [24..48) — allocator header: magic[8] | block_size[8] | free_head[8]
- *              magic = "ALCK\x00\x01\x04\x00"
+ *              magic = "ALCK\x00\x01\x05\x00"
  *   [48..)   — block arena
  *
  * Each block in the arena:
@@ -1515,7 +1515,7 @@ int checked_slab_bstack_allocator_stats(
  *
  * On-disk layout (all within the bstack payload):
  *   [0..24)  — reserved (OFFSET_SIZE; available for caller use)
- *   [24..32) — magic: "ALSG\x00\x02\x03\x00"
+ *   [24..32) — magic: "ALSG\x00\x02\x04\x00"
  *   [32..40) — reserved (no field yet)
  *   [40..40+NUM_CLASSES*8) — free_head[NUM_CLASSES] (last entry = oversized list)
  *   [ARENA_START..) — block arena (16-byte aligned; ARENA_START = 304)

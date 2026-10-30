@@ -4342,7 +4342,7 @@ static int bstack_alloc_tail_shrink_gen(bstack_gen_op_t *out_op, void *ctx_)
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,5,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,6,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
@@ -5889,7 +5889,7 @@ int ghost_tree_bstack_allocator_stats(
 #define SLAB_MIN_BLOCK_SIZE    UINT64_C(8)
 #define SLAB_SENTINEL          UINT64_C(0)
 
-static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,2,0};
+static const uint8_t alsl_magic[8]        = {'A','L','S','L',0,1,3,0};
 static const uint8_t alsl_magic_prefix[6] = {'A','L','S','L',0,1};
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -7153,7 +7153,7 @@ int slab_bstack_allocator_stats(
 /* Maximum number of suspect blocks analysed in resync_tail before giving up. */
 #define ALCK_MAX_RECOVER_REGION ((size_t)(1u << 26))
 
-static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,4,0};
+static const uint8_t alck_magic[8]        = {'A','L','C','K',0,1,5,0};
 static const uint8_t alck_magic_prefix[6] = {'A','L','C','K',0,1};
 
 /* ---- LE helpers (reuse read_le64 / write_le64 already defined above) --- */
@@ -9496,7 +9496,7 @@ int checked_slab_bstack_allocator_stats(
 /* Magic: "ALSG" + major 0 + minor 2; the version encodes the fixed class scheme
  * and the in-use overhead recording the block's physical size (minor 1 recorded
  * the caller's length instead — a \x01 file fails new() with EINVAL). */
-static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,3,0};
+static const uint8_t alsg_magic[8]        = {'A','L','S','G',0,2,4,0};
 static const uint8_t alsg_magic_prefix[6] = {'A','L','S','G',0,2};
 
 /* Bytes recover's zero-run scan reads per step, into a stack buffer; a multiple

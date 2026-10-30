@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`DebugCheckingAllocator` supports concurrent operations (Rust).** When its inner allocator is `Sync`, the wrapper can be shared across threads without external synchronization; operations through it are serialized, so its overlap and double-free checks stay exact.
+- **`SlabBStackAllocator`, `CheckedSlabBStackAllocator`, `SegregatedBStackAllocator`, and `GhostTreeBstackAllocator` versions bumped (`alloc` + `set`; Rust and C): magic `ALSL\x00\x01\x02\x00` → `ALSL\x00\x01\x03\x00`, `ALCK\x00\x01\x04\x00` → `ALCK\x00\x01\x05\x00`, `ALSG\x00\x02\x03\x00` → `ALSG\x00\x02\x04\x00`, `ALGT\x00\x01\x05\x00` → `ALGT\x00\x01\x06\x00`.** No layout change; the patch byte records a writer carrying the lost-handle fix below. Only the first 6 bytes are checked on open, so existing files stay compatible.
 
 ### Fixed
 
