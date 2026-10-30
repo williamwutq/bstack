@@ -2439,7 +2439,7 @@ static void bstack_alloc_lock_destroy(void *lock)
  * reliably detecting cycles created by a partial rotation crash. */
 #define ALGT_MAX_AVL_DEPTH   128u
 
-static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,4,0};
+static const uint8_t algt_magic[8]        = {'A','L','G','T',0,1,5,0};
 static const uint8_t algt_magic_prefix[6] = {'A','L','G','T',0,1};
 
 typedef struct {
