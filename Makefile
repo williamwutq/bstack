@@ -11,8 +11,7 @@
 #   rustup target add x86_64-apple-darwin aarch64-apple-darwin \
 #       x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
 #       x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
-#       x86_64-pc-windows-gnu aarch64-pc-windows-gnu \
-#       x86_64-pc-windows-gnu aarch64-pc-windows-gnu
+#       x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
 #
 # Usage:
 #   make release                           default (CC=gcc on Unix)
@@ -89,11 +88,12 @@ ZIG_aarch64_unknown_linux_gnu  := aarch64-linux-gnu
 ZIG_x86_64_unknown_linux_musl  := x86_64-linux-musl
 ZIG_aarch64_unknown_linux_musl := aarch64-linux-musl
 ZIG_x86_64_pc_windows_gnu      := x86_64-windows-gnu
-ZIG_aarch64_pc_windows_gnullmv := aarch64-windows-gnullvm
+ZIG_aarch64_pc_windows_gnullvm := aarch64-windows-gnullvm
 zig_triple = $(ZIG_$(subst -,_,$(1)))
 
 # gcc: cross-compiler prefix (e.g. x86_64-linux-gnu → x86_64-linux-gnu-gcc)
-# macOS targets have no standard GCC cross-compiler prefix.
+# macOS targets have no standard GCC cross-compiler prefix; they use the host
+# Apple gcc (clang) with -arch from GCCARCH below.
 GCCPFX_x86_64_apple_darwin        :=
 GCCPFX_aarch64_apple_darwin       :=
 GCCPFX_x86_64_unknown_linux_gnu   := x86_64-linux-gnu
@@ -101,8 +101,12 @@ GCCPFX_aarch64_unknown_linux_gnu  := aarch64-linux-gnu
 GCCPFX_x86_64_unknown_linux_musl  := x86_64-linux-musl
 GCCPFX_aarch64_unknown_linux_musl := aarch64-linux-musl
 GCCPFX_x86_64_pc_windows_gnu      := x86_64-w64-mingw32
-GCCPFX_aarch64_pc_windows_gnullvv := aarch64-w64-mingw32
+GCCPFX_aarch64_pc_windows_gnullvm := aarch64-w64-mingw32
 gcc_prefix = $(GCCPFX_$(subst -,_,$(1)))
+
+GCCARCH_x86_64_apple_darwin       := -arch x86_64
+GCCARCH_aarch64_apple_darwin      := -arch arm64
+gcc_arch = $(GCCARCH_$(subst -,_,$(1)))
 
 # ── Per-target compiler and archiver commands ─────────────────────────────────
 # cc_for(target)  — full compiler invocation including target flags
@@ -111,7 +115,7 @@ gcc_prefix = $(GCCPFX_$(subst -,_,$(1)))
 cc_for = $(if $(filter zig,$(_CC_FAMILY)),\
            $(CC) -target $(call zig_triple,$(1)),\
            $(if $(filter gcc,$(_CC_FAMILY)),\
-             $(if $(call gcc_prefix,$(1)),$(call gcc_prefix,$(1))-gcc,gcc),\
+             $(if $(call gcc_prefix,$(1)),$(call gcc_prefix,$(1))-gcc,gcc $(call gcc_arch,$(1))),\
              $(CC) --target=$(call clang_triple,$(1))))
 
 ar_for = $(if $(filter gcc,$(_CC_FAMILY)),\
