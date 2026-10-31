@@ -8506,6 +8506,99 @@ mod atomic_tests {
 
     #[cfg(all(feature = "set", feature = "atomic"))]
     #[test]
+    fn process_gen_rotate_rotates_regions_and_ends_sequence() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"AAABBBCCC").unwrap();
+        let mut calls = 0usize;
+        s.process_gen(|| {
+            calls += 1;
+            match calls {
+                1 => Some(BStackGenOp::Rotate {
+                    offsets: &[0, 3, 6],
+                    len: 3,
+                }),
+                _ => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"NOPE!",
+                }),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "Rotate must end the sequence, like Write");
+        assert_eq!(s.peek(0).unwrap(), b"CCCAAABBB");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_rotate_targets_informed_by_prior_read() {
+        use crate::BStackGenOp;
+        // Layout: [pointer: u64 LE][A: 8][B: 8][C: 8]. The pointer names the
+        // third region of the rotation, so it is read first under the same lock.
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&24u64.to_le_bytes()); // names block C
+        payload.extend_from_slice(b"AAAAAAAABBBBBBBBCCCCCCCC");
+        s.push(&payload).unwrap();
+
+        let mut ptr_buf = [0u8; 8];
+        let mut offsets = [8u64, 16, 0];
+        let mut step = 0usize;
+        s.process_gen(|| {
+            let r = match step {
+                0 => Some(BStackGenOp::Read {
+                    offset: 0,
+                    // SAFETY: `ptr_buf` outlives this whole `process_gen` call.
+                    buf: bstack_unsafe_reborrow_mut!(&mut ptr_buf[..]),
+                }),
+                1 => {
+                    offsets[2] = u64::from_le_bytes(ptr_buf);
+                    Some(BStackGenOp::Rotate {
+                        // SAFETY: `offsets` outlives this whole `process_gen` call.
+                        offsets: bstack_unsafe_reborrow!(&offsets[..]),
+                        len: 8,
+                    })
+                }
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(s.peek(8).unwrap(), b"CCCCCCCCAAAAAAAABBBBBBBB");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn process_gen_rotate_rejects_bad_regions() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"helloworld").unwrap();
+        let bad: [&[u64]; 2] = [&[0, 2, 6], &[0, 3, 8]]; // overlap, past the payload
+        for offsets in bad {
+            let err = s
+                .process_gen(|| Some(BStackGenOp::Rotate { offsets, len: 3 }))
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{offsets:?}");
+        }
+        s.lock_up_to(2).unwrap();
+        let err = s
+            .process_gen(|| {
+                Some(BStackGenOp::Rotate {
+                    offsets: &[0, 3, 6],
+                    len: 2,
+                })
+            })
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "locked prefix");
+        assert_eq!(s.peek(0).unwrap(), b"helloworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
     fn process_gen_does_not_change_file_size() {
         use crate::BStackGenOp;
         let (s, p) = mk_stack();
@@ -9834,6 +9927,37 @@ mod atomic_tests {
         // Size unchanged; only the valid in-place write committed.
         assert_eq!(s.len().unwrap(), 10);
         assert_eq!(s.peek(0).unwrap(), b"HELLOworld");
+    }
+
+    #[cfg(all(feature = "set", feature = "atomic"))]
+    #[test]
+    fn inplace_gen_rejects_rotate_but_still_commits() {
+        use crate::BStackGenOp;
+        let (s, p) = mk_stack();
+        let _g = Guard(p);
+        s.push(b"AAABBBCCC").unwrap();
+        let mut step = 0usize;
+        s.inplace_gen(|res| {
+            if step == 1 {
+                assert!(res.is_err(), "Rotate should have reported an error");
+            }
+            let r = match step {
+                0 => Some(BStackGenOp::Rotate {
+                    offsets: &[0, 3, 6],
+                    len: 3,
+                }),
+                1 => Some(BStackGenOp::Write {
+                    offset: 0,
+                    data: b"Z",
+                }),
+                _ => None,
+            };
+            step += 1;
+            r
+        })
+        .unwrap();
+        assert_eq!(step, 3);
+        assert_eq!(s.peek(0).unwrap(), b"ZAABBBCCC");
     }
 
     #[cfg(all(feature = "set", feature = "atomic"))]

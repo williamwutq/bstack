@@ -163,7 +163,7 @@
 //! | `swap`, `swap_into` *(features: set+atomic)* | `read` old bytes → *commit* `buf` |
 //! | `cas` *(features: set+atomic)* | `read` → compare — conditional *commit* of `new` |
 //! | `process` *(features: set+atomic)* | `read(start..end)` → *(callback)* → *commit* the buffer |
-//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms |
+//! | `process_gen` *(features: set+atomic)* | closure-driven reads, ending in at most one mutating step: `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Rotate` uses the rotation journal (as `cross_rotate`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms |
 //! | `set_batched` *(features: set+atomic)* | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (a `durable_sync` at each barrier); a lone effective write takes the ordinary single-write *commit* |
 //! | `inplace_gen` *(features: set+atomic)* | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`) |
 //! | `replace` *(feature: atomic)* | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)* |
@@ -3087,6 +3087,8 @@ impl BStack {
 ///   ending the sequence.
 /// - `Swap { a_offset, b_offset, len }` — atomically exchange `len` bytes at
 ///   `a_offset` with `len` bytes at `b_offset`, ending the sequence.
+/// - `Rotate { offsets, len }` — atomically rotate the `len`-byte regions at
+///   `offsets`, ending the sequence.
 /// - `Push { data }` — append `data` to the end of the file, growing the
 ///   payload, and ending the sequence.
 /// - `Pop { buf }` — remove the last `buf.len()` bytes from the end of the
@@ -3158,6 +3160,19 @@ pub enum BStackGenOp<'a> {
         /// Logical offset of the second region.
         b_offset: u64,
         /// Number of bytes to exchange.
+        len: u64,
+    },
+    /// Atomically rotate the `len`-byte regions at `offsets`, the bytes at
+    /// `offsets[i]` move to `offsets[i + 1]`, the last to `offsets[0]`, ending
+    /// the sequence.
+    ///
+    /// The in-sequence equivalent of [`cross_rotate`](BStack::cross_rotate), and
+    /// the `k`-region generalisation of [`Swap`](Self::Swap). The regions must be
+    /// pairwise disjoint.
+    Rotate {
+        /// Logical offsets of the regions, in rotation order.
+        offsets: &'a [u64],
+        /// Number of bytes in each region.
         len: u64,
     },
     /// Append `data` to the end of the file, growing the payload by
@@ -3540,52 +3555,62 @@ impl BStack {
     /// I/O error from `read_exact`, `write_all`, or `durable_sync`.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn cross_rotate(&self, offsets: &[u64], n: u64) -> io::Result<()> {
-        let mut max_end = 0u64;
-        for &o in offsets {
-            max_end = max_end.max(checked_end(o, n, "cross_rotate: offset + n overflows u64")?);
-        }
-        if n > 0 && !pairwise_disjoint(offsets.to_vec(), n) {
-            return Err(io_error!(InvalidInput, "cross_rotate: regions overlap"));
-        }
         let mut guard = self.write_lock()?;
         let (file, clen, replay) = &mut *guard;
         let locked = self.locked.load(Ordering::Acquire);
+        let data_size = *clen;
+        Self::check_rotation(offsets, n, locked, data_size, "cross_rotate")?;
+        if n == 0 || offsets.len() < 2 {
+            return Ok(());
+        }
+        fault_point!(self, "cross_rotate");
+        Self::mark_replay(replay, journaled_rotate(file, data_size, offsets, n))
+    }
+
+    /// Validate a rotation of the `n`-byte regions at `offsets` under the held
+    /// write lock: no `offset + n` overflow, pairwise disjoint, clear of the
+    /// locked prefix, within `data_size`, and, for `k >= 3`, a staged tail that
+    /// fits in `u64`. `op` prefixes the error messages. Shared by
+    /// [`cross_rotate`](Self::cross_rotate) and `process_gen`'s `Rotate`.
+    fn check_rotation(
+        offsets: &[u64],
+        n: u64,
+        locked: u64,
+        data_size: u64,
+        op: &str,
+    ) -> io::Result<()> {
+        let mut max_end = 0u64;
+        for &o in offsets {
+            let end = o.checked_add(n).ok_or_else(|| {
+                io_error!(InvalidInput, format!("{op}: offset + n overflows u64"))
+            })?;
+            max_end = max_end.max(end);
+        }
+        if n > 0 && !pairwise_disjoint(offsets.to_vec(), n) {
+            return Err(io_error!(InvalidInput, format!("{op}: regions overlap")));
+        }
         if let Some(&o) = offsets.iter().find(|&&o| o < locked) {
             return Err(io_error!(
                 InvalidInput,
-                format!("cross_rotate: region at {o} overlaps locked region [0, {locked})")
+                format!("{op}: region at {o} overlaps locked region [0, {locked})")
             ));
         }
-        let data_size = *clen;
         if max_end > data_size {
             return Err(io_error!(
                 InvalidInput,
-                format!(
-                    "cross_rotate: region ending at {max_end} exceeds payload size ({data_size})"
-                )
+                format!("{op}: region ending at {max_end} exceeds payload size ({data_size})")
             ));
         }
-        match offsets {
-            _ if n == 0 => Ok(()),
-            [] | [_] => Ok(()),
-            &[a, b] => {
-                fault_point!(self, "cross_rotate");
-                Self::mark_replay(replay, journaled_exchange(file, data_size, a, b, n))
-            }
-            _ => {
-                // The staged tail `[n | k | offsets… | snapshot]` must fit past the payload.
-                let room = (u64::MAX - HEADER_SIZE).saturating_sub(data_size);
-                let offsets_len = size_of_val(offsets) as u64;
-                if n > room.saturating_sub(16).saturating_sub(offsets_len) {
-                    return Err(io_error!(
-                        InvalidInput,
-                        "cross_rotate: staged tail overflows u64"
-                    ));
-                }
-                fault_point!(self, "cross_rotate");
-                Self::mark_replay(replay, journaled_rotate(file, data_size, offsets, n))
-            }
+        // The staged tail `[n | k | offsets… | snapshot]` must fit past the payload.
+        let room = (u64::MAX - HEADER_SIZE).saturating_sub(data_size);
+        let offsets_len = size_of_val(offsets) as u64;
+        if offsets.len() > 2 && n > room.saturating_sub(16).saturating_sub(offsets_len) {
+            return Err(io_error!(
+                InvalidInput,
+                format!("{op}: staged tail overflows u64")
+            ));
         }
+        Ok(())
     }
 
     /// Copy `n` bytes from `from..from+n` to `to..to+n` under a single write lock.
@@ -3761,6 +3786,9 @@ impl BStack {
     ///   [`cross_exchange`](Self::cross_exchange), useful when a swap target
     ///   is only known once an earlier `Read` has resolved it (e.g. "read the
     ///   free-list head, then splice this block in as the new head").
+    /// - `Some(BStackGenOp::Rotate { offsets, len })` atomically rotates the
+    ///   `len`-byte regions at `offsets` and ends the sequence — the in-sequence
+    ///   equivalent of [`cross_rotate`](Self::cross_rotate).
     /// - `Some(BStackGenOp::Push { data })` appends `data` to the end of the
     ///   file, growing the payload, and ends the sequence — the in-sequence
     ///   equivalent of [`push`](Self::push).
@@ -3796,8 +3824,8 @@ impl BStack {
     ///   reads alone inform a decision, including the decision to change
     ///   nothing.
     ///
-    /// `Write`, `Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, and
-    /// `Sparse` are the only mutating operations, exactly one is permitted per
+    /// `Write`, `Swap`, `Rotate`, `Push`, `Pop`, `Discard`, `Atrunc`, `Splice`,
+    /// and `Sparse` are the only mutating operations, exactly one is permitted per
     /// call, and any one of them ends the sequence immediately — `f` is not called
     /// again afterwards.
     ///
@@ -3811,9 +3839,10 @@ impl BStack {
     ///
     /// Reads of the locked region `[0, locked_len())` are permitted, matching
     /// [`get`](Self::get) — locked bytes are immutable, so observing them
-    /// mid-sequence is always safe.  `Write` and `Swap` ranges that touch the
-    /// locked region are rejected, matching [`set`](Self::set) and
-    /// [`cross_exchange`](Self::cross_exchange); an `Atrunc` or `Splice` whose
+    /// mid-sequence is always safe.  `Write`, `Swap`, and `Rotate` ranges that
+    /// touch the locked region are rejected, matching [`set`](Self::set),
+    /// [`cross_exchange`](Self::cross_exchange), and
+    /// [`cross_rotate`](Self::cross_rotate); an `Atrunc` or `Splice` whose
     /// cut point falls inside the locked region is likewise rejected, matching
     /// [`atrunc`](Self::atrunc) and [`splice_into`](Self::splice_into).
     ///
@@ -3825,9 +3854,10 @@ impl BStack {
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if any `offset + len` overflows
-    /// `u64`, if a read, write, or swap range exceeds the current payload
-    /// size, if the two `Swap` regions overlap, if a write or swap range
-    /// overlaps the locked region `[0, locked_len())`, if a `Pop`, `Discard`,
+    /// `u64`, if a read, write, swap, or rotate range exceeds the current
+    /// payload size, if the `Swap` or `Rotate` regions overlap, if a write,
+    /// swap, or rotate range overlaps the locked region `[0, locked_len())`, if
+    /// a `Rotate`'s staged tail overflows `u64`, if a `Pop`, `Discard`,
     /// `Atrunc`, or `Splice` removes more bytes than the current payload size,
     /// or if it would shrink the payload below (or cut into) the locked length.
     /// Propagates any I/O error from `read_exact`, `write_all`, `set_len`, or
@@ -4021,6 +4051,16 @@ impl BStack {
                         Self::mark_replay(
                             replay,
                             journaled_exchange(file, data_size, a_offset, b_offset, len),
+                        )?;
+                    }
+                    return Ok(());
+                }
+                Some(BStackGenOp::Rotate { offsets, len }) => {
+                    Self::check_rotation(offsets, len, locked, data_size, "process_gen: rotate")?;
+                    if len > 0 && offsets.len() >= 2 {
+                        Self::mark_replay(
+                            replay,
+                            journaled_rotate(file, data_size, offsets, len),
                         )?;
                     }
                     return Ok(());
@@ -4423,6 +4463,12 @@ impl BStack {
                     feedback = Err(io_error!(
                         InvalidInput,
                         "inplace_gen: Swap is not permitted (Read/Write/Len only)"
+                    ));
+                }
+                Some(BStackGenOp::Rotate { .. }) => {
+                    feedback = Err(io_error!(
+                        InvalidInput,
+                        "inplace_gen: Rotate is not permitted (Read/Write/Len only)"
                     ));
                 }
                 Some(BStackGenOp::Push { .. }) => {

@@ -47,8 +47,8 @@ int bstack_inplace_gen(bstack_t *bs,
 | `inplace_gen`     | dependent reads, then **many** in-place writes committed together | write |
 
 `process_gen` is the sibling to compare against. It allows every op kind
-(including the size-changing `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse`
-and `Swap`), but the first mutating op **ends** the sequence — one mutation per
+(including the size-changing `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse`,
+`Swap`, and `Rotate`), but the first mutating op **ends** the sequence — one mutation per
 call. `inplace_gen` inverts the trade: only in-place writes are allowed, but
 they accumulate and commit as one unit.
 
@@ -80,8 +80,8 @@ alternative and takes only the read lock.
 | `None`                      | ends; commits every pending edit                                   |
 | any other op kind           | rejected with `InvalidInput` via feedback; not recorded; continues |
 
-`Swap`, `Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, and `Sparse` are the
-rejected kinds. The multi-write journal pins `clen` as the start of its staging
+`Swap`, `Rotate`, `Push`, `Pop`, `Discard`, `Atrunc`, `Splice`, and `Sparse`
+are the rejected kinds. The multi-write journal pins `clen` as the start of its staging
 region and the file size as its end, so nothing that moves either may be
 compounded with a pending batch.
 

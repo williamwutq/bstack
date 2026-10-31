@@ -945,8 +945,9 @@ pub(crate) fn pairwise_disjoint(mut sorted: Vec<u64>, n: u64) -> bool {
     sorted.windows(2).all(|w| w[0] + n <= w[1])
 }
 
-/// Crash-atomically rotate `k >= 3` disjoint `n`-byte payload regions: the
+/// Crash-atomically rotate `k >= 2` disjoint `n`-byte payload regions: the
 /// content of `offsets[i]` moves to `offsets[i + 1]`, the last to `offsets[0]`.
+/// `k == 2` is an exchange and takes [`journaled_exchange`].
 ///
 /// Only `offsets[k - 1]` is snapshotted, so staging is `16 + 8k + n` bytes no
 /// matter how large `k` is, and memory is O(k). Arming is the commit point:
@@ -961,6 +962,9 @@ pub(crate) fn journaled_rotate(
     offsets: &[u64],
     n: u64,
 ) -> io::Result<()> {
+    if let &[a, b] = offsets {
+        return journaled_exchange(file, data_size, a, b, n);
+    }
     let k = offsets.len();
     // 1. Stage `[n | k | offsets…]`, then snapshot the last region after it.
     let mut meta = Vec::with_capacity(16 + 8 * k);

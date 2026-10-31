@@ -242,9 +242,9 @@ impl BStack {
 
     /// Run a sequence of dependent reads, optionally followed by a single write, under
     /// one held write lock. `f` is called in a loop and drives the sequence through
-    /// `BStackGenOp::{Read, Len, Write, Swap, Push, Pop, Discard, Atrunc, Splice, Sparse}`; at
-    /// most one of `Write`/`Swap`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` is permitted
-    /// and ends the sequence.
+    /// `BStackGenOp::{Read, Len, Write, Swap, Rotate, Push, Pop, Discard, Atrunc, Splice, Sparse}`;
+    /// at most one of `Write`/`Swap`/`Rotate`/`Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` is
+    /// permitted and ends the sequence.
     /// Requires the `set` and `atomic` features.
     #[cfg(all(feature = "set", feature = "atomic"))]
     pub fn process_gen<'a, F>(&self, f: F) -> io::Result<()>
@@ -261,8 +261,8 @@ impl BStack {
 
     /// Run dependent reads interleaved with multiple in-place writes, committing
     /// every write together at the end via the multi-write journal. `f` is called
-    /// in a loop over `BStackGenOp::{Read, Write, Len}` (size-changing ops and
-    /// `Swap` are rejected); `Write`s accumulate rather than ending the sequence,
+    /// in a loop over `BStackGenOp::{Read, Write, Len}` (size-changing ops,
+    /// `Swap`, and `Rotate` are rejected); `Write`s accumulate rather than ending the sequence,
     /// later writes override earlier overlapping ones, and `Read`s see the
     /// batch-so-far content. `f` receives the previous op's `io::Result` (an
     /// erroring op is simply not recorded, and a failed `Read` leaves its buffer
@@ -695,7 +695,7 @@ before it is read/compare/callback work under the lock.
 | `swap`, `swap_into` *(set+atomic)*     | `read` old bytes → *commit* `buf`                                                         |
 | `cas` *(set+atomic)*                   | `read` → compare → conditional *commit* of `new`                                          |
 | `process` *(set+atomic)*               | `read(start..end)` → *(callback)* → *commit* the buffer                                    |
-| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms; `Abort` ends before any of them, leaving the payload untouched |
+| `process_gen` *(set+atomic)*           | closure-driven reads (and `Len` queries), ending in at most one mutating step — `Write` *commits*; `Swap` uses the exchange journal (as `cross_exchange`); `Rotate` uses the rotation journal (as `cross_rotate`); `Push`/`Pop`/`Discard`/`Atrunc`/`Splice`/`Sparse` behave as their standalone forms; `Abort` ends before any of them, leaving the payload untouched |
 | `set_batched` *(set+atomic)*           | validate + reject overlap → **multi-write journal**: stage every `[s \| e \| data]` block past `clen` → arm the `MultiWrite` sentinel (`wip_ptr` stays `0`) → replay each block in place → disarm → `ftruncate` (sync at each barrier); a lone effective write takes the ordinary single-write *commit* |
 | `inplace_gen` *(set+atomic)*           | closure-driven reads (each overlaid with the batch-so-far edits) interleaved with accumulated `Write`s (later overrides earlier on overlap); on `None` the pending edits commit together via the multi-write journal (as `set_batched`), on `Abort` they are discarded and nothing reaches the file |
 | `replace` *(atomic)*                   | `lseek(tail)` → `read(n)` → *(callback)* → *(then as `atrunc`)*                           |
