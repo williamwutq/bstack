@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BStack::cross_rotate` / `bstack_cross_rotate` (Rust and C, `set` + `atomic`).** Atomically rotates `k` equal-length, pairwise-disjoint regions: the bytes at `offsets[i]` move to `offsets[i + 1]`, and the last to `offsets[0]`. Any rearrangement of regions decomposes into such rotations. `k == 2` is `cross_exchange`; `k < 2` or `n == 0` is a no-op. A new `CycleSwap` journal mode stages only the last region, `16 + 8k + n` bytes whatever `k` is, and recovery resumes from the step the rotation reached.
+- **`BStackGenOp::Rotate` / `BSTACK_GEN_ROTATE` (Rust and C, `set` + `atomic`).** The in-sequence `cross_rotate` for `process_gen`, so the regions to rotate can depend on earlier `Read`s under the same lock. Like `Swap`, it ends the sequence, and `inplace_gen` rejects it. In C it is appended after `BSTACK_GEN_ABORT`, leaving the existing kinds' values unchanged.
+
 ### Changed
 
 - **`atomic` is now enabled by default *(breaking)*.** Rust: a plain `bstack = "0.5"` dependency now compiles in the `atomic` compound-operation API; the subset also gated on `set` still needs `set`, which stays opt-in alongside `alloc`. C: the released static-library archives are now all compiled with `-DBSTACK_FEATURE_ATOMIC` — the no-atomic and the standalone `atomic`/`set-atomic` archives are no longer shipped (no-atomic builds still compile from source with the `-D` flags and remain covered by CI). No on-disk format change and no behavior change to the base stack — `atomic` only exposes journal machinery every file already carries. **Migration:** Rust — keep it out with `default-features = false` plus an explicit `features = [...]` (e.g. `["set"]`); C — a no-atomic build is no longer distributed as a pre-compiled release archive, so build it from source (omitting `-DBSTACK_FEATURE_ATOMIC`) if you need one.
 - **Non-atomic allocator code paths are now lower-maintenance, but not removed.** Most built-in allocators carry two implementations of the same logic: an atomic path and a non-atomic fallback (Rust `#[cfg(not(feature = "atomic"))]` / C built without `-DBSTACK_FEATURE_ATOMIC`). With `atomic` now the default, the non-atomic paths are the exceptional configuration; expect reduced maintenance and slower optimization, with new allocator work targeting the atomic path first. They are **not** deprecated or removed and stay supported for `default-features = false` (Rust) and non-atomic C builds.
+- **On-disk format bumped to 0.5.0 *(breaking)* (Rust and C).** The new `CycleSwap` journal mode overwrites committed bytes before its commit point, so an older reader could not safely roll it back. `open` / `bstack_open` now write `BSTK\x00\x05\x00\x00` and reject 0.4.x files with `InvalidData` / `EINVAL`; 0.4 builds likewise reject 0.5 files.
 
 ### Removed
 
