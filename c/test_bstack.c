@@ -597,8 +597,8 @@ static int test_large_payload_roundtrip(void)
  * Header / magic
  * ====================================================================== */
 
-static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 4, 7, 0};
-static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
+static const uint8_t MAGIC[8]        = {'B','S','T','K', 0, 5, 0, 0};
+static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 5};
 #define TEST_HEADER_SIZE 32
 
 /* Write-in-progress journal modes (mirror bstack.c). */
@@ -608,6 +608,7 @@ static const uint8_t MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
 #define WIP_REPEAT        (UINT64_MAX - 3)
 #define WIP_COPY          (UINT64_MAX - 4)
 #define WIP_MULTI         (UINT64_MAX - 5)
+#define WIP_CYCLE_SWAP    (UINT64_MAX - 7)
 
 /* Write a crafted 0.4.0 file image: 32-byte header (magic, clen, wip_ptr,
  * wip_aux) followed by payload_len raw payload bytes. Used to simulate a file
@@ -1087,6 +1088,132 @@ static int test_recovery_replays_armed_copy(void)
     uint8_t buf[20]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
     CHECK(memcmp(buf, "SSSSSSSSSSSSSSSSSSSS", 20) == 0); /* both halves = source */
     bstack_close(bs);
+    unlink(tmp);
+    return 0;
+}
+
+/* Oracle: the content of offsets[i] moves to offsets[i+1], the last to
+ * offsets[0]. */
+static void rotated(const uint8_t *payload, size_t len, const uint64_t *offsets,
+                    size_t k, uint64_t n, uint8_t *out)
+{
+    memcpy(out, payload, len);
+    for (size_t i = 0; i < k; i++)
+        memcpy(out + offsets[(i + 1) % k], payload + offsets[i], (size_t)n);
+}
+
+static void put_le64(uint8_t *p, uint64_t v)
+{
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
+}
+
+/* Write a raw file a cross_rotate crashed in: payload committed, the journal
+ * armed at step s, and the tail [n | k | offsets | original last region]. */
+static int write_crashed_rotation(const char *path, const uint8_t *payload,
+                                  size_t len, const uint8_t *original,
+                                  const uint64_t *offsets, size_t k,
+                                  uint64_t n, size_t s)
+{
+    size_t total = len + 16 + 8 * k + (size_t)n;
+    uint8_t *img = malloc(total);
+    if (!img) return -1;
+    memcpy(img, payload, len);
+    put_le64(img + len, n);
+    put_le64(img + len + 8, (uint64_t)k);
+    for (size_t i = 0; i < k; i++)
+        put_le64(img + len + 16 + 8 * i, offsets[i]);
+    memcpy(img + len + 16 + 8 * k, original + offsets[k - 1], (size_t)n);
+    int rc = write_wip_file(path, len, TEST_HEADER_SIZE + offsets[s],
+                            WIP_CYCLE_SWAP, img, total);
+    free(img);
+    return rc;
+}
+
+/* Reopen path, compare the payload with expect, and check the journal was
+ * disarmed and the staged tail dropped. */
+static int check_recovered(const char *path, const uint8_t *expect, size_t len)
+{
+    bstack_t *bs = bstack_open(path);
+    CHECK(bs != NULL);
+    uint64_t got_len; CHECK(bstack_len(bs, &got_len) == 0); CHECK(got_len == len);
+    uint8_t *buf = malloc(len);
+    CHECK(buf != NULL);
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    int same = memcmp(buf, expect, len) == 0;
+    free(buf);
+    CHECK(same);
+    bstack_close(bs);
+
+    int fd = open(path, O_RDONLY | O_BINARY);
+    CHECK(fd >= 0);
+    struct stat st; fstat(fd, &st);
+    CHECK((uint64_t)st.st_size == TEST_HEADER_SIZE + len);
+    CHECK(raw_read_le64(fd, 16) == 0);
+    CHECK(raw_read_le64(fd, 24) == 0);
+    close(fd);
+    return 0;
+}
+
+static int test_recovery_resumes_rotation_from_every_step(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    const uint64_t offsets[5] = {120, 0, 300, 200, 60};
+    const size_t k = 5;
+    const uint64_t n = 40;
+    uint8_t original[400], expect[400], state[400], payload[400];
+    for (int i = 0; i < 400; i++) original[i] = (uint8_t)(i * 7 % 256);
+    rotated(original, 400, offsets, k, n, expect);
+
+    /* done steps have landed, so the journal names step s = k - 1 - done.
+     * Each case is replayed clean and with the pending step's destination torn. */
+    for (size_t done = 0; done < k; done++) {
+        size_t s = k - 1 - done;
+        memcpy(state, original, 400);
+        for (size_t i = k - 1; i > s; i--)
+            memmove(state + offsets[i], state + offsets[i - 1], (size_t)n);
+        for (int torn = 0; torn < 2; torn++) {
+            memcpy(payload, state, 400);
+            if (torn) memset(payload + offsets[s], 0xEE, (size_t)n / 2);
+            CHECK(write_crashed_rotation(tmp, payload, 400, original,
+                                         offsets, k, n, s) == 0);
+            CHECK(check_recovered(tmp, expect, 400) == 0);
+        }
+    }
+    unlink(tmp);
+    return 0;
+}
+
+static int test_recovery_rolls_back_corrupt_rotation_tail(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    const uint64_t offsets[3] = {0, 100, 200};
+    const uint64_t n = 50;
+    uint8_t original[300];
+    for (int i = 0; i < 300; i++) original[i] = (uint8_t)i;
+    const size_t tail = TEST_HEADER_SIZE + 300;
+    const size_t file_len = tail + 16 + 24 + 50;
+
+    /* Each case corrupts one field of a well-formed image armed at s = 2. */
+    for (int c = 0; c < 5; c++) {
+        CHECK(write_crashed_rotation(tmp, original, 300, original,
+                                     offsets, 3, n, 2) == 0);
+        uint8_t img[TEST_HEADER_SIZE + 300 + 16 + 24 + 50];
+        int fd = open(tmp, O_RDWR | O_BINARY);
+        CHECK(fd >= 0);
+        CHECK(pread(fd, img, file_len, 0) == (ssize_t)file_len);
+        size_t new_len = file_len;
+        switch (c) {
+        case 0: put_le64(img + 16, TEST_HEADER_SIZE + 50); break; /* wip_ptr names no offset */
+        case 1: new_len--; break;                     /* tail_len != 16 + 8k + n */
+        case 2: put_le64(img + tail + 16 + 8, 30); break; /* offsets[1] overlaps offsets[0] */
+        case 3: put_le64(img + tail + 16, 260); break; /* offsets[0]: 260 + 50 > clen */
+        case 4: put_le64(img + tail, 0); break;       /* n == 0 */
+        }
+        CHECK(ftruncate(fd, 0) == 0);
+        CHECK(pwrite(fd, img, new_len, 0) == (ssize_t)new_len);
+        close(fd);
+        CHECK(check_recovered(tmp, original, 300) == 0);
+    }
     unlink(tmp);
     return 0;
 }
@@ -4142,6 +4269,123 @@ static int test_process_gen_swap_in_locked_region_returns_error(void)
     return 0;
 }
 
+static const uint64_t pg_rotate_three[3] = {0, 3, 6};
+
+static int pg_rotate_ends_sequence_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    int *calls = userctx;
+    if (++*calls == 1) {
+        out_op->kind             = BSTACK_GEN_ROTATE;
+        out_op->u.rotate.offsets = pg_rotate_three;
+        out_op->u.rotate.count   = 3;
+        out_op->u.rotate.len     = 3;
+    } else {
+        out_op->kind           = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"NOPE!";
+        out_op->u.write.len    = 5;
+    }
+    return 1;
+}
+
+static int test_process_gen_rotate_rotates_regions_and_ends_sequence(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"AAABBBCCC", 9, NULL) == 0);
+    int calls = 0;
+    CHECK(bstack_process_gen(bs, pg_rotate_ends_sequence_gen, &calls) == 0);
+    CHECK(calls == 1); /* ROTATE ends the sequence, like WRITE */
+    uint8_t buf[9]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "CCCAAABBB", 9) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_rotate_informed_ctx {
+    uint8_t  ptr_buf[8];
+    uint64_t offsets[3];
+    int      step;
+};
+
+/* Layout: [pointer: u64 LE][A: 8][B: 8][C: 8]. The pointer names the third
+ * region of the rotation, so it is read first under the same lock. */
+static int pg_rotate_informed_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct pg_rotate_informed_ctx *ctx = userctx;
+    switch (ctx->step++) {
+    case 0:
+        out_op->kind          = BSTACK_GEN_READ;
+        out_op->u.read.offset = 0;
+        out_op->u.read.buf    = ctx->ptr_buf;
+        out_op->u.read.len    = sizeof ctx->ptr_buf;
+        return 1;
+    case 1:
+        ctx->offsets[2] = pg_le64_get(ctx->ptr_buf);
+        out_op->kind             = BSTACK_GEN_ROTATE;
+        out_op->u.rotate.offsets = ctx->offsets;
+        out_op->u.rotate.count   = 3;
+        out_op->u.rotate.len     = 8;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_process_gen_rotate_targets_informed_by_prior_read(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t payload[32];
+    put_le64(payload, 24); /* names block C */
+    memcpy(payload + 8, "AAAAAAAABBBBBBBBCCCCCCCC", 24);
+    CHECK(bstack_push(bs, payload, 32, NULL) == 0);
+    struct pg_rotate_informed_ctx ctx = { {0}, {8, 16, 0}, 0 };
+    CHECK(bstack_process_gen(bs, pg_rotate_informed_gen, &ctx) == 0);
+    uint8_t buf[24]; CHECK(bstack_get(bs, 8, 32, buf) == 0);
+    CHECK(memcmp(buf, "CCCCCCCCAAAAAAAABBBBBBBB", 24) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+struct pg_rotate_bad_ctx {
+    const uint64_t *offsets;
+    uint64_t        len;
+};
+
+static int pg_rotate_bad_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    const struct pg_rotate_bad_ctx *ctx = userctx;
+    out_op->kind             = BSTACK_GEN_ROTATE;
+    out_op->u.rotate.offsets = ctx->offsets;
+    out_op->u.rotate.count   = 3;
+    out_op->u.rotate.len     = ctx->len;
+    return 1;
+}
+
+static int test_process_gen_rotate_rejects_bad_regions(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    const uint64_t overlap[3] = {0, 2, 6}, past[3] = {0, 3, 8};
+    struct pg_rotate_bad_ctx cases[3] = {
+        {overlap, 3}, {past, 3}, {pg_rotate_three, 2} /* locked prefix */
+    };
+    for (int i = 0; i < 3; i++) {
+        if (i == 2) CHECK(bstack_lock_up_to(bs, 2) == 0);
+        CHECK(bstack_process_gen(bs, pg_rotate_bad_gen, &cases[i]) == -1);
+        CHECK(errno == EINVAL);
+    }
+    uint8_t buf[10]; CHECK(bstack_get(bs, 0, 10, buf) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int pg_write_gen(bstack_gen_op_t *out_op, void *userctx)
 {
     (void)userctx;
@@ -5285,6 +5529,50 @@ static int test_inplace_gen_rejects_size_ops_but_still_commits(void)
     return 0;
 }
 
+struct ig_reject_rotate_ctx {
+    int step;
+    const int *prev;  /* points at the caller's prev_status variable */
+    int rotate_prev;  /* prev_status captured after the ROTATE op */
+};
+
+static int ig_reject_rotate_gen(bstack_gen_op_t *out_op, void *userctx)
+{
+    struct ig_reject_rotate_ctx *c = userctx;
+    switch (c->step++) {
+    case 0:
+        out_op->kind             = BSTACK_GEN_ROTATE;
+        out_op->u.rotate.offsets = pg_rotate_three;
+        out_op->u.rotate.count   = 3;
+        out_op->u.rotate.len     = 3;
+        return 1;
+    case 1:
+        c->rotate_prev = *c->prev; /* feedback for the rejected ROTATE */
+        out_op->kind = BSTACK_GEN_WRITE;
+        out_op->u.write.offset = 0;
+        out_op->u.write.data   = (const uint8_t *)"Z";
+        out_op->u.write.len    = 1;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int test_inplace_gen_rejects_rotate_but_still_commits(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"AAABBBCCC", 9, NULL) == 0);
+    int prev = 0;
+    struct ig_reject_rotate_ctx c = { 0, &prev, 0 };
+    CHECK(bstack_inplace_gen(bs, ig_reject_rotate_gen, &c, &prev) == 0);
+    CHECK(c.rotate_prev == EINVAL);
+    uint8_t buf[9]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "ZAABBBCCC", 9) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
 static int ig_immediate_none_gen(bstack_gen_op_t *out_op, void *userctx)
 {
     (void)out_op; (void)userctx;
@@ -5463,6 +5751,125 @@ static int test_process_gen_abort_ends_the_sequence_with_an_error(void)
     uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
     CHECK(memcmp(buf, "helloworld", 10) == 0);
     bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * bstack_cross_rotate (recovery is tested with the other journal modes)
+ * ---------------------------------------------------------------------- */
+
+static int test_cross_rotate_rotates_three_regions(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"AAABBBCCC", 9, NULL) == 0);
+    const uint64_t offsets[3] = {0, 3, 6};
+    CHECK(bstack_cross_rotate(bs, offsets, 3, 3) == 0);
+    uint8_t buf[9]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "CCCAAABBB", 9) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cross_rotate_unordered_offsets_journal_and_reopen_clean(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    uint8_t payload[400], expect[400];
+    for (int i = 0; i < 400; i++) payload[i] = (uint8_t)(i % 251);
+    CHECK(bstack_push(bs, payload, 400, NULL) == 0);
+    const uint64_t offsets[4] = {300, 20, 150, 90};
+    CHECK(bstack_cross_rotate(bs, offsets, 4, 50) == 0);
+    rotated(payload, 400, offsets, 4, 50, expect);
+    uint8_t buf[400]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, 400) == 0);
+    bstack_close(bs);
+    CHECK(check_recovered(tmp, expect, 400) == 0);
+    unlink(tmp);
+    return 0;
+}
+
+static int test_cross_rotate_two_regions_is_an_exchange(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    const uint64_t offsets[2] = {0, 5};
+    CHECK(bstack_cross_rotate(bs, offsets, 2, 5) == 0);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "worldhello", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cross_rotate_trivial_cases_are_noops(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    const uint64_t one[1] = {3}, zeros[3] = {0, 0, 0}, past[1] = {8};
+    CHECK(bstack_cross_rotate(bs, NULL, 0, 5) == 0);
+    CHECK(bstack_cross_rotate(bs, one, 1, 5) == 0);
+    CHECK(bstack_cross_rotate(bs, zeros, 3, 0) == 0); /* n == 0: no overlap check */
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+    /* Bounds are still checked on a no-op. */
+    CHECK(bstack_cross_rotate(bs, past, 1, 5) == -1);
+    CHECK(errno == EINVAL);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cross_rotate_rejects_bad_regions(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    CHECK(bstack_push(bs, (uint8_t *)"helloworld", 10, NULL) == 0);
+    const uint64_t bad[4][3] = {
+        {0, 2, 6},          /* overlap */
+        {0, 4, 0},          /* duplicate */
+        {0, 3, 8},          /* past the payload */
+        {0, 3, UINT64_MAX}, /* offset + n overflows */
+    };
+    for (int i = 0; i < 4; i++) {
+        CHECK(bstack_cross_rotate(bs, bad[i], 3, 3) == -1);
+        CHECK(errno == EINVAL);
+    }
+    CHECK(bstack_lock_up_to(bs, 2) == 0);
+    const uint64_t offsets[3] = {0, 3, 6};
+    CHECK(bstack_cross_rotate(bs, offsets, 3, 2) == -1); /* locked prefix */
+    CHECK(errno == EINVAL);
+    uint8_t buf[10]; CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, "helloworld", 10) == 0);
+    bstack_close(bs); unlink(tmp);
+    return 0;
+}
+
+static int test_cross_rotate_streams_large_regions(void)
+{
+    char tmp[64]; make_tmp(tmp, sizeof tmp);
+    bstack_t *bs = bstack_open(tmp);
+    CHECK(bs != NULL);
+    const uint64_t n = 10 * 1024; /* > MOVE_CHUNK */
+    const size_t len = (size_t)(4 * n);
+    uint8_t *payload = malloc(len), *expect = malloc(len), *buf = malloc(len);
+    CHECK(payload && expect && buf);
+    for (size_t i = 0; i < len; i++) payload[i] = (uint8_t)(i % 253);
+    CHECK(bstack_push(bs, payload, len, NULL) == 0);
+    const uint64_t offsets[4] = {0, n, 2 * n, 3 * n};
+    CHECK(bstack_cross_rotate(bs, offsets, 4, n) == 0);
+    rotated(payload, len, offsets, 4, n, expect);
+    CHECK(bstack_peek(bs, 0, buf, NULL) == 0);
+    CHECK(memcmp(buf, expect, len) == 0);
+    bstack_close(bs);
+    CHECK(check_recovered(tmp, expect, len) == 0);
+    free(payload); free(expect); free(buf);
+    unlink(tmp);
     return 0;
 }
 
@@ -6124,6 +6531,8 @@ int main(void)
     T(test_recovery_replays_armed_set);
     T(test_recovery_replays_armed_repeat);
     T(test_recovery_replays_armed_copy);
+    T(test_recovery_resumes_rotation_from_every_step);
+    T(test_recovery_rolls_back_corrupt_rotation_tail);
     T(test_recovery_rolls_forward_splice_grow);
     T(test_recovery_rolls_forward_splice_shrink);
     T(test_recovery_rolls_back_unknown_mode);
@@ -6344,9 +6753,18 @@ int main(void)
     T(test_process_gen_immediate_none_is_noop);
     T(test_process_gen_write_ends_sequence);
     T(test_process_gen_swap_exchanges_two_regions_and_ends_sequence);
+    T(test_cross_rotate_rotates_three_regions);
+    T(test_cross_rotate_unordered_offsets_journal_and_reopen_clean);
+    T(test_cross_rotate_two_regions_is_an_exchange);
+    T(test_cross_rotate_trivial_cases_are_noops);
+    T(test_cross_rotate_rejects_bad_regions);
+    T(test_cross_rotate_streams_large_regions);
     T(test_process_gen_swap_target_informed_by_prior_read);
     T(test_process_gen_swap_overlapping_regions_returns_error);
     T(test_process_gen_swap_in_locked_region_returns_error);
+    T(test_process_gen_rotate_rotates_regions_and_ends_sequence);
+    T(test_process_gen_rotate_targets_informed_by_prior_read);
+    T(test_process_gen_rotate_rejects_bad_regions);
     T(test_process_gen_does_not_change_file_size);
     T(test_process_gen_read_out_of_bounds_returns_error);
     T(test_process_gen_write_out_of_bounds_returns_error);
@@ -6379,6 +6797,7 @@ int main(void)
     T(test_inplace_gen_read_fully_covered_by_overlay);
     T(test_inplace_gen_read_spans_multiple_edits_and_gaps);
     T(test_inplace_gen_rejects_size_ops_but_still_commits);
+    T(test_inplace_gen_rejects_rotate_but_still_commits);
     T(test_inplace_gen_immediate_none_is_noop);
     T(test_inplace_gen_abort_discards_staged_writes);
     T(test_inplace_gen_abort_unwinds_after_a_rejected_write);

@@ -58,10 +58,13 @@
  * Constants
  * ---------------------------------------------------------------------- */
 
-/* On-disk format 0.4.7. The first 6 bytes (BSTK + major + minor) are the
- * compatibility prefix checked on open; the patch byte is informational. */
-static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 4, 7, 0};
-static const uint8_t  MAGIC_PREFIX[6] = {'B','S','T','K', 0, 4};
+/* On-disk format 0.5.0. The first 6 bytes (BSTK + major + minor) are the
+ * compatibility prefix checked on open; the patch byte is informational. 0.5.0
+ * adds the WIP_CYCLE_SWAP journal mode, which overwrites committed bytes before
+ * its commit point, so an older reader cannot safely roll it back (WIP.md
+ * Rule 2). */
+static const uint8_t  MAGIC[8]        = {'B','S','T','K', 0, 5, 0, 0};
+static const uint8_t  MAGIC_PREFIX[6] = {'B','S','T','K', 0, 5};
 static const uint64_t HEADER_SIZE     = 32;
 
 /* Pre-0.4.0 (0.1.x) format that bstack_migrate upgrades from: 16-byte header
@@ -81,6 +84,11 @@ static const uint64_t LEGACY_HEADER_SIZE     = 16;
 #define WIP_REPEAT       (UINT64_MAX - 3)
 #define WIP_COPY         (UINT64_MAX - 4)
 #define WIP_MULTI        (UINT64_MAX - 5)
+/* Cyclic rotation of k disjoint n-byte regions. The tail holds [n | k | offsets
+ * | snapshot of offsets[k-1]]; wip_ptr is HEADER_SIZE + offsets[s], the
+ * destination of the next unperformed step, so it doubles as the progress
+ * counter. UINT64_MAX - 6 is reserved for MultiAtrunc. */
+#define WIP_CYCLE_SWAP   (UINT64_MAX - 7)
 
 /* Conservative power-fail atomic block size (bytes): a write confined to one
  * 256-byte-aligned region cannot tear across a hardware block on power loss.
@@ -452,8 +460,8 @@ static int read_header(bstack_fd_t fd, uint64_t *out_clen,
  * ---------------------------------------------------------------------- */
 
 /* Overwrite wip_ptr (offset 16) and wip_aux (offset 24) in one 16-byte write.
- * wip_ptr == 0 is the disarmed (steady) state. */
-#if defined(BSTACK_FEATURE_SET) || defined(BSTACK_FEATURE_ATOMIC)
+ * wip_ptr == 0 is the disarmed (steady) state. Not feature-gated: recovery
+ * advances the WIP_CYCLE_SWAP counter. */
 static inline int write_wip(bstack_fd_t fd, uint64_t wip_ptr, uint64_t wip_aux)
 {
     uint8_t buf[16];
@@ -461,7 +469,6 @@ static inline int write_wip(bstack_fd_t fd, uint64_t wip_ptr, uint64_t wip_aux)
     for (int i = 0; i < 8; i++) buf[8 + i] = (uint8_t)(wip_aux >> (8 * i));
     return plat_pwrite(fd, buf, 16, 16);
 }
-#endif
 
 /* Atomically commit a new committed length AND disarm the journal in one
  * 24-byte header write: clen at offset 8, wip_ptr/wip_aux at 16/24. All three
@@ -549,6 +556,98 @@ static int write_repeated(bstack_fd_t fd, uint64_t phys,
     }
     free(buf);
     return 0;
+}
+
+/* qsort comparator: ascending uint64_t. */
+static int cmp_u64(const void *x, const void *y)
+{
+    uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
+    return (a > b) - (a < b);
+}
+
+/* Return 1 if the n-byte regions at sorted[0..k) are pairwise disjoint; sorts
+ * sorted in place. Callers guarantee every offset + n fits in uint64_t. */
+static int pairwise_disjoint(uint64_t *sorted, size_t k, uint64_t n)
+{
+    qsort(sorted, k, sizeof *sorted, cmp_u64);
+    for (size_t i = 1; i < k; i++)
+        if (sorted[i - 1] + n > sorted[i])
+            return 0;
+    return 1;
+}
+
+/* Run the rotation steps from s down to 0, each a commit point. Step s >= 1
+ * copies offsets[s-1] -> offsets[s], then advances wip_ptr to offsets[s-1];
+ * step 0 copies the staged snapshot (logical snapshot) -> offsets[0]. Replaying
+ * a step is idempotent: its source is not written until the following step, and
+ * the snapshot covers the one region overwritten before it is read. Shared by
+ * the writer and recovery. Not feature-gated (recovery needs it). */
+static int rotate_steps(bstack_fd_t fd, const uint64_t *offsets, uint64_t n,
+                        uint64_t snapshot, size_t s)
+{
+    for (size_t i = s; i > 0; i--) {
+        if (move_chunked(fd, offsets[i - 1], offsets[i], n) != 0) return -1;
+        if (plat_durable_sync(fd) != 0) return -1;
+        if (write_wip(fd, HEADER_SIZE + offsets[i - 1], WIP_CYCLE_SWAP) != 0)
+            return -1;
+        if (plat_durable_sync(fd) != 0) return -1;
+    }
+    if (move_chunked(fd, snapshot, offsets[0], n) != 0) return -1;
+    return plat_durable_sync(fd);
+}
+
+/* Parse and validate an armed WIP_CYCLE_SWAP tail, then resume the rotation at
+ * the step wip_ptr names. Requires tail_len == 16 + 8k + n, n > 0, k >= 2,
+ * every offset + n <= committed_len, pairwise-disjoint regions, and wip_ptr
+ * naming one of the offsets. An invalid tail applies nothing, so the caller's
+ * finalize rolls back. */
+static int recover_rotation(bstack_fd_t fd, uint64_t committed_len,
+                            uint64_t tail_start, uint64_t tail_len,
+                            uint64_t wip_ptr)
+{
+    if (tail_len < 16 || wip_ptr < HEADER_SIZE) return 0;
+    uint8_t meta[16];
+    if (plat_pread(fd, meta, 16, tail_start) != 0) return -1;
+    uint64_t n = decode_le64(meta);
+    uint64_t k = decode_le64(meta + 8);
+    /* What is left after the header and the snapshot must be exactly the k
+     * offsets. A short tail saturates to 0, which k >= 2 rejects. */
+    uint64_t rest = tail_len - 16;
+    rest = (rest > n) ? rest - n : 0;
+    if (n == 0 || k < 2 || rest % 8 != 0 || rest / 8 != k) return 0;
+    /* rest == 8k is bounded by the file; too large for memory is ENOMEM. */
+    if (rest > SIZE_MAX) { errno = ENOMEM; return -1; }
+    uint64_t *offsets = (uint64_t *)malloc((size_t)rest);
+    uint64_t *sorted  = (uint64_t *)malloc((size_t)rest);
+    if (!offsets || !sorted) {
+        free(offsets); free(sorted);
+        return -1;
+    }
+    int rc = 0;
+    if (plat_pread(fd, offsets, (size_t)rest, tail_start + 16) != 0) {
+        rc = -1;
+        goto done;
+    }
+    /* Decode in place, and check every region lies within the payload. */
+    int valid = 1;
+    for (size_t i = 0; i < (size_t)k; i++) {
+        offsets[i] = decode_le64((const uint8_t *)&offsets[i]);
+        if (offsets[i] > committed_len || committed_len - offsets[i] < n)
+            valid = 0;
+    }
+    if (!valid) goto done;
+    memcpy(sorted, offsets, (size_t)rest);
+    if (!pairwise_disjoint(sorted, (size_t)k, n)) goto done;
+    uint64_t target = wip_ptr - HEADER_SIZE;
+    for (size_t s = 0; s < (size_t)k; s++) {
+        if (offsets[s] == target) {
+            rc = rotate_steps(fd, offsets, n, committed_len + 16 + rest, s);
+            break;
+        }
+    }
+done:
+    { int sv = errno; free(offsets); free(sorted); errno = sv; }
+    return rc;
 }
 
 /* Recover an armed in-place journal (wip_ptr != 0) found on open, restoring the
@@ -675,6 +774,12 @@ static int recover_wip(bstack_fd_t fd, uint64_t committed_len,
                 }
             }
         }
+    } else if (wip_aux == WIP_CYCLE_SWAP) {
+        /* Tail is [n | k | offsets | snapshot]; wip_ptr - HEADER_SIZE names the
+         * next step. Every step before it has landed, so resume there. Roll back
+         * on a corrupt or inconsistent tail. */
+        if (recover_rotation(fd, committed_len, tail_start, tail_len, wip_ptr) != 0)
+            return -1;
     }
     /* else: unknown mode — roll back to committed_len (no replay). */
 
@@ -2194,6 +2299,83 @@ static int journaled_exchange(bstack_fd_t fd, uint64_t data_size,
     return plat_ftruncate(fd, HEADER_SIZE + data_size);
 }
 
+/* Validate a rotation of the n-byte regions at offsets[0..k) under the held
+ * write lock: no offset + n overflow, pairwise disjoint, clear of the locked
+ * prefix, within data_size, and, for k >= 3, a staged tail that fits in
+ * uint64_t. Shared by bstack_cross_rotate and BSTACK_GEN_ROTATE. Returns 0, or
+ * -1 with errno = EINVAL (or ENOMEM if the offsets cannot be copied to sort). */
+static int check_rotation(const uint64_t *offsets, size_t k, uint64_t n,
+                          uint64_t locked, uint64_t data_size)
+{
+    uint64_t max_end = 0;
+    for (size_t i = 0; i < k; i++) {
+        if (n > UINT64_MAX - offsets[i]) goto error;
+        if (offsets[i] + n > max_end) max_end = offsets[i] + n;
+    }
+    if (n > 0 && k >= 2) {
+        uint64_t *sorted = (uint64_t *)malloc(k * sizeof *sorted);
+        if (!sorted) return -1;
+        memcpy(sorted, offsets, k * sizeof *sorted);
+        int disjoint = pairwise_disjoint(sorted, k, n);
+        free(sorted);
+        if (!disjoint) goto error;
+    }
+    for (size_t i = 0; i < k; i++)
+        if (offsets[i] < locked) goto error;
+    if (max_end > data_size) goto error;
+    /* The staged tail [n | k | offsets | snapshot] must fit past the payload. */
+    uint64_t room = UINT64_MAX - HEADER_SIZE;
+    uint64_t offsets_len = (uint64_t)k * 8;
+    room = (room > data_size) ? room - data_size : 0;
+    room = (room > 16) ? room - 16 : 0;
+    room = (room > offsets_len) ? room - offsets_len : 0;
+    if (k > 2 && n > room) goto error;
+    return 0;
+
+error:
+    errno = EINVAL;
+    return -1;
+}
+
+/* Crash-atomically rotate k >= 2 disjoint n-byte payload regions: the content
+ * of offsets[i] moves to offsets[i+1], the last to offsets[0]. k == 2 is an
+ * exchange and takes journaled_exchange. Only offsets[k-1] is snapshotted, so
+ * staging is 16 + 8k + n bytes no matter how large k is, and memory is O(k).
+ * Arming is the commit point: recovery always rolls forward from the step
+ * wip_ptr names (see rotate_steps). Callers have validated the regions with
+ * check_rotation and ensured n > 0. */
+static int journaled_rotate(bstack_fd_t fd, uint64_t data_size,
+                            const uint64_t *offsets, size_t k, uint64_t n)
+{
+    if (k == 2)
+        return journaled_exchange(fd, data_size, offsets[0], offsets[1], n);
+    /* 1. Stage [n | k | offsets], then snapshot the last region after it. The
+     *    8k bytes mirror the caller's array, so 16 + 8k fits size_t. */
+    size_t meta_len = 16 + 8 * k;
+    uint8_t *meta = (uint8_t *)malloc(meta_len);
+    if (!meta) return -1;
+    for (int i = 0; i < 8; i++) meta[i]     = (uint8_t)(n          >> (8 * i));
+    for (int i = 0; i < 8; i++) meta[8 + i] = (uint8_t)((uint64_t)k >> (8 * i));
+    for (size_t j = 0; j < k; j++)
+        for (int i = 0; i < 8; i++)
+            meta[16 + 8 * j + i] = (uint8_t)(offsets[j] >> (8 * i));
+    int rc = plat_pwrite(fd, meta, meta_len, HEADER_SIZE + data_size);
+    { int sv = errno; free(meta); errno = sv; }
+    if (rc != 0) return -1;
+    uint64_t snapshot = data_size + meta_len;
+    if (move_chunked(fd, offsets[k - 1], snapshot, n) != 0) return -1;
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 2. Arm at the first step, s = k - 1 — the commit point. */
+    if (write_wip(fd, HEADER_SIZE + offsets[k - 1], WIP_CYCLE_SWAP) != 0) return -1;
+    if (plat_durable_sync(fd) != 0) return -1;
+    /* 3. Perform every step, advancing the counter after each. */
+    if (rotate_steps(fd, offsets, n, snapshot, k - 1) != 0) return -1;
+    /* 4. Disarm and drop the staged tail. */
+    if (write_wip(fd, 0, WIP_SET) != 0) return -1;
+    if (plat_durable_sync(fd) != 0) return -1;
+    return plat_ftruncate(fd, HEADER_SIZE + data_size);
+}
+
 /* Crash-atomically commit count non-overlapping in-place writes {(offset_i,
  * buf_i, len_i)} as one unit through the multi-write journal, O(1) memory beyond
  * the caller's own buffers. data_size is the current payload length; it is never
@@ -3291,6 +3473,20 @@ int bstack_process_gen(bstack_t *bs,
             BS_WRUNLOCK(bs);
             return 0;
         }
+        case BSTACK_GEN_ROTATE: {
+            const uint64_t *offsets = op.u.rotate.offsets;
+            size_t   count = op.u.rotate.count;
+            uint64_t len   = op.u.rotate.len;
+            if (check_rotation(offsets, count, len, locked, data_size) != 0)
+                goto fail_unlock;
+            /* Crash-atomic rotation journal (as bstack_cross_rotate). */
+            if (len > 0 && count >= 2 &&
+                mark_replay(bs, journaled_rotate(bs->fd, data_size,
+                                                 offsets, count, len)) != 0)
+                goto fail_unlock;
+            BS_WRUNLOCK(bs);
+            return 0;
+        }
         case BSTACK_GEN_PUSH: {
             const uint8_t *data = op.u.push.data;
             size_t   len  = op.u.push.len;
@@ -3718,8 +3914,9 @@ int bstack_inplace_gen(bstack_t *bs,
             goto fail_free;
         }
         default:
-            /* SWAP / PUSH / POP / SPLICE / SPARSE and any unknown kind are not
-             * permitted (in-place Read/Write/Len only); report and continue. */
+            /* SWAP / ROTATE / PUSH / POP / SPLICE / SPARSE and any unknown kind
+             * are not permitted (in-place Read/Write/Len only); report and
+             * continue. */
             prev = EINVAL;
             break;
         }
@@ -3782,6 +3979,28 @@ int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n)
     /* Crash-atomic exchange through the write-in-progress journal (O(1)
      * memory): stage A's bytes, then commit at a single wip_ptr flip A -> B. */
     if (mark_replay(bs, journaled_exchange(bs->fd, data_size, a, b, n)) != 0)
+        goto fail_unlock;
+
+    BS_WRUNLOCK(bs);
+    return 0;
+
+fail_unlock:
+    { int sv = errno; BS_WRUNLOCK(bs); errno = sv; }
+    return -1;
+}
+
+int bstack_cross_rotate(bstack_t *bs, const uint64_t *offsets, size_t k,
+                        uint64_t n)
+{
+    BS_WRLOCK_REPLAY(bs);
+
+    uint64_t locked = ATOMIC_LOAD_ACQUIRE(&bs->locked);
+    uint64_t data_size = bs->clen;
+    if (check_rotation(offsets, k, n, locked, data_size) != 0)
+        goto fail_unlock;
+
+    if (n > 0 && k >= 2 &&
+        mark_replay(bs, journaled_rotate(bs->fd, data_size, offsets, k, n)) != 0)
         goto fail_unlock;
 
     BS_WRUNLOCK(bs);

@@ -8,7 +8,7 @@
  * bstack — persistent, fsync-durable binary stack backed by a single file.
  *
  * File format (32-byte header followed by payload):
- *   [0..8)   magic: "BSTK" + major(0) + minor(4) + patch(7) + reserved(0)
+ *   [0..8)   magic: "BSTK" + major(0) + minor(5) + patch(0) + reserved(0)
  *   [8..16)  committed payload length (clen), little-endian uint64
  *   [16..24) wip_ptr: write-in-progress journal target (0 when idle), LE uint64
  *   [24..32) wip_aux: write-in-progress journal mode, LE uint64
@@ -60,7 +60,7 @@
  * bstack_try_extend / bstack_try_extend_zeros / bstack_try_discard(s, n>0) /
  * bstack_ensure_with / bstack_swap / bstack_cas / bstack_replace / bstack_process /
  * bstack_process_gen / bstack_set_batched / bstack_inplace_gen /
- * bstack_cross_exchange / bstack_copy / bstack_recover /
+ * bstack_cross_exchange / bstack_cross_rotate / bstack_copy / bstack_recover /
  * bstack_eq_crds / bstack_ne_crds /
  * bstack_masked_eq_crds / bstack_masked_ne_crds
  * hold a write lock.  bstack_try_discard(s, 0) holds a read lock.
@@ -85,8 +85,8 @@
  *   bstack_replace, bstack_get_batched, and bstack_get_batched_gen.  Both
  *   flags together also enable bstack_swap, bstack_cas, bstack_process,
  *   bstack_process_gen, bstack_set_batched, bstack_inplace_gen, bstack_gen_op_t,
- *   bstack_cross_exchange, bstack_copy, bstack_eq_crds, bstack_ne_crds,
- *   bstack_masked_eq_crds, and bstack_masked_ne_crds.
+ *   bstack_cross_exchange, bstack_cross_rotate, bstack_copy, bstack_eq_crds,
+ *   bstack_ne_crds, bstack_masked_eq_crds, and bstack_masked_ne_crds.
  */
 
 /*
@@ -684,6 +684,9 @@ typedef enum {
     /* End the sequence without applying anything it accumulated.  Fails the
      * call with errno = u.abort.status, or succeeds if status is 0. */
     BSTACK_GEN_ABORT,
+    /* Atomically rotate the u.rotate.len-byte regions at the u.rotate.count
+     * offsets in u.rotate.offsets, ending the sequence. */
+    BSTACK_GEN_ROTATE,
 } bstack_gen_op_kind_t;
 
 /*
@@ -699,6 +702,11 @@ typedef enum {
  * - BSTACK_GEN_SWAP: atomically exchange u.swap.len bytes at u.swap.a_offset
  *   with u.swap.len bytes at u.swap.b_offset, ending the sequence.  The
  *   regions must not overlap.
+ * - BSTACK_GEN_ROTATE: atomically rotate the u.rotate.len-byte regions at the
+ *   u.rotate.count offsets in u.rotate.offsets — the bytes at offsets[i] move
+ *   to offsets[i+1], the last to offsets[0] — ending the sequence, the
+ *   in-sequence equivalent of bstack_cross_rotate.  The regions must be
+ *   pairwise disjoint.
  * - BSTACK_GEN_PUSH: append u.push.len bytes from u.push.data to the end of
  *   the file, growing the payload, and ending the sequence — the in-sequence
  *   equivalent of bstack_push.
@@ -730,10 +738,10 @@ typedef enum {
  *   committing everything.  u.abort.status sets the outcome independently:
  *   non-zero fails the call with errno = u.abort.status, 0 returns 0.
  *
- * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_PUSH, BSTACK_GEN_POP,
- * BSTACK_GEN_SPLICE, and BSTACK_GEN_SPARSE are the only mutating kinds — exactly
- * one is permitted per bstack_process_gen call, and any one of them ends the
- * sequence immediately.
+ * BSTACK_GEN_WRITE, BSTACK_GEN_SWAP, BSTACK_GEN_ROTATE, BSTACK_GEN_PUSH,
+ * BSTACK_GEN_POP, BSTACK_GEN_SPLICE, and BSTACK_GEN_SPARSE are the only
+ * mutating kinds — exactly one is permitted per bstack_process_gen call, and
+ * any one of them ends the sequence immediately.
  *
  * Only available when compiled with both -DBSTACK_FEATURE_SET and
  * -DBSTACK_FEATURE_ATOMIC.
@@ -756,6 +764,11 @@ typedef struct {
             uint64_t b_offset;
             uint64_t len;
         } swap;
+        struct {
+            const uint64_t *offsets;  /* region offsets, in rotation order */
+            size_t          count;
+            uint64_t        len;      /* bytes in each region */
+        } rotate;
         struct {
             const uint8_t *data;
             size_t   len;
@@ -860,6 +873,9 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  *   the in-sequence equivalent of bstack_cross_exchange, useful when a swap
  *   target is only known once an earlier read has resolved it (e.g. "read the
  *   free-list head, then splice this block in as the new head").
+ * - Returning 1 with *out_op set to BSTACK_GEN_ROTATE atomically rotates the
+ *   requested regions and ends the sequence; gen is not called again — the
+ *   in-sequence equivalent of bstack_cross_rotate.
  * - Returning 1 with *out_op set to BSTACK_GEN_PUSH appends u.push.data to
  *   the end of the file, growing the payload, and ends the sequence; gen is
  *   not called again — the in-sequence equivalent of bstack_push.
@@ -897,15 +913,16 @@ int bstack_process(bstack_t *bs, uint64_t start, uint64_t end,
  * the steps that change the file size.
  *
  * Reads of the locked region [0, bstack_locked_len()) are permitted, matching
- * bstack_get.  Write and swap ranges that touch the locked region are
- * rejected, matching bstack_set and bstack_cross_exchange.  A pop that would
+ * bstack_get.  Write, swap, and rotate ranges that touch the locked region are
+ * rejected, matching bstack_set, bstack_cross_exchange, and
+ * bstack_cross_rotate.  A pop that would
  * shrink the payload below bstack_locked_len() is rejected, matching
  * bstack_pop.
  *
- * Returns EINVAL if any offset + len overflows uint64_t, if a read, write, or
- * swap range exceeds the current payload size, if the two swap regions
- * overlap, if a write or swap range overlaps the locked region
- * [0, bstack_locked_len()), if a pop removes more bytes than the current
+ * Returns EINVAL if any offset + len overflows uint64_t, if a read, write,
+ * swap, or rotate range exceeds the current payload size, if the swap or
+ * rotate regions overlap, if a write, swap, or rotate range overlaps the locked
+ * region [0, bstack_locked_len()), if a pop removes more bytes than the current
  * payload size, or if a pop would shrink the payload below
  * bstack_locked_len().  Returns -1 (errno set) if gen yields a
  * BSTACK_GEN_ABORT with a non-zero status, if gen returns -1, or if an I/O
@@ -969,8 +986,8 @@ int bstack_set_batched(bstack_t *bs, const bstack_iovec_t *writes, size_t count)
  *
  * Only in-place ops are permitted: BSTACK_GEN_READ, BSTACK_GEN_WRITE,
  * BSTACK_GEN_LEN, and BSTACK_GEN_ABORT.  The size-changing ops
- * (PUSH/POP/SPLICE/SPARSE) and SWAP are rejected (reported as EINVAL via
- * prev_status; not recorded, and the sequence continues).
+ * (PUSH/POP/SPLICE/SPARSE), SWAP, and ROTATE are rejected (reported as EINVAL
+ * via prev_status; not recorded, and the sequence continues).
  * A BSTACK_GEN_ABORT ends the sequence the other way: every pending write is
  * discarded — the only way to unwind a batch — and the call fails with
  * errno = u.abort.status, or returns 0 when status is 0.
@@ -1017,6 +1034,27 @@ int bstack_inplace_gen(bstack_t *bs,
  */
 BSTACK_WARN_UNUSED_RESULT
 int bstack_cross_exchange(bstack_t *bs, uint64_t a, uint64_t b, uint64_t n);
+
+/*
+ * Atomically rotate k equal-size, pairwise-disjoint regions within the file:
+ * the bytes at offsets[i] move to offsets[i+1], and the bytes at offsets[k-1]
+ * move to offsets[0].
+ *
+ * Runs under a single write lock.  Any rearrangement of regions decomposes
+ * into disjoint rotations, each of which this performs atomically.  k == 2 is
+ * exactly bstack_cross_exchange; k < 2 or n = 0 is a valid no-op (bounds are
+ * still checked).  The file size is never changed.
+ *
+ * Returns EINVAL if any offset+n overflows uint64_t, if any two regions
+ * overlap, if any region exceeds the payload size, or if any region start lies
+ * within the locked prefix.  Returns ENOMEM if the offsets cannot be copied.
+ *
+ * Only available when compiled with both -DBSTACK_FEATURE_SET and
+ * -DBSTACK_FEATURE_ATOMIC.
+ */
+BSTACK_WARN_UNUSED_RESULT
+int bstack_cross_rotate(bstack_t *bs, const uint64_t *offsets, size_t k,
+                        uint64_t n);
 
 /*
  * Copy n bytes from [from, from+n) to [to, to+n) under a single write lock.
